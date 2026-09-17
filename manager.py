@@ -10,6 +10,16 @@ MAX_BACKUPS_PER_FILE = 5  # 每個檔案最多保留幾份歷史備份，避免 
 
 class SkillManager:
     def __init__(self, base_dir=None):
+        """
+        建立一個 SkillManager，固定住自我進化機制會用到的四個目錄／檔案路徑。
+
+        base_dir 預設以 manager.py 自身檔案位置為準（`<專案根目錄>/skills_system`），
+        不吃呼叫當下的工作目錄——修正舊版寫死 `/home/david/CLI_Ops_Test` 這個不存在
+        路徑的問題，同時也讓自我進化在任何 cwd 下呼叫都能正確落地。
+
+        會確保 skills/、scripts/、tools/ 三個子目錄存在（不存在就建立），並在
+        skills/ 底下補上空的 __init__.py（使其可被當作 Python package 匯入）。
+        """
         self.root = base_dir or os.path.join(os.path.dirname(os.path.abspath(__file__)), "skills_system")
         self.skills_dir = os.path.join(self.root, "skills")
         self.scripts_dir = os.path.join(self.root, "scripts")
@@ -45,16 +55,23 @@ class SkillManager:
         branch_lines = []
 
         def describe(node):
+            """把一個 AST 運算式節點還原成原始碼文字（如 `val > 100`），供條件/回傳值說明使用；還原失敗時退回 `<運算式>` 佔位字串，不中斷整體分析。"""
             try:
                 return ast.unparse(node)
             except Exception:
                 return "<運算式>"
 
         def describe_return_value(value_node, conditions):
-            # 三元運算式（return "High" if val > 100 else "Low"）是 ROBOT_AGENT.md 教的標準單行
-            # 寫法，屬於運算式而非 if 敘述，AST 上是 IfExp 而非 If——特別拆解成兩條分支，
-            # 否則會整句被當成一個不透明的運算式，規格書品質提升有限。遞迴處理是為了涵蓋
-            # 巢狀三元運算式（如 "A" if x else ("B" if y else "C")）。
+            """
+            把一個 return 敘述的值節點轉成 `branch_lines` 條列項目。
+
+            三元運算式（return "High" if val > 100 else "Low"）是 ROBOT_AGENT.md 教的
+            標準單行寫法，屬於運算式而非 if 敘述，AST 上是 IfExp 而非 If——特別拆解成
+            兩條分支，否則會整句被當成一個不透明的運算式，規格書品質提升有限。遞迴
+            處理是為了涵蓋巢狀三元運算式（如 "A" if x else ("B" if y else "C")）。
+            conditions 是外層（walk()／上一層 IfExp）已經累積下來的條件描述列表，
+            用「、」串接後與這裡的回傳值一起組成一行 `* 若 X → 回傳 Y`。
+            """
             if isinstance(value_node, ast.IfExp):
                 cond_text = describe(value_node.test)
                 describe_return_value(value_node.body, conditions + [f"若 {cond_text}"])
@@ -65,6 +82,12 @@ class SkillManager:
             branch_lines.append(f"* {cond_desc} → 回傳 `{value_text}`")
 
         def walk(stmts, conditions):
+            """
+            遞迴走訪一段敘述式列表（函式本體或 if/else 分支內容），累積目前路徑上
+            經過的條件描述（conditions），遇到 if 就往兩個分支各自遞迴下去，遇到
+            return 就交給 describe_return_value() 轉成條列項目附進 branch_lines。
+            賦值、迴圈等其他敘述類型暫不細分，避免規格書因涵蓋過多細節而失焦。
+            """
             for node in stmts:
                 if isinstance(node, ast.If):
                     cond_text = describe(node.test)
@@ -214,6 +237,33 @@ dependencies: []
             f.write(entry)
 
     def create_skill(self, name, description, params, code_body):
+        """
+        自我進化的主入口：從模型提供的 `名稱｜描述｜參數名｜程式碼主體` 建立（或
+        覆蓋重建）一個完整技能，同步產生腳本、規格書、索引列三者，回傳一則說明
+        結果的訊息字串（成功以 ✅ 開頭，失敗以 ❌ 開頭）。
+
+        流程：
+        1. 解析 params（支援逗號分隔的多參數，如 "robot_name,priority"）；參數
+           名稱清單為空直接失敗。
+        2. 呼叫 _analyze_code() 做語法驗證——**先做這一步，且尚未寫入任何檔案**：
+           語法錯誤就直接回傳錯誤訊息中止，不覆蓋任何既有腳本／規格書。
+        3. 若目標腳本/規格書已存在，透過 _backup_existing_file() 備份到
+           `.history/`（保留最近 MAX_BACKUPS_PER_FILE 份）再覆蓋。
+        4. 把 code_body 的字面 `\\n` 轉成真正換行並統一縮排，套進固定的腳本樣板
+           （含逐參數的數值自動轉型、CLI 用法提示），寫入 scripts/<name>_cmd.py。
+        5. 用 _smoke_test_script() 以預留值實際跑一次剛產生的腳本（非阻斷性，
+           結果只附在回傳訊息裡參考）。
+        6. 呼叫 _write_tool_doc() 產生／更新規格書、_update_index() 同步
+           INDEX.md 索引列。
+
+        參數:
+            name: 技能名稱，同時決定腳本檔名（`<name>_cmd.py`）與規格書檔名
+                （`tools/<name>.md`）。
+            description: 一行中文描述，會同時寫進規格書與 INDEX.md。
+            params: 參數名稱字串，單一名稱或以逗號分隔的多個名稱。
+            code_body: 函式本體邏輯（字面 `\\n` 換行、4 空格縮排字串），依
+                ROBOT_AGENT.md 的代碼撰寫規範撰寫，不可包含 `def`。
+        """
         # 支援多參數：params 可以是單一名稱（"val"）或以逗號分隔的多個名稱
         # （"robot_name,workstations,priority,state,is_authored"）。
         param_names = [p.strip() for p in params.split(',') if p.strip()]

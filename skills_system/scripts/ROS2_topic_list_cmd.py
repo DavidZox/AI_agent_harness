@@ -3,8 +3,26 @@ import subprocess
 
 def run_ros2_topic_list(container_name):
     """
-    在指定的 Docker 容器內執行 'ros2 topic list'。
-    透過 bash -ic 確保載入 ROS2 環境變數 (source /opt/ros/<distro>/setup.bash)。
+    在指定的 Docker 容器內執行 `ros2 topic list`，列出該容器目前所有
+    可見的 ROS2 topic 名稱，供 ROS2_topic_echo_cmd 等指令進一步查詢
+    個別 topic 內容時使用。
+
+    透過 `docker exec <container_name> bash -ic "ros2 topic list"` 執行，
+    用 `-ic`（interactive）確保容器內的 shell 會先載入 .bashrc /
+    ROS2 的 setup.bash（例如 source /opt/ros/<distro>/setup.bash），
+    否則容器內會找不到 `ros2` 指令。
+
+    參數：
+        container_name：目標 Docker 容器名稱。
+
+    回傳：
+        指令成功（returncode == 0）時回傳去除頭尾空白的 stdout
+        （每行一個 topic 名稱）；指令失敗則回傳
+        "[ERROR] 執行失敗: <stderr 內容>"。
+        與同資料夾的其他 ROS2_*_cmd 指令不同，這裡額外包了
+        try/except，若 subprocess 執行過程本身丟出例外（例如
+        找不到 docker 指令），會被攔截並回傳
+        "[ERROR] 異常: <例外內容>"，而不會讓例外往外傳。
     """
     # 使用 bash -ic 可以確保執行時會載入容器內的 .bashrc 或環境設定
     # 這樣才能找到 ros2 指令

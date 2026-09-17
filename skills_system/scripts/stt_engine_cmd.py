@@ -10,6 +10,25 @@ MODEL_PATH = "small"
 MIC_NAME = "麥克風排列 (適用於數位麥克風的 Intel® 智慧型音效 技術)" 
 
 def record_audio_via_windows():
+    """
+    透過 WSL 呼叫 Windows 端的 ffmpeg.exe（路徑 /mnt/c/ffmpeg/bin/ffmpeg.exe），
+    以 dshow 裝置擷取指定麥克風錄製 10 秒音訊，存成 Windows 原生路徑
+    C:\\temp\\input.wav。
+
+    刻意不使用 /mnt/c/temp/... 這種 WSL 掛載路徑當輸出目的地，而是直接傳
+    Windows 原生路徑給 ffmpeg.exe，讓它以 Windows 行程身分原生寫檔，避開
+    WSL/Windows 之間常見的檔案權限問題；os.path.exists("C:\\temp") 這行在
+    WSL 環境下其實無法正確判斷該 Windows 路徑是否存在，因此若自動建立目錄
+    失敗，需要手動在 Windows 端建立 C:\\temp 資料夾（見程式內註解）。
+
+    麥克風裝置以 dshow 的裝置識別字串 alt_name（GUID 形式）寫死指定，高度
+    綁定安裝此程式的特定機器與其麥克風硬體，換機器或換麥克風需要修改這裡的
+    GUID（同一份寫死值也備份在 MIC_NAME 常數中）。
+
+    不接受參數、不回傳值；若 ffmpeg.exe 找不到或錄音失敗，
+    `subprocess.run(..., check=True)` 會讓 CalledProcessError 往外拋出，
+    交由呼叫端（`__main__`）的 try/except 處理。
+    """
     print("🎤 啟動 Windows 錄音裝置...", file=sys.stderr)
     
     # 1. 直接使用 Windows 格式的路徑，不要用 /mnt/c/
@@ -35,6 +54,20 @@ def record_audio_via_windows():
     print(f"✅ 錄音結束，檔案已存至 {windows_output_path}", file=sys.stderr)
 
 def transcribe_audio(filename=OUTPUT_WAV):
+    """
+    載入本機 faster_whisper 模型（MODEL_PATH="small"，CPU、int8 量化）對指定
+    音訊檔做語音辨識，回傳辨識出的純文字。
+
+    參數 filename 預設為 OUTPUT_WAV（"/mnt/c/temp/input.wav"，即
+    record_audio_via_windows() 寫入的同一份檔案，透過 WSL 掛載路徑讀取）。
+    若該檔案不存在，主動拋出 FileNotFoundError 並附上「錄音可能未成功」的
+    提示，而不是讓底層函式庫拋出較難理解的錯誤。
+
+    以 beam_size=5 執行 transcribe，並將所有辨識片段（segments）的文字依序
+    串接、去除頭尾空白後回傳；若音訊為空或辨識不出任何內容，回傳空字串。
+
+    回傳值：辨識出的文字字串（str）。
+    """
     if not os.path.exists(filename):
         raise FileNotFoundError(f"找不到音訊檔案: {filename}，錄音可能未成功。")
         

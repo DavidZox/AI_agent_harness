@@ -4,6 +4,28 @@ import subprocess
 import shlex
 
 def execute(args_str):
+    """
+    將 Agent 傳入的關鍵字/路徑參數字串轉成正規的 `grep` 指令並執行，用於在檔案
+    「內容」中搜尋關鍵字（與只比對檔名的 find_file_cmd 互補）。
+
+    先以 shlex.split(args_str) 拆解，並濾掉使用者可能不小心夾帶的字面 "grep"。
+    接著檢查已拆出的參數中是否已包含 -r（遞迴）/-n（顯示行號）/-i（忽略大小寫）/
+    -I（略過二進位檔，注意是大寫 I）這幾個 flag，缺哪個就自動補上——特別是 -I，
+    用意是遇到 Miniconda 等巨大二進位檔時能直接跳過內容比對，避免掃描逾時；
+    使用者自行帶的 flag 一律保留、不會被覆蓋或去除。
+
+    參數 args_str 為完整未拆分的原始字串（例如 "model ."）；若為空字串或只有
+    空白，直接回傳 [ERROR]。
+
+    安全防護：組好完整指令陣列後，逐一檢查其中每個「非 flag」參數，只要有任何
+    一個精準等於 "/"（代表搜尋路徑被設成全系統根目錄），就阻斷並回傳 [ERROR]，
+    因為對 / 做遞迴內容搜尋可能拖垮系統；執行時另有 8 秒逾時保護。
+
+    回傳值：grep 的 return code 0（找到相符內容）與 1（grep 定義的「沒找到」，
+    屬正常結果而非錯誤）都視為成功，分別回傳 [PASS] 附完整搜尋結果，或 [PASS]
+    附「找不到」訊息；其餘 return code 視為 grep 本身出錯，回傳 [ERROR] 附
+    stderr 內容；逾時或其他例外分別回傳對應的 [ERROR] 訊息。
+    """
     if not args_str or args_str.strip() == "":
         return "[ERROR] 缺少參數。請提供關鍵字與路徑，例如: \"model\" ."
     

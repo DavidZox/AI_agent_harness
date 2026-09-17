@@ -4,6 +4,28 @@ import subprocess
 import shlex
 
 def execute(args_str):
+    """
+    將 Agent 傳入、格式不固定的原始參數字串轉換成正規的 `find -iname` 指令並執行，
+    用於依「檔案名稱」關鍵字做模糊、不分大小寫的搜尋（與搜內容的 grep_cmd 互補，
+    本函式完全不檢視檔案內容）。
+
+    Agent 傳入的參數順序不保證（可能是「關鍵字 路徑」或「路徑 關鍵字」），因此不
+    假設固定順序：以 shlex.split(args_str) 拆出 token 後，先濾掉不小心夾帶的字面
+    "find"，再逐一檢查每個 token——是既存目錄（或字面 "."）就當作 target_path，
+    其餘當作 search_pattern；若沒有任何 token 被判定為關鍵字，退而使用最後一個
+    token。"-" 開頭的 token 視為其他工具的 flag，直接忽略。
+
+    參數 args_str 為完整未拆分的原始字串（例如 "Modelfile ."）；若為空字串或只有
+    空白，或最終解析不出 search_pattern，回傳 [ERROR]。
+
+    安全防護：target_path 精準等於 "/" 時直接阻斷並回傳 [ERROR]，避免對全系統根
+    目錄做檔名搜尋而耗盡系統資源；subprocess 執行 find 另有 5 秒逾時保護。
+
+    回傳字串：find 執行成功且有結果回傳 [PASS] 附檔案路徑清單；執行成功但無符合
+    檔案一樣回傳 [PASS]（附「找不到」訊息，因為這是正常結果而非錯誤）；find 指令
+    本身失敗（非 0 return code）回傳 [ERROR] 附 stderr；逾時或其他例外分別回傳
+    對應的 [ERROR] 訊息。
+    """
     if not args_str or args_str.strip() == "":
         return "[ERROR] 缺少參數。請提供要搜尋的檔案名稱與路徑，例如: \"Modelfile\" ."
     

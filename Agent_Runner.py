@@ -32,6 +32,28 @@ class SkillAgent:
     def __init__(self, model="gemma4:e4b", max_history=10, token_threshold=DEFAULT_TOKEN_THRESHOLD,
                  tool_idle_eviction_turns=DEFAULT_TOOL_IDLE_EVICTION_TURNS,
                  heartbeat_interval=DEFAULT_HEARTBEAT_INTERVAL_SECONDS, heartbeat_checks=None):
+        """
+        建立一個 SkillAgent 執行個體，初始化本次對話會用到的所有路徑與狀態。
+
+        會計算並固定住專案內各關鍵檔案／目錄的絕對路徑（skills_system 下的
+        INDEX.md／tools/、ROBOT_AGENT.md、memory/ 三檔），並在 INDEX.md 不存在時
+        直接拋出 FileNotFoundError（技能索引是整個系統運作的前提，不應該悄悄跑
+        起來卻沒有任何技能可用）。
+
+        同時初始化四組彼此獨立的狀態：token 統計（user/ai/tool 三種累計數）、
+        sticky objective（/objective 設定的核心目標）、隨需載入技能的追蹤集合
+        （loaded_tools/loaded_scripts 等，見 check_need_tool()/evict_idle_tools()）、
+        以及心跳背景執行緒的旗標與設定（見 start_heartbeat()）。
+
+        參數:
+            model: Ollama 模型名稱。
+            max_history: _truncate_memory() 滑動視窗保留的最大訊息數。
+            token_threshold: enforce_context_budget() 的預算閾值（token 數）。
+            tool_idle_eviction_turns: evict_idle_tools() 判定「閒置」的連續輪數門檻。
+            heartbeat_interval: 心跳背景執行緒的檢查間隔秒數。
+            heartbeat_checks: 心跳固定唯讀健檢清單；為 None 時使用
+                DEFAULT_HEARTBEAT_CHECKS。
+        """
         self.model = model
         self.script_dir = os.path.dirname(os.path.abspath(__file__))
         self.base_path = os.path.join(self.script_dir, "skills_system")
@@ -103,7 +125,12 @@ class SkillAgent:
 
     def count_tokens(self, text: str) -> int:
         """
-        Ollama Native tokenizer (Gemma 4 e4b)
+        計算一段文字若送進 self.model 會佔用的 token 數。
+
+        優先呼叫 Ollama 官方的原生 tokenizer（對應 Gemma 4 e4b），這是最準確的
+        算法；若呼叫失敗（例如模型尚未 pull 下來、Ollama 服務未啟動等任何例外），
+        則退回粗略估算 len(text) // 4 作為安全網，確保呼叫端（get_context_token_count()
+        等）永遠拿得到一個可用的數字，不會中斷。
         """
         try:
             tokens = ollama.tokenize(model=self.model, prompt=text)
@@ -198,7 +225,22 @@ class SkillAgent:
         return evicted
 
     def compress_context_to_file(self, num_to_keep=2):
-        """壓縮成功回傳 True；若沒有足夠的動態歷史可壓縮（如剛開始對話），回傳 False。"""
+        """
+        將動態對話歷史（self.messages[1:]，不含 system prompt）壓縮成一份摘要，
+        歸檔到 logs/summary_<時間戳>.md，只在記憶體中保留最新 num_to_keep 筆原文。
+
+        流程：切出要壓縮的舊訊息與要保留的最新 num_to_keep 筆 → 用一組專門的
+        system/user prompt 請 self.model 依固定 Markdown 範本產生摘要 → 重建
+        self.messages 為 [system prompt, *to_keep]（刻意不呼叫 reset_conversation()，
+        否則會把剛保留下來的 to_keep 又整批蓋掉）→ 清空技能載入追蹤狀態（見
+        _clear_tool_tracking()，因為壓縮後舊技能規格書多半已不在對話中）→ 把摘要
+        寫入 logs/ 底下的獨立檔案。
+
+        若動態歷史本來就不超過 num_to_keep 筆（例如對話才剛開始），視為沒有東西
+        好壓縮，直接回傳 False、不呼叫模型也不寫檔；實際完成壓縮則回傳 True——
+        呼叫端（enforce_context_budget()）靠這個真實結果判斷，而不是單純假設
+        「呼叫了就一定有效果」。
+        """
         history_to_compress = self.messages[1:]
         # 如果對話不足以壓縮，則直接返回
         if len(history_to_compress) <= num_to_keep:
@@ -270,7 +312,13 @@ class SkillAgent:
         return True
 
     def load_recent_summary_logs(self, max_files=5):
-        """讀取 logs 目錄下最新的幾個壓縮紀錄檔案，作為 Agent 的近期歷史知識"""
+        """
+        讀取 logs/ 目錄下最新的 max_files 個壓縮摘要檔（compress_context_to_file()
+        產生的 summary_<時間戳>.md），依檔名時間戳由新到舊排序後串接全文回傳，
+        供 get_system_prompt() 組進「Recent Compressed History Summary」區塊，
+        讓模型即使歷史已被壓縮清空，也還能看到近期發生過什麼事。目錄不存在時
+        回傳提示字串，不拋例外。
+        """
         log_dir = os.path.join(self.script_dir, "logs")
         if not os.path.exists(log_dir):
             return "No history logs found."
@@ -287,7 +335,13 @@ class SkillAgent:
         return content
 
     def load_long_term_memory(self, max_lines=15):
-        """讀取語意／情節／程序三種長期記憶檔案的尾段內容"""
+        """
+        讀取 memory/semantic.md、episodic.md、procedural.md 三個長期記憶檔各自的
+        最後 max_lines 行，各自標上對應的中文標題後串接成一段文字回傳，供
+        get_system_prompt() 組進系統提示詞的「Long Term Memory」區塊。三個檔案
+        各自獨立處理——檔案不存在時該區塊顯示「No memory yet.」，讀取例外時顯示
+        錯誤訊息，都不會影響其他兩個檔案的讀取或讓整個系統提示詞組裝失敗。
+        """
         sections = [
             ("semantic", "### 語意記憶 (Semantic)"),
             ("episodic", "### 情節記憶 (Episodic)"),
@@ -341,13 +395,19 @@ class SkillAgent:
         return True
 
     def is_heartbeat_running(self):
+        """回傳心跳背景執行緒目前是否存在且存活中（True/False），供狀態列與 /heartbeat status 使用。"""
         return self._heartbeat_thread is not None and self._heartbeat_thread.is_alive()
 
     def _heartbeat_loop(self):
-        # Event.wait(timeout) 兼具「睡眠」與「可被立即喚醒中斷」兩種功能：
-        # 正常情況下每隔 heartbeat_interval 秒回傳 False（逾時）就執行一次健檢；
-        # 一旦 stop_heartbeat() 呼叫 set()，wait() 會立刻回傳 True，迴圈馬上結束，
-        # 不用等到目前這一輪 interval 跑完。
+        """
+        心跳背景執行緒的主迴圈（由 start_heartbeat() 以 daemon thread 啟動）。
+
+        用 Event.wait(timeout) 同時實現「睡眠」與「可被立即喚醒中斷」兩種功能：
+        正常情況下每隔 heartbeat_interval 秒回傳 False（逾時）就執行一次健檢
+        （_run_heartbeat_once()）；一旦 stop_heartbeat() 呼叫 set()，wait() 會
+        立刻回傳 True，迴圈馬上結束，不用等到目前這一輪 interval 跑完。健檢過程
+        中任何未預期例外都會被攔截並印出，不會讓整個背景執行緒意外崩潰退出。
+        """
         while not self._heartbeat_stop_event.wait(self.heartbeat_interval):
             try:
                 self._run_heartbeat_once()
@@ -388,6 +448,17 @@ class SkillAgent:
         print(f"\n💓 [心跳] {timestamp} 已完成健檢，結果已寫入 logs/heartbeat.md")
 
     def get_system_prompt(self):
+        """
+        組裝完整的 system prompt 全文（存放於 self.messages[0]）。
+
+        每次呼叫都會即時組裝（而不是快取），確保狀態相關的區塊永遠反映最新值：
+        ROBOT_AGENT.md 角色設定與協議全文、Current Agent State（工作目錄／容器
+        目錄／本次對話已載入的技能規格書清單／心跳運作狀態）、sticky objective
+        （若有設定）、長期記憶三檔尾段（load_long_term_memory()）、近期壓縮摘要
+        （load_recent_summary_logs()）、近期心跳健檢結果（load_recent_heartbeat_checks()）、
+        以及 INDEX.md 技能索引全文。ask_ai() 與 get_context_token_count() 在每次
+        呼叫模型前都會用這個方法的回傳值刷新 self.messages[0]。
+        """
 
         objective_prompt = ""
         if self.sticky_objective:
@@ -452,16 +523,47 @@ class SkillAgent:
         self.tool_last_used_turn.clear()
 
     def reset_conversation(self):
+        """
+        將對話完全重置為初始狀態：self.messages 只剩下一則全新組裝的 system
+        prompt，並透過 _clear_tool_tracking() 一併清空所有技能載入追蹤狀態
+        （否則 loaded_tools 會謊報規格書還在上下文裡），turn_counter 歸零重新
+        起算。對應 REPL 的 /clear 指令。
+
+        刻意不處理心跳背景執行緒——心跳是否運作是獨立於對話內容的關注點，
+        /clear 不會、也不應該連帶停止已經在跑的心跳（見 stop_heartbeat()）。
+        """
         self.messages = [{'role': 'system', 'content': self.get_system_prompt()}]
         self._clear_tool_tracking()
         self.turn_counter = 0
 
     def _truncate_memory(self):
+        """
+        通用的滑動視窗安全網：當 self.messages 筆數超過 max_history + 1（+1 是
+        system prompt）時，只保留 system prompt 加上最新 max_history 筆訊息，
+        捨棄更早的內容。這是不分內容種類、單純依筆數觸發的粗粒度機制，與
+        evict_idle_tools()（針對特定閒置技能規格書的精準清除）及
+        compress_context_to_file()（整批摘要歸檔）互補，三者共同構成上下文
+        管理的多層防線。
+        """
         if len(self.messages) > self.max_history + 1:
             print(f"⚠️  [記憶優化] 啟動滑動視窗（保留 {self.max_history} 筆）")
             self.messages = [self.messages[0]] + self.messages[-self.max_history:]
 
     def ask_ai(self):
+        """
+        呼叫模型取得一次回覆，是主迴圈每一輪對話的核心入口。
+
+        依序執行：turn_counter 遞增（作為技能生命週期等機制的統一輪次計數）→
+        刷新 system prompt → 通用滑動視窗截斷（_truncate_memory()）→ 精準清除
+        閒置技能規格書（evict_idle_tools()）→ 主動式上下文預算檢查與壓縮
+        （enforce_context_budget()）→ 才真正呼叫 ollama.chat()。這個順序確保
+        送給模型的請求一定是「清理過、且沒有超過預算」的版本，而不是先送出去
+        才發現超標。
+
+        回覆內容若包含 <thought>...</thought> 或以 "...done thinking." 結尾的
+        推理痕跡，會被去除，只保留正式回覆部分。任何例外（如 Ollama 連線失敗）
+        都會被攔截，回傳一則說明錯誤的字串而不是讓呼叫端崩潰。
+        """
         try:
             self.turn_counter += 1
 
@@ -538,6 +640,32 @@ class SkillAgent:
         return f"[PASS] 已載入技能 '{safe_name}' 規格書：\n{content}", safe_name
 
     def run_tool(self, ai_response):
+        """
+        解析模型回覆中的 `EXECUTE: <腳本> <參數>` 指令並實際執行對應腳本，回傳
+        執行結果字串；若回覆中沒有 EXECUTE 標記則回傳 None（呼叫端據此判斷這輪
+        沒有工具動作）。
+
+        主要步驟：
+        1. 取出 EXECUTE: 之後的內容，若模型多輸出了 code fence 或 "# ---" 分隔線，
+           一併裁掉；再切出腳本名稱與其餘參數字串。
+        2. 腳本名稱正規化——不論模型輸出的是技能顯示名稱、裸檔名還是已含
+           `_cmd.py` 副檔名，都統一補齊成實際檔名（如 change_dir → cd_cmd.py，
+           經 SKILL_NAME_TO_SCRIPT 或預設的 `<名稱>_cmd.py` 規則解析）。
+        3. 參數切分：`manage_skill` 系列因為參數本身是用 `|` 分隔的單一字串
+           （名稱｜描述｜參數名｜程式碼主體），整段原樣當一個參數傳入，不能用
+           shlex 再切一次；其餘腳本則用 shlex.split（失敗時退回簡單 split）。
+        4. 用 subprocess 執行腳本，帶入目前的 current_cwd 與（透過環境變數
+           CONTAINER_CWD 注入的）container_cwd。
+        5. 掃描輸出中的 `[CWD_CHANGED]`／`[CONTAINER_CWD]` 標記以同步 Agent 的
+           目錄狀態；若是成功的 manage_skill 呼叫，因為新技能是在子行程中建立、
+           無法直接改到本行程的記憶體狀態，改由這裡從父行程解析同一份輸入把新
+           技能名稱登記進 loaded_tools/loaded_scripts。
+        6. 記錄這個腳本這一輪確實被 EXECUTE 過（供 evict_idle_tools() 判斷閒置）；
+           若尚未透過 NEED_TOOL 載入過規格書就直接執行，附加一則不阻擋執行的
+           `[INFO]` 提醒（NEED_TOOL 是省 token 機制，不是權限控管）。
+
+        任何解析或執行過程中的例外都會被攔截，回傳說明錯誤的字串。
+        """
         if "EXECUTE:" in ai_response:
             try:
                 start_marker = "EXECUTE:"
@@ -635,6 +763,19 @@ class SkillAgent:
 # =========================================================
 
 def main():
+    """
+    REPL 主程式進入點：建立一個 SkillAgent、重置對話，然後進入無窮迴圈讀取
+    使用者輸入並處理。
+
+    每輪輸入先比對是否命中內建的 slash 指令（/clear、/compress、/auto on|off、
+    /hybrid on|off、/budget、/skill_ttl、/heartbeat on|off|status|interval、
+    /objective，以及多行版本的 objective set/show/clear）並就地處理、continue
+    回主迴圈；否則視為一般訊息，進入內層迴圈：呼叫 ask_ai() 取得模型回覆 →
+    依序判斷 check_need_tool()（優先）與 run_tool() → 視結果與目前模式
+    （NEED_TOOL 一律自動繼續／auto/hybrid/manual）決定是否把結果加入對話並
+    繼續下一輪，或中斷交還使用者輸入。exit/quit 或 Ctrl+C 都會先呼叫
+    agent.stop_heartbeat() 再結束，避免心跳背景執行緒殘留。
+    """
     agent = SkillAgent(
         model="gemma4:e4b",
         max_history=30
