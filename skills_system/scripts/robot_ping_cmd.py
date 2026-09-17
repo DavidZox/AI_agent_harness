@@ -33,14 +33,17 @@ def execute():
     多餘的參數會被安靜忽略而不是讓工具直接報錯——與系統其他地方「未知輸入
     採取軟性容錯」的一貫原則一致。
 
-    若模組頂層 `from skills.nav_core import NavBrain` 失敗，NavBrain 會被
-    設為 None，此時 `NavBrain()` 仍會因為呼叫 None 而拋出 TypeError，並在
-    `__main__` 的 try/except 中被攔截、印成 "Error executing robot_ping: ..."
-    並以非 0 狀態碼結束——這是環境/部署層級的問題（skills 套件無法載入），
-    不屬於本次修正範圍。
+    修正紀錄：先前若模組頂層 `from skills.nav_core import NavBrain` 失敗，
+    NavBrain 會被設為 None，`NavBrain()` 會因為呼叫 None 而拋出 TypeError，
+    只能靠 `__main__` 的 try/except 攔截、印成非標準格式的錯誤訊息。現在
+    在建立實例前先檢查 NavBrain 是否為 None，是的話直接回傳說明「skills
+    套件無法載入」的 [ERROR] 字串，不再讓 TypeError 往外拋。
 
-    回傳值：NavBrain.get_v49_status() 回傳的固定描述字串。
+    回傳值：NavBrain.get_v49_status() 回傳的固定描述字串；若 skills.nav_core
+    模組無法載入，回傳 [ERROR] 字串。
     """
+    if NavBrain is None:
+        return "[ERROR] skills.nav_core 模組載入失敗，NavBrain 未定義（請確認 skills_system/skills 目錄與 __init__.py 是否存在且可被匯入）。"
     brain = NavBrain()
     return brain.get_v49_status()
 

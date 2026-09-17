@@ -25,14 +25,17 @@ def execute(speed=0.0):
 
     回傳：
         brain.calculate_risk(speed) 的回傳值（實際型別/內容由
-        NavBrain 的實作決定，本函式不做任何加工）。
+        NavBrain 的實作決定，本函式不做任何加工）；若 skills.nav_core
+        模組無法載入，回傳 [ERROR] 字串。
 
-    注意：檔案開頭若因為找不到 skills.nav_core 模組而 import
-    失敗，NavBrain 會被設成 None，這裡的 `NavBrain()` 會因此
-    拋出 TypeError（'NoneType' object is not callable），此例外
-    不會在本函式內被攔截，而是交由 __main__ 區塊的 try/except
-    捕捉並印到 stderr。
+    修正紀錄：先前檔案開頭若因為找不到 skills.nav_core 模組而 import
+    失敗，NavBrain 會被設成 None，`NavBrain()` 會因此拋出 TypeError
+    （'NoneType' object is not callable），只能靠 __main__ 區塊的
+    try/except 捕捉並印到 stderr。現在在建立實例前先檢查 NavBrain
+    是否為 None，是的話直接回傳 [ERROR] 字串，不再讓 TypeError 往外拋。
     """
+    if NavBrain is None:
+        return "[ERROR] skills.nav_core 模組載入失敗，NavBrain 未定義（請確認 skills_system/skills 目錄與 __init__.py 是否存在且可被匯入）。"
     brain = NavBrain()
     return brain.calculate_risk(speed)
 

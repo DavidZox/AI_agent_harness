@@ -16,13 +16,18 @@ def run_node_list(container):
 
     回傳：
         指令成功（returncode == 0）時回傳去除頭尾空白的 stdout
-        （每行一個節點名稱）；失敗則回傳 stderr。本函式與呼叫端
-        的 __main__ 都沒有包 try/except，若 docker 指令不存在等
-        例外會直接以未捕捉例外往外拋，不會被轉成 [ERROR] 訊息。
+        （每行一個節點名稱）；失敗則回傳 stderr。
+
+    修正紀錄：先前本函式沒有包 try/except，若 docker 指令不存在等例外
+    會直接以未捕捉例外往外拋。現在比照同資料夾 ROS2_topic_list_cmd.py
+    的作法，補上 try/except，例外時回傳 "[ERROR] 異常: ..." 字串。
     """
     cmd = ["docker", "exec", container, "bash", "-ic", "ros2 node list"]
-    result = subprocess.run(cmd, capture_output=True, text=True)
-    return result.stdout.strip() if result.returncode == 0 else result.stderr.strip()
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True)
+        return result.stdout.strip() if result.returncode == 0 else result.stderr.strip()
+    except Exception as e:
+        return f"[ERROR] 異常: {str(e)}"
 
 if __name__ == "__main__":
     if len(sys.argv) < 2:
