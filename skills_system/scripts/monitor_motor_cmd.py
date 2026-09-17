@@ -9,18 +9,23 @@ def execute(temp):
     先嘗試型別轉換：僅當 temp 是字串、且不含逗號時，才嘗試 float(temp) 轉型
     （不含逗號的限制是為了避免把「70,80」這種以逗號分隔的多值字串誤當成單一
     數字轉換）；轉型失敗（ValueError）或型別不支援（TypeError）時，直接放棄
-    轉型、保留原始輸入值。這代表：若呼叫時傳入無法轉成數字的字串（如 "abc"）
-    或含逗號的字串，temp 會維持字串型別進入下方的 `>` 比較，導致從此函式內部
-    拋出 TypeError（str 與 int 無法比較），此例外不會被本函式攔截，只能靠
-    呼叫端的 try/except 處理（`__main__` 區塊有包，直接呼叫則會往外傳播）。
+    轉型、保留原始輸入值。
 
-    門檻分級（temp 需為可比較的數值）：
+    修正紀錄：先前轉型失敗後會直接放行，讓仍是字串的 temp 進入下方的 `>`
+    比較，從函式內部拋出未被攔截的 TypeError（str 與 int 無法比較），只能
+    靠呼叫端（`__main__`）的 try/except 攔截、印成非標準格式的錯誤訊息。
+    現在轉型後會先檢查 temp 是否確實為 int/float，不是的話直接回傳
+    `[ERROR] 無效的溫度數值: ...`，與其他分級結果一樣是正常回傳值，不會
+    再讓例外往外傳播。
+
+    門檻分級（temp 為有效數值時）：
     > 80 → [CRITICAL] 觸發物理邊界約束，請立即停機；
     >= 60 → [WARNING] 負載異常，建議降速 30%；
     >= 20 → [NORMAL] 運作正常；
     其餘（< 20）→ [NOTICE] 正在進行環境語義單元預熱。
 
-    回傳對應分級的字串（無例外狀況時一定會回傳其中一種，不會回傳 None）。
+    回傳對應分級的字串，或（輸入無法解讀為數值時）[ERROR] 訊息字串；
+    不會拋出例外。
     """
     # 物理邊界防護：只有在「不含逗號」且「看起來像數字」時才自動轉型
     try:
@@ -28,7 +33,10 @@ def execute(temp):
             temp = float(temp)
     except (ValueError, TypeError):
         pass
-    
+
+    if not isinstance(temp, (int, float)):
+        return f"[ERROR] 無效的溫度數值: {temp!r}"
+
     # --- AI Generated Code ---
     if temp > 80: return "[CRITICAL] 觸發物理邊界約束，請立即停機"
     elif temp >= 60: return "[WARNING] 負載異常，建議降速 30%"

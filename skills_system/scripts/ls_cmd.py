@@ -14,15 +14,16 @@ def execute(args_str):
     避免組出 `ls -laF -la` 這種重複旗標；非 flag 的 token（路徑）則原樣保留。
     最終指令為 base_cmd 加上濾過的 token 清單，執行時有 5 秒逾時保護。
 
-    已知邊界情況：當 args_str 為空或全是空白時，程式改走 else 分支、只設定
-    final_cmd，不會建立 clean_args 這個區域變數；但函式稍後為了組出
-    display_path 仍會讀取 clean_args[0]，因此「完全不帶參數呼叫」時會觸發
-    UnboundLocalError，並被外層 except 攔截，回傳 [ERROR] 執行異常: ...
-    （而非預期中列出目前目錄），呼叫時應至少帶入 "." 以避免觸發此路徑。
+    修正紀錄：當 args_str 為空或全是空白時，程式走 else 分支——先前 else
+    分支只設定 final_cmd、未同步建立 clean_args，但函式稍後為了組出
+    display_path 一律會讀取 clean_args[0]，導致「完全不帶參數呼叫」時觸發
+    UnboundLocalError（被下面的 except 攔截成 [ERROR] 執行異常，而不是預期
+    中列出目前目錄）。已在 else 分支同步補上 `clean_args = []`，使
+    display_path 正確落回 "."，恢復「不帶參數＝列出目前目錄」的預期行為。
 
     回傳字串：ls 執行成功回傳 [PASS] 附目錄列表與判定出的 display_path；ls
-    失敗（如路徑不存在或無權限）回傳 [ERROR] 附 stderr 內容；其餘例外（含上述
-    UnboundLocalError）一併回傳 [ERROR] 執行異常訊息。
+    失敗（如路徑不存在或無權限）回傳 [ERROR] 附 stderr 內容；其餘例外一併
+    回傳 [ERROR] 執行異常訊息。
     """
     # 預設的基礎指令組合
     base_cmd = ["ls", "-laF"]
@@ -50,6 +51,7 @@ def execute(args_str):
             final_cmd = base_cmd + clean_args
         else:
             final_cmd = base_cmd
+            clean_args = []
 
         # 執行指令
         result = subprocess.run(
