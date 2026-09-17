@@ -6,14 +6,33 @@ import re
 import shlex
 import time
 
+# 技能「顯示名稱」與實際腳本檔名不一致的少數歷史案例；其餘技能（含所有自我進化新建的技能）
+# 皆遵循 <名稱>_cmd.py 規則，可直接推導，不需列在此處。
+SKILL_NAME_TO_SCRIPT = {
+    "list_dir": "ls_cmd.py",
+    "search_text": "grep_cmd.py",
+    "change_dir": "cd_cmd.py",
+    "view_file": "cat_cmd.py",
+}
+
+NEED_TOOL_LOOP_LIMIT = 5  # 連續 NEED_TOOL（含重複命中快取）達此次數即強制中斷交還使用者
+
+
 class SkillAgent:
     def __init__(self, model="gemma4:e4b", max_history=10):
         self.model = model
         self.script_dir = os.path.dirname(os.path.abspath(__file__))
         self.base_path = os.path.join(self.script_dir, "skills_system")
-        self.index_file = os.path.join(self.base_path, "SKILLS.md")
+        self.index_file = os.path.join(self.base_path, "INDEX.md")
+        self.tools_dir = os.path.join(self.base_path, "tools")
         self.profile_file = os.path.join(self.script_dir, "ROBOT_AGENT.md")
-        self.memory_file = os.path.join(self.script_dir, "Memory.md")
+
+        self.memory_dir = os.path.join(self.script_dir, "memory")
+        self.memory_files = {
+            "semantic": os.path.join(self.memory_dir, "semantic.md"),
+            "episodic": os.path.join(self.memory_dir, "episodic.md"),
+            "procedural": os.path.join(self.memory_dir, "procedural.md"),
+        }
 
         self.current_cwd = "/home/david"
         self.container_cwd = ""
@@ -36,6 +55,12 @@ class SkillAgent:
         # =========================
         self.sticky_objective = None
 
+        # =========================
+        # 📚 On-Demand Skill Loading (NEED_TOOL)
+        # =========================
+        self.loaded_tools = set()      # 技能顯示名稱（INDEX.md / tools/*.md 用）
+        self.loaded_scripts = set()    # 實際腳本檔名（run_tool 解析用）
+        self.consecutive_need_tool_count = 0
 
     def count_tokens(self, text: str) -> int:
         """
@@ -106,16 +131,21 @@ class SkillAgent:
         self.messages = [self.messages[0]] + to_keep
         print(f"💾 [系統] 歷史已壓縮並存入。已保留最新的 {num_to_keep} 筆對話。")
 
+        # 🔥 壓縮後，先前載入的技能規格書內容已不在對話中，清空快取避免誤判「已載入」
+        self.loaded_tools.clear()
+        self.loaded_scripts.clear()
+        self.consecutive_need_tool_count = 0
+
         # 確保 logs 目錄存在
         log_dir = os.path.join(self.script_dir, "logs")
         os.makedirs(log_dir, exist_ok=True)
-        
+
         # 寫入獨立檔案
         timestamp = time.strftime('%Y-%m-%d_%H-%M-%S')
         file_path = os.path.join(log_dir, f"summary_{timestamp}.md")
         with open(file_path, "w", encoding="utf-8") as f:
             f.write(f"# Summary at {timestamp}\n\n{summary_content}")
-            
+
         self.reset_conversation()
         print(f"💾 [系統] 歷史已壓縮並存入: {os.path.basename(file_path)}")
 
@@ -136,19 +166,26 @@ class SkillAgent:
                 content += f"\n--- 紀錄檔: {os.path.basename(f_path)} ---\n{f.read()}\n"
         return content
 
-    def load_long_term_memory(self, max_lines=30):
-        if not os.path.exists(self.memory_file):
-            return "No long-term memory."
-
-        try:
-            with open(self.memory_file, "r", encoding="utf-8") as f:
-                lines = f.readlines()
-
-            memory_lines = lines[-max_lines:]
-            return "".join(memory_lines)
-
-        except Exception as e:
-            return f"[Memory Load Error] {e}"
+    def load_long_term_memory(self, max_lines=15):
+        """讀取語意／情節／程序三種長期記憶檔案的尾段內容"""
+        sections = [
+            ("semantic", "### 語意記憶 (Semantic)"),
+            ("episodic", "### 情節記憶 (Episodic)"),
+            ("procedural", "### 程序記憶 (Procedural)"),
+        ]
+        blocks = []
+        for mem_type, title in sections:
+            path = self.memory_files[mem_type]
+            if not os.path.exists(path):
+                blocks.append(f"{title}\nNo memory yet.")
+                continue
+            try:
+                with open(path, "r", encoding="utf-8") as f:
+                    lines = f.readlines()
+                blocks.append(f"{title}\n" + "".join(lines[-max_lines:]).strip())
+            except Exception as e:
+                blocks.append(f"{title}\n[Memory Load Error] {e}")
+        return "\n\n".join(blocks)
 
     def get_system_prompt(self):
 
@@ -175,7 +212,13 @@ class SkillAgent:
             memory_content = self.load_long_term_memory()
             history_summary = self.load_recent_summary_logs()
 
-        status_prompt = f"\n\n## Current Agent State\n- CURRENT_WORKING_DIRECTORY: {self.current_cwd}\nCURRENT_CONTAINER_DIRECTORY: {self.container_cwd}"
+        loaded_display = sorted(self.loaded_tools) if self.loaded_tools else "None"
+        status_prompt = (
+            f"\n\n## Current Agent State\n"
+            f"- CURRENT_WORKING_DIRECTORY: {self.current_cwd}\n"
+            f"- CURRENT_CONTAINER_DIRECTORY: {self.container_cwd}\n"
+            f"- LOADED_TOOL_SPECS_THIS_SESSION: {loaded_display}"
+        )
 
         return f"""
                 {profile}
@@ -185,7 +228,7 @@ class SkillAgent:
                 {memory_content}
                 ## Recent Compressed History Summary
                 {history_summary}
-                ## Available Skills (SKILLS.md)
+                ## Available Skills (INDEX.md)
                 {skills}
                 """
 
@@ -221,6 +264,48 @@ class SkillAgent:
 
         except Exception as e:
             return f"Ollama 連線錯誤: {e}"
+
+    def check_need_tool(self, ai_response):
+        """
+        解析 `NEED_TOOL: <技能名稱>`，命中時載入 skills_system/tools/<name>.md 全文，
+        是本次「隨需載入」重構的核心：技能規格書預設不在 context 裡，只有被明確請求時才載入。
+
+        只看第一行（刻意不沿用 EXECUTE 的 split(maxsplit=1) 寫法 —— 那種寫法在模型於指令後
+        面接著輸出額外說明文字、且沒有用 code fence 包起來時，會把說明文字一併吃進參數）。
+        回傳 None 代表本次回覆沒有 NEED_TOOL 宣告。
+        """
+        stripped = ai_response.strip()
+        if not stripped:
+            return None
+
+        first_line = stripped.splitlines()[0]
+        if "NEED_TOOL:" not in first_line:
+            return None
+
+        raw_name = first_line.split("NEED_TOOL:", 1)[1].strip()
+        raw_name = raw_name.strip("`\"' ")
+
+        # 安全防護：僅允許英數字與底線並取 basename，避免路徑穿越字串（與 grep_cmd.py/find_file_cmd.py
+        # 阻擋 "/" 搜尋的既有防護風格一致）
+        safe_name = os.path.basename(raw_name)
+        if not re.fullmatch(r"[A-Za-z0-9_]+", safe_name):
+            return f"[ERROR] 不合法的技能名稱: {raw_name}"
+
+        if safe_name in self.loaded_tools:
+            return f"[INFO] 技能 '{safe_name}' 規格書本次對話已載入，無需重複讀取。"
+
+        doc_path = os.path.join(self.tools_dir, f"{safe_name}.md")
+        if not os.path.exists(doc_path):
+            return f"[ERROR] 找不到技能 '{safe_name}' 的規格書，請確認 INDEX.md 中的技能名稱是否正確。"
+
+        with open(doc_path, "r", encoding="utf-8") as f:
+            content = f.read()
+
+        self.loaded_tools.add(safe_name)
+        script_name = SKILL_NAME_TO_SCRIPT.get(safe_name, f"{safe_name}_cmd.py")
+        self.loaded_scripts.add(script_name)
+
+        return f"[PASS] 已載入技能 '{safe_name}' 規格書：\n{content}"
 
     def run_tool(self, ai_response):
         if "EXECUTE:" in ai_response:
@@ -280,11 +365,28 @@ class SkillAgent:
                 for i, line in enumerate(lines):
                     if line.startswith("[CWD_CHANGED]"):
                         self.current_cwd = line.replace("[CWD_CHANGED]", "").strip()
-                    
+
                     # 抓取 [CONTAINER_CWD] 標記的下一行作為路徑
                     if line.startswith("[CONTAINER_CWD]"):
                         if i + 1 < len(lines):
                             self.container_cwd = lines[i + 1].strip()
+
+                # --- 自我進化技能：於父行程中同步註冊 ---
+                # manage_skill_cmd.py / manager.py 在子行程中執行，無法直接改動本行程的
+                # loaded_tools / loaded_scripts，因此改由父行程根據同一份原始輸入解析新技能名稱。
+                if "manage_skill" in script_name and res.returncode == 0 and clean_args:
+                    new_name = clean_args[0].split("|", 1)[0].strip()
+                    if new_name and re.fullmatch(r"[A-Za-z0-9_]+", new_name):
+                        self.loaded_tools.add(new_name)
+                        self.loaded_scripts.add(f"{new_name}_cmd.py")
+
+                # --- 未先 NEED_TOOL 就 EXECUTE：軟性提醒，不阻擋 ---
+                # NEED_TOOL 是省 token 的機制，不是權限控管，因此絕不因未載入規格書而拒絕執行。
+                if script_name not in self.loaded_scripts:
+                    output_text = (
+                        "[INFO] 提醒：尚未透過 NEED_TOOL 載入此技能的規格書，仍已依既有邏輯執行下方結果。\n"
+                        f"{output_text}"
+                    )
 
                 return output_text
 
@@ -294,7 +396,7 @@ class SkillAgent:
         return None
 
 # =========================================================
-# 🚀 MAIN LOOP (加入 Token Tracking 顯示)
+# 🚀 MAIN LOOP (加入 Token Tracking 顯示 + NEED_TOOL 隨需載入)
 # =========================================================
 
 def main():
@@ -307,13 +409,13 @@ def main():
     hybrid_mode = False  # 👈 新增狀態
 
     print("\n" + "="*50)
-    print("V6 Robot Agent + Token Tracker 已啟動")
+    print("V7 Robot Agent + On-Demand Skill Loading 已啟動")
     print("="*50)
 
     while True:
         try:
             user_msg = input("\n👤 使用者: ")
-            
+
             # --- 基礎指令 ---
             if user_msg.lower() in ['exit', 'quit']:
                 break
@@ -327,7 +429,7 @@ def main():
                 agent.compress_context_to_file(num_to_keep=2)
                 print("🗜️ 歷史已手動壓縮並歸檔。")
                 continue
-            
+
             # --- 模式切換指令 ---
             if user_msg.lower() == '/auto on':
                 auto_mode = True
@@ -379,12 +481,25 @@ def main():
                 print(f"📤 AI Tokens: {ai_tokens}")
                 agent.messages.append({'role': 'assistant', 'content': ai_msg})
 
-                # --- 🧰 TOOL 執行 ---
-                result = agent.run_tool(ai_msg)
+                # --- 📚 NEED_TOOL 優先於 EXECUTE 判斷 ---
+                # 若模型同一回覆同時輸出兩者（小模型偶爾會如此），本次只處理 NEED_TOOL，
+                # EXECUTE 留待下一輪（載入規格書後）再次輸出，避免在還沒讀規格前就執行。
+                tool_doc = agent.check_need_tool(ai_msg)
+                is_need_tool = tool_doc is not None
+
+                if is_need_tool:
+                    result = tool_doc
+                    agent.consecutive_need_tool_count += 1
+                else:
+                    result = agent.run_tool(ai_msg)
+                    agent.consecutive_need_tool_count = 0
+
+                # --- 🧰 執行結果／規格書 顯示 ---
                 if result:
                     tool_tokens = agent.count_tokens(result)
                     agent.total_tool_tokens += tool_tokens
-                    print(f"\n🚀 系統回傳:\n{'-'*30}\n{result}\n{'-'*30}")
+                    label = "📚 技能規格書" if is_need_tool else "🚀 系統回傳"
+                    print(f"\n{label}:\n{'-'*30}\n{result}\n{'-'*30}")
                     print(f"🧰 Tool Tokens: {tool_tokens}")
                 else:
                     print("✅ 無工具需要執行")
@@ -404,12 +519,21 @@ def main():
                 if not result:
                     break
 
+                # 0. NEED_TOOL：唯讀的規格書載入動作，一律自動繼續，不受 auto/hybrid/manual 影響
+                if is_need_tool:
+                    agent.messages.append({'role': 'user', 'content': f"[tool spec]\n{result}"})
+                    if agent.consecutive_need_tool_count > NEED_TOOL_LOOP_LIMIT:
+                        print(f"\n🛑 連續 NEED_TOOL 已達 {NEED_TOOL_LOOP_LIMIT} 次，強制中斷並交還使用者確認。")
+                        break
+                    print("♻️ 已載入規格書，自動繼續...")
+                    continue
+
                 # 1. Auto Mode
                 if auto_mode:
                     agent.messages.append({'role': 'user', 'content': f"[tool result]\n{result}"})
                     print("♻️ Auto Continue 中...")
                     continue
-                
+
                 # 2. Hybrid Mode
                 if hybrid_mode:
                     choice = input("\n🤔 Hybrid Mode - 加入上下文？(y/n): ").lower()
@@ -419,7 +543,7 @@ def main():
                     else:
                         # 🔥 關鍵修正：回傳「工具已執行，但結果被隱藏」的訊息給 Agent
                         agent.messages.append({
-                            'role': 'user', 
+                            'role': 'user',
                             'content': "[tool result]\nTool execution completed, but the result was discarded by user request."
                         })
                         print("🚫 該結果已被略過 (已告知 Agent 執行結束)")
@@ -435,7 +559,7 @@ def main():
                 else:
                 # 🔥 關鍵修正：回傳「工具已執行，但結果被隱藏」的訊息給 Agent
                     agent.messages.append({
-                        'role': 'user', 
+                        'role': 'user',
                         'content': "[tool result]\nTool execution completed, but the result was discarded by user request."
                     })
                     print("👀 已略過")
