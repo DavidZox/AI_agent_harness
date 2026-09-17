@@ -5,6 +5,7 @@ import ollama  # 導入官方庫
 import re
 import shlex
 import time
+import threading
 
 # 技能「顯示名稱」與實際腳本檔名不一致的少數歷史案例；其餘技能（含所有自我進化新建的技能）
 # 皆遵循 <名稱>_cmd.py 規則，可直接推導，不需列在此處。
@@ -18,11 +19,19 @@ SKILL_NAME_TO_SCRIPT = {
 NEED_TOOL_LOOP_LIMIT = 5  # 連續 NEED_TOOL（含重複命中快取）達此次數即強制中斷交還使用者
 DEFAULT_TOKEN_THRESHOLD = 8000  # 上下文預算閾值預設值，可由 SkillAgent(token_threshold=...) 或 /budget 指令調整
 DEFAULT_TOOL_IDLE_EVICTION_TURNS = 6  # 技能規格書連續閒置（未被 EXECUTE）幾輪後從上下文清除
+DEFAULT_HEARTBEAT_INTERVAL_SECONDS = 300  # 心跳預設間隔（5 分鐘），可由 /heartbeat interval 調整
+# 心跳固定唯讀健檢清單：(顯示標籤, 腳本檔名, 固定參數列表)。只跑不需要即時情境參數的唯讀技能，
+# 不經過 LLM 推論、不自動寫入記憶——這是刻意的安全邊界，見 ROBOT_AGENT.md 的 Memory Write Protocol
+# （記憶寫入必須由使用者明確要求，心跳沒有人在場確認，不適用）。
+DEFAULT_HEARTBEAT_CHECKS = [
+    ("robot_ping", "robot_ping_cmd.py", []),
+]
 
 
 class SkillAgent:
     def __init__(self, model="gemma4:e4b", max_history=10, token_threshold=DEFAULT_TOKEN_THRESHOLD,
-                 tool_idle_eviction_turns=DEFAULT_TOOL_IDLE_EVICTION_TURNS):
+                 tool_idle_eviction_turns=DEFAULT_TOOL_IDLE_EVICTION_TURNS,
+                 heartbeat_interval=DEFAULT_HEARTBEAT_INTERVAL_SECONDS, heartbeat_checks=None):
         self.model = model
         self.script_dir = os.path.dirname(os.path.abspath(__file__))
         self.base_path = os.path.join(self.script_dir, "skills_system")
@@ -73,6 +82,19 @@ class SkillAgent:
         self.tool_spec_messages = {}     # 技能名稱 -> 該規格書在 self.messages 中的實際訊息物件參照
         self.tool_load_turn = {}         # 技能名稱 -> 載入當下的 turn_counter（尚未被 EXECUTE 過時的起算點）
         self.tool_last_used_turn = {}    # 腳本檔名 -> 最近一次被 EXECUTE 的 turn_counter
+
+        # =========================
+        # 💓 Heartbeat（背景健檢執行緒）
+        # =========================
+        # 設計原則：這個背景執行緒「絕不」直接碰 self.messages / loaded_tools 等主執行緒也會
+        # 讀寫的狀態——只透過 subprocess 執行固定的唯讀腳本，結果單純寫進 heartbeat_log_file。
+        # 下一次人真的互動、get_system_prompt() 重新組裝時，才會把心跳結果的檔案內容讀進去
+        # 給模型看。這樣兩個執行緒之間完全沒有共享的可變物件，不需要鎖。
+        self.heartbeat_interval = heartbeat_interval
+        self.heartbeat_checks = list(heartbeat_checks) if heartbeat_checks is not None else list(DEFAULT_HEARTBEAT_CHECKS)
+        self.heartbeat_log_file = os.path.join(self.script_dir, "logs", "heartbeat.md")
+        self._heartbeat_stop_event = threading.Event()
+        self._heartbeat_thread = None
 
         # =========================
         # 📦 Context Budget Monitor
@@ -285,6 +307,86 @@ class SkillAgent:
                 blocks.append(f"{title}\n[Memory Load Error] {e}")
         return "\n\n".join(blocks)
 
+    # =========================
+    # 💓 Heartbeat（背景健檢執行緒）
+    # =========================
+    def load_recent_heartbeat_checks(self, max_lines=20):
+        """讀取心跳健檢紀錄檔的尾段內容，供 get_system_prompt() 顯示給模型參考。"""
+        if not os.path.exists(self.heartbeat_log_file):
+            return "No heartbeat checks yet."
+        try:
+            with open(self.heartbeat_log_file, "r", encoding="utf-8") as f:
+                lines = f.readlines()
+            return "".join(lines[-max_lines:]).strip()
+        except Exception as e:
+            return f"[Heartbeat Load Error] {e}"
+
+    def start_heartbeat(self):
+        """啟動背景心跳執行緒。已在執行時回傳 False，成功啟動回傳 True。"""
+        if self._heartbeat_thread is not None and self._heartbeat_thread.is_alive():
+            return False
+        self._heartbeat_stop_event.clear()
+        self._heartbeat_thread = threading.Thread(target=self._heartbeat_loop, daemon=True)
+        self._heartbeat_thread.start()
+        return True
+
+    def stop_heartbeat(self):
+        """停止背景心跳執行緒。本來就沒在跑時回傳 False，成功停止回傳 True。"""
+        if self._heartbeat_thread is None or not self._heartbeat_thread.is_alive():
+            self._heartbeat_thread = None
+            return False
+        self._heartbeat_stop_event.set()
+        self._heartbeat_thread.join(timeout=5)
+        self._heartbeat_thread = None
+        return True
+
+    def is_heartbeat_running(self):
+        return self._heartbeat_thread is not None and self._heartbeat_thread.is_alive()
+
+    def _heartbeat_loop(self):
+        # Event.wait(timeout) 兼具「睡眠」與「可被立即喚醒中斷」兩種功能：
+        # 正常情況下每隔 heartbeat_interval 秒回傳 False（逾時）就執行一次健檢；
+        # 一旦 stop_heartbeat() 呼叫 set()，wait() 會立刻回傳 True，迴圈馬上結束，
+        # 不用等到目前這一輪 interval 跑完。
+        while not self._heartbeat_stop_event.wait(self.heartbeat_interval):
+            try:
+                self._run_heartbeat_once()
+            except Exception as e:
+                print(f"\n💓 [心跳] 執行健檢時發生未預期例外: {e}")
+
+    def _run_heartbeat_once(self):
+        """
+        執行一輪固定的唯讀健檢。刻意不呼叫 ask_ai()、不寫入 memory/、不碰 self.messages——
+        心跳期間沒有人在場確認，維持與 ROBOT_AGENT.md 一致的『記憶寫入需使用者明確要求』
+        『EXECUTE 需經過協議』等原則，只單純把結果記錄下來，留給下次真人互動時參考。
+        """
+        timestamp = time.strftime('%Y-%m-%d %H:%M:%S')
+        lines = [f"\n### 心跳檢查 {timestamp}"]
+
+        for label, script_name, args in self.heartbeat_checks:
+            script_path = os.path.join(self.base_path, "scripts", script_name)
+            if not os.path.exists(script_path):
+                lines.append(f"- **{label}**: [ERROR] 找不到腳本 {script_path}")
+                continue
+            try:
+                res = subprocess.run(
+                    [sys.executable, script_path] + list(args),
+                    capture_output=True,
+                    text=True,
+                    cwd=self.current_cwd,
+                    timeout=10,
+                )
+                output = res.stdout.strip() if res.returncode == 0 else res.stderr.strip()
+            except Exception as e:
+                output = f"[ERROR] 心跳檢查執行異常: {e}"
+            lines.append(f"- **{label}**: {output}")
+
+        os.makedirs(os.path.dirname(self.heartbeat_log_file), exist_ok=True)
+        with open(self.heartbeat_log_file, "a", encoding="utf-8") as f:
+            f.write("\n".join(lines) + "\n")
+
+        print(f"\n💓 [心跳] {timestamp} 已完成健檢，結果已寫入 logs/heartbeat.md")
+
     def get_system_prompt(self):
 
         objective_prompt = ""
@@ -309,13 +411,16 @@ class SkillAgent:
             skills = f.read()
             memory_content = self.load_long_term_memory()
             history_summary = self.load_recent_summary_logs()
+            heartbeat_summary = self.load_recent_heartbeat_checks()
 
         loaded_display = sorted(self.loaded_tools) if self.loaded_tools else "None"
+        heartbeat_state = "運作中" if self.is_heartbeat_running() else "已停止"
         status_prompt = (
             f"\n\n## Current Agent State\n"
             f"- CURRENT_WORKING_DIRECTORY: {self.current_cwd}\n"
             f"- CURRENT_CONTAINER_DIRECTORY: {self.container_cwd}\n"
-            f"- LOADED_TOOL_SPECS_THIS_SESSION: {loaded_display}"
+            f"- LOADED_TOOL_SPECS_THIS_SESSION: {loaded_display}\n"
+            f"- HEARTBEAT: {heartbeat_state}（間隔 {self.heartbeat_interval} 秒）"
         )
 
         return f"""
@@ -326,6 +431,8 @@ class SkillAgent:
                 {memory_content}
                 ## Recent Compressed History Summary
                 {history_summary}
+                ## Recent Heartbeat Checks
+                {heartbeat_summary}
                 ## Available Skills (INDEX.md)
                 {skills}
                 """
@@ -546,6 +653,7 @@ def main():
 
             # --- 基礎指令 ---
             if user_msg.lower() in ['exit', 'quit']:
+                agent.stop_heartbeat()
                 break
             if user_msg.lower() == '/clear':
                 agent.reset_conversation()
@@ -600,6 +708,36 @@ def main():
                         print(f"🧹 已設定技能閒置逐出門檻為 {agent.tool_idle_eviction_turns} 輪")
                     except ValueError:
                         print("⚠️ 用法錯誤，請輸入整數，例如: /skill_ttl 6（或 /skill_ttl 查看目前值）")
+                continue
+
+            # --- 💓 心跳機制：開關／狀態／間隔設定 ---
+            if user_msg.lower() == '/heartbeat on':
+                started = agent.start_heartbeat()
+                if started:
+                    print(f"💓 已啟動心跳機制（每 {agent.heartbeat_interval} 秒執行一次唯讀健檢："
+                          f"{', '.join(label for label, _, _ in agent.heartbeat_checks)}）")
+                else:
+                    print("💓 心跳機制已經在執行中")
+                continue
+            if user_msg.lower() == '/heartbeat off':
+                stopped = agent.stop_heartbeat()
+                print("🛑 已停止心跳機制" if stopped else "🛑 心跳機制本來就沒有在跑")
+                continue
+            if user_msg.lower() == '/heartbeat status':
+                state = "運作中" if agent.is_heartbeat_running() else "已停止"
+                checks_desc = ", ".join(label for label, _, _ in agent.heartbeat_checks) or "（無）"
+                print(f"💓 心跳狀態: {state}｜間隔: {agent.heartbeat_interval} 秒｜健檢項目: {checks_desc}")
+                continue
+            if user_msg.lower().startswith('/heartbeat interval'):
+                remainder = user_msg[len('/heartbeat interval'):].strip()
+                if not remainder:
+                    print(f"💓 目前心跳間隔: {agent.heartbeat_interval} 秒")
+                else:
+                    try:
+                        agent.heartbeat_interval = int(remainder)
+                        print(f"💓 已設定心跳間隔為 {agent.heartbeat_interval} 秒（下一輪心跳生效）")
+                    except ValueError:
+                        print("⚠️ 用法錯誤，請輸入整數秒數，例如: /heartbeat interval 300")
                 continue
 
             # --- 🎯 OBJECTIVE 單行版本（/objective <文字> 直接設定；/objective 顯示目前值；
@@ -734,6 +872,7 @@ def main():
                     break
 
         except KeyboardInterrupt:
+            agent.stop_heartbeat()
             print("\n👋 Bye")
             break
 
