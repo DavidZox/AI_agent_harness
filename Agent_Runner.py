@@ -17,10 +17,12 @@ SKILL_NAME_TO_SCRIPT = {
 
 NEED_TOOL_LOOP_LIMIT = 5  # 連續 NEED_TOOL（含重複命中快取）達此次數即強制中斷交還使用者
 DEFAULT_TOKEN_THRESHOLD = 8000  # 上下文預算閾值預設值，可由 SkillAgent(token_threshold=...) 或 /budget 指令調整
+DEFAULT_TOOL_IDLE_EVICTION_TURNS = 6  # 技能規格書連續閒置（未被 EXECUTE）幾輪後從上下文清除
 
 
 class SkillAgent:
-    def __init__(self, model="gemma4:e4b", max_history=10, token_threshold=DEFAULT_TOKEN_THRESHOLD):
+    def __init__(self, model="gemma4:e4b", max_history=10, token_threshold=DEFAULT_TOKEN_THRESHOLD,
+                 tool_idle_eviction_turns=DEFAULT_TOOL_IDLE_EVICTION_TURNS):
         self.model = model
         self.script_dir = os.path.dirname(os.path.abspath(__file__))
         self.base_path = os.path.join(self.script_dir, "skills_system")
@@ -62,6 +64,15 @@ class SkillAgent:
         self.loaded_tools = set()      # 技能顯示名稱（INDEX.md / tools/*.md 用）
         self.loaded_scripts = set()    # 實際腳本檔名（run_tool 解析用）
         self.consecutive_need_tool_count = 0
+
+        # =========================
+        # 🧹 Skill Lifecycle（技能生命週期清除）
+        # =========================
+        self.tool_idle_eviction_turns = tool_idle_eviction_turns
+        self.turn_counter = 0            # 每次 ask_ai() 呼叫模型前遞增一次，作為「輪次」的統一計數
+        self.tool_spec_messages = {}     # 技能名稱 -> 該規格書在 self.messages 中的實際訊息物件參照
+        self.tool_load_turn = {}         # 技能名稱 -> 載入當下的 turn_counter（尚未被 EXECUTE 過時的起算點）
+        self.tool_last_used_turn = {}    # 腳本檔名 -> 最近一次被 EXECUTE 的 turn_counter
 
         # =========================
         # 📦 Context Budget Monitor
@@ -124,6 +135,46 @@ class SkillAgent:
             )
         return actually_compressed, token_count_after
 
+    # =========================
+    # 🧹 Skill Lifecycle（技能生命週期清除）
+    # =========================
+    def evict_idle_tools(self):
+        """
+        主動式技能生命週期清除：與 enforce_context_budget() 一樣在 ask_ai() 呼叫模型『之前』
+        執行，但目標不同——這裡是『精準』清除，只把連續 self.tool_idle_eviction_turns 輪都沒有
+        被實際 EXECUTE 的技能規格書，從 self.messages 中單獨移除，不影響其他仍在使用中的技能
+        或一般對話內容。這與 _truncate_memory()／compress_context_to_file() 那種『不分青紅皂白
+        整批處理』的機制互補：那兩個是通用的安全網，這個是針對『特定技能真的用完了』的精準清理。
+
+        被清除的技能會同時從 loaded_tools / loaded_scripts 除名，之後要再用就必須重新
+        NEED_TOOL 載入——這就是「用完就從上下文移除」的實際落地：清除的不只是文字內容，
+        agent 對『這個技能是否已知』的認知也一併重置。
+
+        回傳被清除的技能名稱列表（可能為空）。
+        """
+        evicted = []
+        for skill_name in list(self.loaded_tools):
+            script_name = SKILL_NAME_TO_SCRIPT.get(skill_name, f"{skill_name}_cmd.py")
+            # 從未被 EXECUTE 過的技能，以「載入當下」的 turn 當作起算基準
+            baseline_turn = self.tool_last_used_turn.get(script_name, self.tool_load_turn.get(skill_name, self.turn_counter))
+            idle_for = self.turn_counter - baseline_turn
+            if idle_for < self.tool_idle_eviction_turns:
+                continue
+
+            spec_message = self.tool_spec_messages.pop(skill_name, None)
+            if spec_message is not None and spec_message in self.messages:
+                self.messages.remove(spec_message)
+
+            self.loaded_tools.discard(skill_name)
+            self.loaded_scripts.discard(script_name)
+            self.tool_load_turn.pop(skill_name, None)
+            self.tool_last_used_turn.pop(script_name, None)
+            evicted.append(skill_name)
+
+        if evicted:
+            print(f"🧹 [技能生命週期] 已清除閒置技能規格書（連續 {self.tool_idle_eviction_turns} 輪未使用）: {evicted}")
+        return evicted
+
     def compress_context_to_file(self, num_to_keep=2):
         """壓縮成功回傳 True；若沒有足夠的動態歷史可壓縮（如剛開始對話），回傳 False。"""
         history_to_compress = self.messages[1:]
@@ -178,10 +229,10 @@ class SkillAgent:
         self.messages = [self.messages[0]] + to_keep
         print(f"💾 [系統] 歷史已壓縮並存入。已保留最新的 {num_to_keep} 筆對話。")
 
-        # 🔥 壓縮後，先前載入的技能規格書內容已不在對話中，清空快取避免誤判「已載入」
-        self.loaded_tools.clear()
-        self.loaded_scripts.clear()
-        self.consecutive_need_tool_count = 0
+        # 🔥 壓縮後，先前載入的技能規格書內容已不在對話中（除非剛好落在 to_keep 裡，但保守起見
+        # 一律視為不再可靠），清空追蹤狀態避免誤判「已載入」。turn_counter 則刻意不重置——
+        # 它只是單調遞增的相對時間軸，壓縮不代表對話真的重新開始（/clear 才是）。
+        self._clear_tool_tracking()
 
         # 確保 logs 目錄存在
         log_dir = os.path.join(self.script_dir, "logs")
@@ -279,8 +330,24 @@ class SkillAgent:
                 {skills}
                 """
 
+    def _clear_tool_tracking(self):
+        """
+        清空所有『已載入技能』的追蹤狀態。凡是會讓 self.messages 整批被改寫或清空的操作
+        （/clear 重置、壓縮）都必須呼叫這個，否則 loaded_tools 會謊報「規格書還在上下文裡」，
+        導致 LOADED_TOOL_SPECS_THIS_SESSION 狀態列失真、也讓 run_tool() 的軟性提醒判斷錯誤。
+        （這其實是修正了一個既有問題：舊版 /clear 只重置了 messages，從沒清過這些追蹤集合。）
+        """
+        self.loaded_tools.clear()
+        self.loaded_scripts.clear()
+        self.consecutive_need_tool_count = 0
+        self.tool_spec_messages.clear()
+        self.tool_load_turn.clear()
+        self.tool_last_used_turn.clear()
+
     def reset_conversation(self):
         self.messages = [{'role': 'system', 'content': self.get_system_prompt()}]
+        self._clear_tool_tracking()
+        self.turn_counter = 0
 
     def _truncate_memory(self):
         if len(self.messages) > self.max_history + 1:
@@ -289,11 +356,14 @@ class SkillAgent:
 
     def ask_ai(self):
         try:
+            self.turn_counter += 1
+
             if self.messages and self.messages[0]['role'] == 'system':
                 self.messages[0]['content'] = self.get_system_prompt()
 
             self._truncate_memory()
-            self.enforce_context_budget()  # 主動式檢查：呼叫模型前先確保沒有超出 token 預算
+            self.evict_idle_tools()        # 先做精準清除：把真的閒置的技能規格書單獨移除
+            self.enforce_context_budget()  # 再做預算檢查：若還是超標，才動用整批壓縮
 
             response = ollama.chat(
                 model=self.model,
@@ -320,15 +390,19 @@ class SkillAgent:
 
         只看第一行（刻意不沿用 EXECUTE 的 split(maxsplit=1) 寫法 —— 那種寫法在模型於指令後
         面接著輸出額外說明文字、且沒有用 code fence 包起來時，會把說明文字一併吃進參數）。
-        回傳 None 代表本次回覆沒有 NEED_TOOL 宣告。
+
+        回傳 (顯示文字, 剛被新載入的技能名稱或 None)。第二個值只有在「這次是真的從檔案讀進來的
+        全新載入」時才會是技能名稱，命中快取／找不到／不合法名稱等情況一律是 None——呼叫端
+        （main()）需要靠這個值決定要不要把訊息物件登記進 tool_spec_messages 供之後清除使用。
+        沒有任何 NEED_TOOL 宣告時，第一個值回傳 None。
         """
         stripped = ai_response.strip()
         if not stripped:
-            return None
+            return None, None
 
         first_line = stripped.splitlines()[0]
         if "NEED_TOOL:" not in first_line:
-            return None
+            return None, None
 
         raw_name = first_line.split("NEED_TOOL:", 1)[1].strip()
         raw_name = raw_name.strip("`\"' ")
@@ -337,14 +411,14 @@ class SkillAgent:
         # 阻擋 "/" 搜尋的既有防護風格一致）
         safe_name = os.path.basename(raw_name)
         if not re.fullmatch(r"[A-Za-z0-9_]+", safe_name):
-            return f"[ERROR] 不合法的技能名稱: {raw_name}"
+            return f"[ERROR] 不合法的技能名稱: {raw_name}", None
 
         if safe_name in self.loaded_tools:
-            return f"[INFO] 技能 '{safe_name}' 規格書本次對話已載入，無需重複讀取。"
+            return f"[INFO] 技能 '{safe_name}' 規格書本次對話已載入，無需重複讀取。", None
 
         doc_path = os.path.join(self.tools_dir, f"{safe_name}.md")
         if not os.path.exists(doc_path):
-            return f"[ERROR] 找不到技能 '{safe_name}' 的規格書，請確認 INDEX.md 中的技能名稱是否正確。"
+            return f"[ERROR] 找不到技能 '{safe_name}' 的規格書，請確認 INDEX.md 中的技能名稱是否正確。", None
 
         with open(doc_path, "r", encoding="utf-8") as f:
             content = f.read()
@@ -352,8 +426,9 @@ class SkillAgent:
         self.loaded_tools.add(safe_name)
         script_name = SKILL_NAME_TO_SCRIPT.get(safe_name, f"{safe_name}_cmd.py")
         self.loaded_scripts.add(script_name)
+        self.tool_load_turn[safe_name] = self.turn_counter
 
-        return f"[PASS] 已載入技能 '{safe_name}' 規格書：\n{content}"
+        return f"[PASS] 已載入技能 '{safe_name}' 規格書：\n{content}", safe_name
 
     def run_tool(self, ai_response):
         if "EXECUTE:" in ai_response:
@@ -408,6 +483,11 @@ class SkillAgent:
 
                 output_text = res.stdout.strip() if res.returncode == 0 else res.stderr
                 lines = output_text.splitlines()
+
+                # --- 技能生命週期：記錄這個腳本『這一輪』被實際使用過 ---
+                # 不論成功或失敗都算「有在用」，只有真正被晾在一邊、完全沒被 EXECUTE 過的
+                # 技能才會被 evict_idle_tools() 判定為閒置。
+                self.tool_last_used_turn[script_name] = self.turn_counter
 
                 # --- 狀態同步邏輯 ---
                 for i, line in enumerate(lines):
@@ -509,6 +589,19 @@ def main():
                         print("⚠️ 用法錯誤，請輸入整數，例如: /budget 8000（或 /budget 查看目前值）")
                 continue
 
+            # --- 🧹 技能閒置逐出門檻查詢／設定 ---
+            if user_msg.lower() == '/skill_ttl' or user_msg.lower().startswith('/skill_ttl '):
+                remainder = user_msg[len('/skill_ttl'):].strip()
+                if not remainder:
+                    print(f"🧹 技能閒置逐出門檻: 連續 {agent.tool_idle_eviction_turns} 輪未使用即清除")
+                else:
+                    try:
+                        agent.tool_idle_eviction_turns = int(remainder)
+                        print(f"🧹 已設定技能閒置逐出門檻為 {agent.tool_idle_eviction_turns} 輪")
+                    except ValueError:
+                        print("⚠️ 用法錯誤，請輸入整數，例如: /skill_ttl 6（或 /skill_ttl 查看目前值）")
+                continue
+
             # --- 🎯 OBJECTIVE 單行版本（/objective <文字> 直接設定；/objective 顯示目前值；
             #     /objective clear 清除。多行輸入仍可用下面的 objective set/show/clear） ---
             if user_msg.lower() == '/objective' or user_msg.lower().startswith('/objective '):
@@ -559,7 +652,7 @@ def main():
                 # --- 📚 NEED_TOOL 優先於 EXECUTE 判斷 ---
                 # 若模型同一回覆同時輸出兩者（小模型偶爾會如此），本次只處理 NEED_TOOL，
                 # EXECUTE 留待下一輪（載入規格書後）再次輸出，避免在還沒讀規格前就執行。
-                tool_doc = agent.check_need_tool(ai_msg)
+                tool_doc, freshly_loaded_name = agent.check_need_tool(ai_msg)
                 is_need_tool = tool_doc is not None
 
                 if is_need_tool:
@@ -591,7 +684,12 @@ def main():
 
                 # 0. NEED_TOOL：唯讀的規格書載入動作，一律自動繼續，不受 auto/hybrid/manual 影響
                 if is_need_tool:
-                    agent.messages.append({'role': 'user', 'content': f"[tool spec]\n{result}"})
+                    spec_message = {'role': 'user', 'content': f"[tool spec]\n{result}"}
+                    agent.messages.append(spec_message)
+                    if freshly_loaded_name:
+                        # 登記訊息物件參照，供 evict_idle_tools() 之後精準移除（而非用索引，
+                        # 避免 truncate/compress 造成索引失效）
+                        agent.tool_spec_messages[freshly_loaded_name] = spec_message
                     if agent.consecutive_need_tool_count > NEED_TOOL_LOOP_LIMIT:
                         print(f"\n🛑 連續 NEED_TOOL 已達 {NEED_TOOL_LOOP_LIMIT} 次，強制中斷並交還使用者確認。")
                         break
