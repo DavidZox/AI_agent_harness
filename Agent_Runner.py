@@ -16,10 +16,11 @@ SKILL_NAME_TO_SCRIPT = {
 }
 
 NEED_TOOL_LOOP_LIMIT = 5  # 連續 NEED_TOOL（含重複命中快取）達此次數即強制中斷交還使用者
+DEFAULT_TOKEN_THRESHOLD = 8000  # 上下文預算閾值預設值，可由 SkillAgent(token_threshold=...) 或 /budget 指令調整
 
 
 class SkillAgent:
-    def __init__(self, model="gemma4:e4b", max_history=10):
+    def __init__(self, model="gemma4:e4b", max_history=10, token_threshold=DEFAULT_TOKEN_THRESHOLD):
         self.model = model
         self.script_dir = os.path.dirname(os.path.abspath(__file__))
         self.base_path = os.path.join(self.script_dir, "skills_system")
@@ -62,6 +63,11 @@ class SkillAgent:
         self.loaded_scripts = set()    # 實際腳本檔名（run_tool 解析用）
         self.consecutive_need_tool_count = 0
 
+        # =========================
+        # 📦 Context Budget Monitor
+        # =========================
+        self.token_threshold = token_threshold
+
     def count_tokens(self, text: str) -> int:
         """
         Ollama Native tokenizer (Gemma 4 e4b)
@@ -73,20 +79,57 @@ class SkillAgent:
             # fallback
             return len(text) // 4
 
-    def count_context_tokens(self) -> int:
+    # =========================
+    # 📦 Context Budget Monitor（主動量測 + 事前壓縮）
+    # =========================
+    def get_context_token_count(self) -> int:
         """
-        計算整體 context tokens
+        量測『若現在呼叫模型，實際會送出去』的完整 context token 數。
+        會先刷新 system prompt 內容，再對 self.messages 逐則計算——
+        這與 ask_ai() 真正送給 ollama.chat(messages=self.messages) 的內容一致，
+        不會像舊版顯示邏輯那樣把 system prompt 重複算一次。
         """
-        full_text = ""
-        for m in self.messages:
-            full_text += f"{m['role']}: {m['content']}\n"
+        if self.messages and self.messages[0]['role'] == 'system':
+            self.messages[0]['content'] = self.get_system_prompt()
+        full_text = "".join(f"{m['role']}: {m['content']}\n" for m in self.messages)
         return self.count_tokens(full_text)
 
+    def enforce_context_budget(self):
+        """
+        主動式（proactive）上下文預算檢查：在每次呼叫模型『之前』檢查一次，
+        超過 self.token_threshold 就先壓縮再繼續，確保不會送出超標的請求
+        （舊版是等模型回覆、結果都算完之後才檢查，等於至少會放行一次超標請求）。
+
+        只會壓縮 self.messages[1:]（動態對話歷史），system prompt（index 0：
+        profile / objective / memory / skills index）不受影響——見
+        compress_context_to_file()。
+
+        回傳 (was_compressed: bool, token_count_after: int)。
+        """
+        token_count = self.get_context_token_count()
+        if token_count <= self.token_threshold:
+            return False, token_count
+
+        print(f"\n📦 [上下文監控] {token_count} tokens 超過閾值 {self.token_threshold}，事前壓縮中...")
+        actually_compressed = self.compress_context_to_file(num_to_keep=2)
+        token_count_after = self.get_context_token_count()
+
+        if actually_compressed:
+            print(f"📦 [上下文監控] 壓縮後 {token_count_after} tokens")
+        else:
+            print(
+                "📦 [上下文監控] 目前沒有可壓縮的動態歷史了——"
+                "system prompt（profile/objective/memory/skills index）本身就已接近或超過閾值，"
+                "這部分依規則不會被壓縮，將照常送出。若要降低，需精簡 ROBOT_AGENT.md／memory／INDEX.md 本身內容。"
+            )
+        return actually_compressed, token_count_after
+
     def compress_context_to_file(self, num_to_keep=2):
+        """壓縮成功回傳 True；若沒有足夠的動態歷史可壓縮（如剛開始對話），回傳 False。"""
         history_to_compress = self.messages[1:]
         # 如果對話不足以壓縮，則直接返回
         if len(history_to_compress) <= num_to_keep:
-            return
+            return False
         # 切分：前面是要壓縮的，後面是保留的
         to_compress = history_to_compress[:-num_to_keep]
         to_keep = history_to_compress[-num_to_keep:]
@@ -128,6 +171,10 @@ class SkillAgent:
         ])
         summary_content = res['message']['content']
         # 🔥 關鍵：重置對話時，保留 System Prompt + 我們想保留的最新對話
+        # （注意：這裡刻意不再呼叫 reset_conversation() —— 舊版在這行之後緊接著呼叫它，
+        # 會把剛保留下來的 to_keep 訊息又整個蓋掉，等於「保留最新 N 筆」形同虛設。
+        # system prompt 的內容仍會在下一次 ask_ai() / get_context_token_count() 時自動刷新，
+        # 不需要在這裡重置。）
         self.messages = [self.messages[0]] + to_keep
         print(f"💾 [系統] 歷史已壓縮並存入。已保留最新的 {num_to_keep} 筆對話。")
 
@@ -146,8 +193,8 @@ class SkillAgent:
         with open(file_path, "w", encoding="utf-8") as f:
             f.write(f"# Summary at {timestamp}\n\n{summary_content}")
 
-        self.reset_conversation()
         print(f"💾 [系統] 歷史已壓縮並存入: {os.path.basename(file_path)}")
+        return True
 
     def load_recent_summary_logs(self, max_files=5):
         """讀取 logs 目錄下最新的幾個壓縮紀錄檔案，作為 Agent 的近期歷史知識"""
@@ -246,6 +293,7 @@ class SkillAgent:
                 self.messages[0]['content'] = self.get_system_prompt()
 
             self._truncate_memory()
+            self.enforce_context_budget()  # 主動式檢查：呼叫模型前先確保沒有超出 token 預算
 
             response = ollama.chat(
                 model=self.model,
@@ -448,7 +496,34 @@ def main():
                 print("🧬 已關閉 Hybrid Mode")
                 continue
 
-            # --- 🎯 OBJECTIVE 設定 ---
+            # --- 📦 上下文預算閾值查詢／設定 ---
+            if user_msg.lower() == '/budget' or user_msg.lower().startswith('/budget '):
+                remainder = user_msg[len('/budget'):].strip()
+                if not remainder:
+                    print(f"📦 目前上下文預算閾值: {agent.token_threshold} tokens")
+                else:
+                    try:
+                        agent.token_threshold = int(remainder)
+                        print(f"📦 已設定上下文預算閾值為 {agent.token_threshold} tokens")
+                    except ValueError:
+                        print("⚠️ 用法錯誤，請輸入整數，例如: /budget 8000（或 /budget 查看目前值）")
+                continue
+
+            # --- 🎯 OBJECTIVE 單行版本（/objective <文字> 直接設定；/objective 顯示目前值；
+            #     /objective clear 清除。多行輸入仍可用下面的 objective set/show/clear） ---
+            if user_msg.lower() == '/objective' or user_msg.lower().startswith('/objective '):
+                remainder = user_msg[len('/objective'):].strip()
+                if not remainder:
+                    print(f"🎯 Current: {agent.sticky_objective or 'None'}")
+                elif remainder.lower() == 'clear':
+                    agent.sticky_objective = ""
+                    print("🧹 已清除 Sticky Objective")
+                else:
+                    agent.sticky_objective = remainder
+                    print(f"🎯 已設定核心目標: {remainder}")
+                continue
+
+            # --- 🎯 OBJECTIVE 設定（多行輸入版本，適合較長的目標描述） ---
             if user_msg.lower() == "objective set":
                 print("\n🎯 進入任務錨點設定模式 (輸入 objective end 結束)")
                 objective_lines = []
@@ -505,14 +580,9 @@ def main():
                     print("✅ 無工具需要執行")
 
                 # --- 📊 TOKEN 統計顯示 ---
-                full_context = agent.get_system_prompt() + "\n" + "".join([f"{m['role']}: {m['content']}\n" for m in agent.messages])
-                print(f"\n📦 Context Tokens: {agent.count_tokens(full_context)}")
-                # --- 自動壓縮觸發器 ---
-                TOKEN_THRESHOLD = 8000 # 根據你的需求調整
-                if agent.count_tokens(full_context) > TOKEN_THRESHOLD:
-                    agent.compress_context_to_file(num_to_keep=2)
-                    print(f"\n📦 Compressed Context Tokens: {agent.count_tokens(full_context)}")
-                    continue # 壓縮後重新循環，確保下一輪 Agent 讀取到更新後的 system prompt
+                # 壓縮已改為主動式（見 SkillAgent.enforce_context_budget()，在 ask_ai() 呼叫模型
+                # 之前就先檢查並壓縮），這裡單純顯示目前狀態，不再重複觸發壓縮判斷。
+                print(f"\n📦 Context Tokens: {agent.get_context_token_count()} (閾值 {agent.token_threshold})")
                 print(f"📊 Stats | User: {agent.total_user_tokens} | AI: {agent.total_ai_tokens} | Tool: {agent.total_tool_tokens}")
 
                 # --- 模式判定流程 ---
