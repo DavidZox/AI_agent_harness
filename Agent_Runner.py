@@ -11,7 +11,7 @@ class SkillAgent:
         self.script_dir = os.path.dirname(os.path.abspath(__file__))
         self.base_path = os.path.join(self.script_dir, "skills_system")
         self.index_file = os.path.join(self.base_path, "SKILLS.md")
-        self.profile_file = os.path.join(self.script_dir, "ROBOT_AGENT.md")
+        self.profile_file = os.path.join(self.script_dir, "AGENT.md")
         self.memory_file = os.path.join(self.script_dir, "Memory.md")
 
         self.current_cwd = "/home/david"
