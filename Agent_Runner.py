@@ -24,6 +24,9 @@ class SkillAgent:
         if not os.path.exists(self.index_file):
             raise FileNotFoundError(f"找不到技能索引：{self.index_file}")
 
+        self.tools_dir = os.path.join(self.base_path, "tools")
+        self.skill_script_map = self._load_skill_script_map()
+
         # =========================
         # 🧠 Token Tracker
         # =========================
@@ -222,6 +225,31 @@ class SkillAgent:
         except Exception as e:
             return f"Ollama 連線錯誤: {e}"
 
+    def _load_skill_script_map(self):
+        """
+        掃描 skills_system/tools/*.md，建立「技能友善名稱 -> 實際腳本檔名」對照表。
+        每份規格文件內都會有一行反引號包住的 `scripts/xxx_cmd.py`，藉此讓
+        AI 輸出索引中的技能名稱（如 change_dir）時，仍能正確對應到底層腳本（cd_cmd.py）。
+        """
+        skill_map = {}
+        if not os.path.isdir(self.tools_dir):
+            return skill_map
+
+        for filename in os.listdir(self.tools_dir):
+            if not filename.endswith(".md"):
+                continue
+            skill_name = filename[:-3]
+            try:
+                with open(os.path.join(self.tools_dir, filename), "r", encoding="utf-8") as f:
+                    content = f.read()
+                match = re.search(r"`scripts/([\w./-]+\.py)`", content)
+                if match:
+                    skill_map[skill_name] = os.path.basename(match.group(1))
+            except Exception:
+                continue
+
+        return skill_map
+
     def run_tool(self, ai_response):
         if "EXECUTE:" in ai_response:
             try:
@@ -237,7 +265,10 @@ class SkillAgent:
                     return None
 
                 parts = full_content.split(maxsplit=1)
-                script_name = os.path.basename(parts[0])
+                raw_token = os.path.basename(parts[0])
+                # 先查「技能名稱 -> 腳本檔名」對照表（如 change_dir -> cd_cmd.py），
+                # 查不到則沿用舊邏輯，把輸入字串本身當作腳本名稱猜測。
+                script_name = self.skill_script_map.get(raw_token, raw_token)
 
                 if not script_name.endswith("_cmd.py") and not script_name.endswith(".py"):
                     script_name = f"{script_name}_cmd.py"
