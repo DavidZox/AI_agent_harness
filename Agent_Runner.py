@@ -16,7 +16,6 @@ SKILL_NAME_TO_SCRIPT = {
     "view_file": "cat_cmd.py",
 }
 
-NEED_TOOL_LOOP_LIMIT = 5  # 連續 NEED_TOOL（含重複命中快取）達此次數即強制中斷交還使用者
 DEFAULT_TOKEN_THRESHOLD = 8000  # 上下文預算閾值預設值，可由 SkillAgent(token_threshold=...) 或 /budget 指令調整
 DEFAULT_TOOL_IDLE_EVICTION_TURNS = 6  # 技能規格書連續閒置（未被 EXECUTE）幾輪後從上下文清除
 DEFAULT_HEARTBEAT_INTERVAL_SECONDS = 300  # 心跳預設間隔（5 分鐘），可由 /heartbeat interval 調整
@@ -94,7 +93,6 @@ class SkillAgent:
         # =========================
         self.loaded_tools = set()      # 技能顯示名稱（INDEX.md / tools/*.md 用）
         self.loaded_scripts = set()    # 實際腳本檔名（run_tool 解析用）
-        self.consecutive_need_tool_count = 0
 
         # =========================
         # 🧹 Skill Lifecycle（技能生命週期清除）
@@ -519,7 +517,6 @@ class SkillAgent:
         """
         self.loaded_tools.clear()
         self.loaded_scripts.clear()
-        self.consecutive_need_tool_count = 0
         self.tool_spec_messages.clear()
         self.tool_load_turn.clear()
         self.tool_last_used_turn.clear()
@@ -607,8 +604,12 @@ class SkillAgent:
         解析 `NEED_TOOL: <技能名稱>`，命中時載入 skills_system/tools/<name>.md 全文，
         是本次「隨需載入」重構的核心：技能規格書預設不在 context 裡，只有被明確請求時才載入。
 
-        只看第一行（刻意不沿用 EXECUTE 的 split(maxsplit=1) 寫法 —— 那種寫法在模型於指令後
-        面接著輸出額外說明文字、且沒有用 code fence 包起來時，會把說明文字一併吃進參數）。
+        逐行掃描，取「該行去除頭尾空白後以 `NEED_TOOL:` 開頭」的第一行（不是只看
+        `ai_response` 的第一行）——模型有時會先寫一兩句說明再換行輸出 `NEED_TOOL:`，
+        只檢查第一行會完全漏掉這種情況。刻意不沿用 EXECUTE 的 split(maxsplit=1) 寫法
+        —— 那種寫法在模型於指令後面接著輸出額外說明文字、且沒有用 code fence 包起來時，
+        會把說明文字一併吃進參數；這裡只取「命中的那一行」本身的內容，不會把後面（或前面）
+        其他行的說明文字一併吃進去。
 
         回傳 (顯示文字, 剛被新載入的技能名稱或 None)。第二個值只有在「這次是真的從檔案讀進來的
         全新載入」時才會是技能名稱，命中快取／找不到／不合法名稱等情況一律是 None——呼叫端
@@ -619,11 +620,14 @@ class SkillAgent:
         if not stripped:
             return None, None
 
-        first_line = stripped.splitlines()[0]
-        if "NEED_TOOL:" not in first_line:
+        marker_line = next(
+            (line for line in stripped.splitlines() if line.strip().startswith("NEED_TOOL:")),
+            None,
+        )
+        if marker_line is None:
             return None, None
 
-        raw_name = first_line.split("NEED_TOOL:", 1)[1].strip()
+        raw_name = marker_line.strip().split("NEED_TOOL:", 1)[1].strip()
         raw_name = raw_name.strip("`\"' ")
 
         # 安全防護：僅允許英數字與底線並取 basename，避免路徑穿越字串（與 grep_cmd.py/find_file_cmd.py
@@ -801,7 +805,7 @@ def main():
     """
     agent = SkillAgent(
         model="gemma4:e4b",
-        max_history=30
+        max_history=100
     )
     agent.reset_conversation()
 
@@ -939,10 +943,8 @@ def main():
 
                 if is_need_tool:
                     result = tool_doc
-                    agent.consecutive_need_tool_count += 1
                 else:
                     result = agent.run_tool(ai_msg)
-                    agent.consecutive_need_tool_count = 0
 
                 # --- 🧰 執行結果／規格書 顯示 ---
                 if result:
@@ -979,14 +981,25 @@ def main():
                         # 登記訊息物件參照，供 evict_idle_tools() 之後精準移除（而非用索引，
                         # 避免 truncate/compress 造成索引失效）
                         agent.tool_spec_messages[freshly_loaded_name] = spec_message
-                    if agent.consecutive_need_tool_count > NEED_TOOL_LOOP_LIMIT:
-                        print(f"\n🛑 連續 NEED_TOOL 已達 {NEED_TOOL_LOOP_LIMIT} 次，強制中斷並交還使用者確認。")
-                        break
                     print("♻️ 已載入規格書，自動繼續...")
                     continue
 
-                # 1. EXECUTE 結果：一律自動接續
-                agent.messages.append({'role': 'user', 'content': f"[tool result]\n{result}"})
+                # 1. EXECUTE 結果：一律自動接續，但附加判斷依據，讓模型自己決定要不要停下來
+                # （見 ROBOT_AGENT.md 的「停止時機」規則）——只回傳原始結果的話，小模型很容易
+                # 不管成敗都反射性地繼續呼叫工具；附上這段提示能讓它把 [PASS]/[ERROR] 等
+                # 約定標記當作「任務完成／失敗」的推論依據，而不是單純的文字內容。
+                agent.messages.append({
+                    'role': 'user',
+                    'content': (
+                        f"[tool result]\n{result}\n\n"
+                        "[SYSTEM] 請根據上方執行結果判斷下一步：\n"
+                        "- 若結果顯示成功（如 [PASS]）且已達成使用者原始需求，請直接用一般文字回報結果，"
+                        "不要再輸出 NEED_TOOL:/EXECUTE:。\n"
+                        "- 若結果顯示失敗（如 [ERROR]）且你已合理嘗試修正仍然失敗，請用一般文字說明失敗原因，"
+                        "不要重複輸出同樣的 NEED_TOOL:/EXECUTE: 再試一次。\n"
+                        "- 只有在使用者需求確實還沒完成、且有明確的下一步時，才繼續輸出 NEED_TOOL:/EXECUTE:。"
+                    ),
+                })
                 print("♻️ 已取得執行結果，自動繼續...")
                 continue
 
