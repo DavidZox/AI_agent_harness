@@ -23,7 +23,17 @@ import os
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-from Agent_Runner import SkillAgent, _append_discarded_tool_result
+# TOKEN_THRESHOLD（整體上下文自動壓縮門檻）、TOOL_RESULT_TOKEN_THRESHOLD
+# （單一工具回傳精簡門檻）與 _content_for_context 都是核心邏輯，定義在
+# Agent_Runner.py 裡，CLI（main()）與這裡共用同一份，避免兩邊各自維護一份
+# 而逐漸產生行為落差。
+from Agent_Runner import (
+    SkillAgent,
+    _append_discarded_tool_result,
+    _content_for_context,
+    TOKEN_THRESHOLD,
+    TOOL_RESULT_TOKEN_THRESHOLD,
+)
 
 # =========================================================
 # Agent 狀態（單一使用者、單一 Agent 實例）
@@ -33,10 +43,9 @@ agent = SkillAgent(model=os.environ.get("WEB_CONSOLE_MODEL", "gemma4:e4b"), max_
 agent.reset_conversation()
 
 state = {"auto_mode": False, "hybrid_mode": False}
-pending = {"result": None, "mode": None}  # 等待使用者決策的工具結果（hybrid / manual 模式用）
+pending = {"result": None, "mode": None, "tokens": None}  # 等待使用者決策的工具結果（hybrid / manual 模式用）
 lock = threading.Lock()
 
-TOKEN_THRESHOLD = 4000  # 與 Agent_Runner.main() 的自動壓縮門檻一致
 MAX_AUTO_ITERATIONS = 25  # 安全防護：避免 auto 模式下模型無限迴圈卡住伺服器
 
 MENU_TEXT = """可用指令：
@@ -50,7 +59,13 @@ MENU_TEXT = """可用指令：
 /objective clear        清除 Objective
 
 不切換 auto／hybrid 時，預設為「手動模式」：每次工具執行完都會等待你確認
-是否要把結果加入上下文，畫面下方會出現決策按鈕。"""
+是否要把結果加入上下文，畫面下方會出現決策按鈕。
+
+單一工具回傳若超過 {threshold} tokens，不論目前是什麼模式，AI 都只會收到
+精簡的成功／失敗摘要（避免大量原始輸出干擾推理），完整內容仍會顯示在
+「系統 / 工具回傳」面板並標記 ⚠️ 待確認，需自行點「✅ 我已確認」。""".format(
+    threshold=TOOL_RESULT_TOKEN_THRESHOLD
+)
 
 
 # =========================================================
@@ -92,10 +107,26 @@ def run_turn(events):
         events.append({"channel": "chat", "role": "assistant", "text": ai_msg, "tokens": ai_tokens})
 
         result = agent.run_tool(ai_msg)
+        tool_tokens = 0
         if result:
             tool_tokens = agent.count_tokens(result)
             agent.total_tool_tokens += tool_tokens
-            events.append({"channel": "tool", "text": result, "tokens": tool_tokens})
+            oversized = tool_tokens > TOOL_RESULT_TOKEN_THRESHOLD
+            events.append({
+                "channel": "tool",
+                "text": result,
+                "tokens": tool_tokens,
+                "oversized": oversized,
+            })
+            if oversized:
+                events.append({
+                    "channel": "system",
+                    "text": (
+                        f"⚠️ 此工具回傳約 {tool_tokens} tokens，超過門檻 "
+                        f"{TOOL_RESULT_TOKEN_THRESHOLD}，已標記待人工確認；"
+                        f"AI 只會收到精簡的成功／失敗摘要。"
+                    ),
+                })
         else:
             events.append({"channel": "system", "text": "✅ 無工具需要執行"})
 
@@ -111,13 +142,15 @@ def run_turn(events):
             return False
 
         if state["auto_mode"]:
-            agent.messages.append({'role': 'user', 'content': f"[tool result]\n{result}"})
+            content = _content_for_context(result, tool_tokens)
+            agent.messages.append({'role': 'user', 'content': f"[tool result]\n{content}"})
             events.append({"channel": "system", "text": "♻️ Auto Continue 中..."})
             continue
 
         # hybrid / manual 都需要暫停，等待使用者對這次工具結果做決策
         pending["result"] = result
         pending["mode"] = "hybrid" if state["hybrid_mode"] else "manual"
+        pending["tokens"] = tool_tokens
         return True
 
     events.append({"channel": "system", "text": "⚠️ 已達安全上限（連續執行過多輪工具），本回合自動中止。"})
@@ -128,19 +161,23 @@ def apply_decision(action, events):
     """套用使用者對待處理工具結果的決策，回傳是否要繼續本回合的迴圈。"""
     result = pending["result"]
     mode = pending["mode"]
+    tool_tokens = pending["tokens"] or 0
     pending["result"] = None
     pending["mode"] = None
+    pending["tokens"] = None
+
+    content = _content_for_context(result, tool_tokens)
 
     if mode == "hybrid":
         if action == "y":
-            agent.messages.append({'role': 'user', 'content': f"[tool result]\n{result}"})
+            agent.messages.append({'role': 'user', 'content': f"[tool result]\n{content}"})
         else:
             _append_discarded_tool_result(agent)
         return True  # hybrid 不論加入或捨棄，都會讓 AI 接續推論
 
     # manual 模式
     if action == "y":
-        agent.messages.append({'role': 'user', 'content': f"【系統執行結果】:\n{result}"})
+        agent.messages.append({'role': 'user', 'content': f"【系統執行結果】:\n{content}"})
         return True
     if action == "stop":
         return False
@@ -230,7 +267,14 @@ HTML_PAGE = r"""<!DOCTYPE html>
   .entry.assistant { background: #2b2d31; border: 1px solid #3a3c40; }
   .entry.tool { background: #1f2a24; border: 1px solid #2f4a3a; font-family: "Cascadia Code", Consolas, monospace; }
   .entry.system { background: #2a2620; border: 1px solid #4a4030; color: #d8c9a3; font-style: italic; }
+  .entry.tool.oversized { border: 1px solid #b0873f; box-shadow: 0 0 0 1px #b0873f inset; }
+  .entry.tool.oversized .tag { color: #e6b95c; opacity: 1; }
+  .entry.tool.oversized.reviewed { border-color: #2f4a3a; box-shadow: none; opacity: 0.75; }
   .entry .tag { font-size: 10px; text-transform: uppercase; opacity: 0.6; margin-bottom: 4px; }
+  .entry .ack-btn {
+    display: inline-block; margin-top: 6px; padding: 4px 10px; font-size: 11px;
+    background: #4a4c50; border-radius: 4px; cursor: pointer;
+  }
   footer { border-top: 1px solid #3a3c40; padding: 10px 12px; background: #2b2d31; }
   #decision-bar { display: none; margin-bottom: 8px; gap: 8px; align-items: center; font-size: 13px; }
   #decision-bar.show { display: flex; }
@@ -288,18 +332,28 @@ const msgBox = document.getElementById('msg');
 const sendBtn = document.getElementById('send-btn');
 const decisionBar = document.getElementById('decision-bar');
 
-function renderEntry(container, cls, tag, text) {
+function renderEntry(container, cls, tag, text, oversized) {
   const div = document.createElement('div');
-  div.className = 'entry ' + cls;
+  div.className = 'entry ' + cls + (oversized ? ' oversized' : '');
   if (tag) {
     const tagEl = document.createElement('div');
     tagEl.className = 'tag';
-    tagEl.textContent = tag;
+    tagEl.textContent = oversized ? tag + ' ⚠️ 待確認' : tag;
     div.appendChild(tagEl);
   }
   const textEl = document.createElement('div');
   textEl.textContent = text;
   div.appendChild(textEl);
+  if (oversized) {
+    const ackBtn = document.createElement('div');
+    ackBtn.className = 'ack-btn';
+    ackBtn.textContent = '✅ 我已確認';
+    ackBtn.onclick = () => {
+      div.classList.add('reviewed');
+      ackBtn.remove();
+    };
+    div.appendChild(ackBtn);
+  }
   container.appendChild(div);
   container.scrollTop = container.scrollHeight;
 }
@@ -309,7 +363,7 @@ function renderEvents(events) {
     if (ev.channel === 'chat') {
       renderEntry(chatLog, ev.role, ev.role === 'user' ? '你' : 'AI', ev.text);
     } else if (ev.channel === 'tool') {
-      renderEntry(toolLog, 'tool', '系統回傳', ev.text);
+      renderEntry(toolLog, 'tool', '系統回傳', ev.text, ev.oversized);
     } else if (ev.channel === 'system') {
       renderEntry(toolLog, 'system', '系統', ev.text);
     }

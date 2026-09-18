@@ -352,6 +352,32 @@ def _append_discarded_tool_result(agent):
     })
 
 
+# 整體上下文超過此 token 數時，自動觸發壓縮並歸檔（見 compress_context_to_file）。
+TOKEN_THRESHOLD = 8000
+
+# 單一工具回傳內容的 token 門檻：超過此值時，不會把完整原始內容塞進 AI 的
+# 上下文（避免一次搜尋/列目錄的大量輸出把 context 灌爆、干擾推理），而是
+# 改用精簡的「成功／失敗」摘要餵給 AI，讓它的推理流程保持穩定；完整內容
+# 仍會顯示給使用者（CLI 印出、或 web_console 的系統/工具回傳面板）。
+TOOL_RESULT_TOKEN_THRESHOLD = 250
+
+
+def _content_for_context(result, tool_tokens):
+    """決定要餵給 AI 上下文的內容：正常大小就原封不動放進去；超過
+    TOOL_RESULT_TOKEN_THRESHOLD 則改用精簡摘要，同時仍讓 AI 知道指令本身
+    是成功還是失敗，避免推理過程被誤導或被大量原始輸出干擾。"""
+    if tool_tokens <= TOOL_RESULT_TOKEN_THRESHOLD:
+        return result
+
+    status = "失敗" if result.lstrip().startswith("[ERROR]") else "成功"
+    return (
+        f"[tool result - 已精簡]\n"
+        f"指令已{status}執行（原始輸出約 {tool_tokens} tokens，超過門檻 "
+        f"{TOOL_RESULT_TOKEN_THRESHOLD}）。完整內容已顯示在剛才的系統回傳訊息中，"
+        f"未直接加入上下文，以維持推理穩定。"
+    )
+
+
 def main():
     agent = SkillAgent(
         model="gemma4:e4b",
@@ -436,11 +462,15 @@ def main():
 
                 # --- 🧰 TOOL 執行 ---
                 result = agent.run_tool(ai_msg)
+                tool_tokens = 0
                 if result:
                     tool_tokens = agent.count_tokens(result)
                     agent.total_tool_tokens += tool_tokens
                     print(f"\n🚀 系統回傳:\n{'-'*30}\n{result}\n{'-'*30}")
                     print(f"🧰 Tool Tokens: {tool_tokens}")
+                    if tool_tokens > TOOL_RESULT_TOKEN_THRESHOLD:
+                        print(f"⚠️ 此工具回傳約 {tool_tokens} tokens，超過門檻 {TOOL_RESULT_TOKEN_THRESHOLD}，"
+                              f"加入上下文時將改用精簡摘要。")
                 else:
                     print("✅ 無工具需要執行")
 
@@ -448,7 +478,6 @@ def main():
                 full_context = agent.get_system_prompt() + "\n" + "".join([f"{m['role']}: {m['content']}\n" for m in agent.messages])
                 print(f"\n📦 Context Tokens: {agent.count_tokens(full_context)}")
                 # --- 自動壓縮觸發器 ---
-                TOKEN_THRESHOLD = 8000 # 根據你的需求調整
                 if agent.count_tokens(full_context) > TOKEN_THRESHOLD:
                     agent.compress_context_to_file(num_to_keep=2)
                     print(f"\n📦 Compressed Context Tokens: {agent.count_tokens(full_context)}")
@@ -461,15 +490,15 @@ def main():
 
                 # 1. Auto Mode
                 if auto_mode:
-                    agent.messages.append({'role': 'user', 'content': f"[tool result]\n{result}"})
+                    agent.messages.append({'role': 'user', 'content': f"[tool result]\n{_content_for_context(result, tool_tokens)}"})
                     print("♻️ Auto Continue 中...")
                     continue
-                
+
                 # 2. Hybrid Mode
                 if hybrid_mode:
                     choice = input("\n🤔 Hybrid Mode - 加入上下文？(y/n): ").lower()
                     if choice == 'y':
-                        agent.messages.append({'role': 'user', 'content': f"[tool result]\n{result}"})
+                        agent.messages.append({'role': 'user', 'content': f"[tool result]\n{_content_for_context(result, tool_tokens)}"})
                         continue
                     else:
                         _append_discarded_tool_result(agent)
@@ -480,7 +509,7 @@ def main():
                 # 3. Manual Mode
                 choice = input("\n是否將系統結果加入上下文？(y/n/stop): ").lower()
                 if choice == 'y':
-                    agent.messages.append({'role': 'user', 'content': f"【系統執行結果】:\n{result}"})
+                    agent.messages.append({'role': 'user', 'content': f"【系統執行結果】:\n{_content_for_context(result, tool_tokens)}"})
                 elif choice == 'stop':
                     break
                 else:
