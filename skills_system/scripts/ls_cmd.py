@@ -6,15 +6,15 @@ import shlex
 def execute(args_str):
     # 預設的基礎指令組合
     base_cmd = ["ls", "-laF"]
-    
+    clean_args = []
+
     # --- AI Generated Code / CLI Executor ---
     try:
         if args_str and args_str.strip():
             # 使用 shlex.split 安全地拆分字串（例如 "-la /opt" 拆成 ['-la', '/opt']）
             parsed_args = shlex.split(args_str)
-            
+
             # 過濾掉已經內建的重複參數，避免變成 ls -laF -la
-            clean_args = []
             for arg in parsed_args:
                 if arg.startswith('-'):
                     # 提取非重複的參數字元（例如如果輸入 -la，我們只補上不重複的，或直接跳過）

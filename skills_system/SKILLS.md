@@ -35,5 +35,3 @@
 - [monitor_motor](/home/david/AI_agent_harness/skills_system/tools/monitor_motor.md) — 監測動力組件溫度，評估運作狀態
 - [check_batch](/home/david/AI_agent_harness/skills_system/tools/check_batch.md) — 接收逗號分隔的數值字串，檢查是否有數值超過限制 100
 
-## 自我進化
-- [manage_skill](/home/david/AI_agent_harness/skills_system/tools/manage_skill.md) — 當現有工具無法完成任務時，動態建立新技能並自動註冊
