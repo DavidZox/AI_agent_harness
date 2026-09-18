@@ -577,7 +577,9 @@ class SkillAgent:
             response = ollama.chat(
                 model=self.model,
                 messages=self.messages,
-                options={'temperature': 0.2}
+                options={'temperature': 0.2},
+                think=False,  # gemma4:e4b 支援思考模式，若不關閉，答案會被 Ollama 分離到
+                              # message.thinking 而非 message.content，導致 content 永遠是空字串
             )
 
             raw_content = response['message']['content'].strip()
