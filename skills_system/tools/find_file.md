@@ -1,0 +1,27 @@
+---
+type: Tool
+title: 檔案名稱搜尋
+description: 只搜尋「檔案名稱」本身。
+version: 1.0.0
+dependencies: []
+---
+
+# 背景 / 運作原理
+包裝系統 `find <path> -iname *pattern*`，自動判斷參數中何者為路徑、何者為檔名關鍵字，並阻擋對根目錄 `/` 的搜尋。
+
+# 語法 / 參數規範
+* `filename_keyword` (string, required): 檔名關鍵字（模糊比對，不分大小寫）。
+* `path` (string, optional): 搜尋起始目錄，預設為 `.`。
+* 核心腳本：`scripts/find_file_cmd.py`
+
+# 執行步驟 (Steps)
+1. 拆解參數，依「是否為現存目錄」判斷 path 與 pattern。
+2. 檢查 path 是否為根目錄（阻斷）。
+3. 以 5 秒逾時執行 `find -iname` 並回傳結果。
+
+# 範例 (Examples)
+* 尋找 Modelfile：`EXECUTE: find_file "Modelfile" .`
+
+# 異常處理 (Edge Cases)
+* 搜尋路徑為 `/` 時阻斷。
+* 找不到檔案時回傳 `[PASS]` 訊息（非錯誤）。

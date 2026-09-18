@@ -2,29 +2,64 @@ import os
 import textwrap
 
 class SkillManager:
-    def __init__(self, base_dir="/home/david/CLI_Ops_Test/skills_system"):
+    def __init__(self, base_dir="/home/david/AI_agent_harness/skills_system"):
         self.root = base_dir
         self.skills_dir = os.path.join(self.root, "skills")
         self.scripts_dir = os.path.join(self.root, "scripts")
+        self.tools_dir = os.path.join(self.root, "tools")
         self.index_file = os.path.join(self.root, "SKILLS.md")
-        
-        for d in [self.skills_dir, self.scripts_dir]:
+
+        for d in [self.skills_dir, self.scripts_dir, self.tools_dir]:
             os.makedirs(d, exist_ok=True)
             if "skills" in d and not os.path.exists(os.path.join(d, "__init__.py")):
                 with open(os.path.join(d, "__init__.py"), "w") as f: pass
 
+    def _write_tool_doc(self, name, description, script_path, params):
+        """依 Open Knowledge Format 產生技能詳細規格文件，回傳絕對路徑。"""
+        doc_path = os.path.join(self.tools_dir, f"{name}.md")
+        if not os.path.exists(doc_path):
+            rel_script = os.path.relpath(script_path, self.root)
+            content = f"""---
+type: Tool
+title: {name}
+description: {description}
+version: 1.0.0
+dependencies: []
+---
+
+# 背景 / 運作原理
+由 Agent 於自我進化流程中透過 `manage_skill_cmd.py` 自動生成。
+
+# 語法 / 參數規範
+* `{params}` (string, required)
+* 核心腳本：`{rel_script}`
+
+# 執行步驟 (Steps)
+1. 接收 `{params}` 參數。
+2. 執行自動生成的邏輯並回傳結果。
+
+# 範例 (Examples)
+* `EXECUTE: {name} <{params}>`
+
+# 異常處理 (Edge Cases)
+* 本文件為自動生成的骨架，正式大量使用前建議先以 view_file 檢視 `{rel_script}` 內容是否符合預期。
+"""
+            with open(doc_path, "w", encoding="utf-8") as f:
+                f.write(content)
+        return doc_path
+
     def _update_markdown(self, name, description, script_path, params):
-        rel_path = os.path.relpath(script_path, self.root)
-        # 確保 description 是一行，避免破壞表格結構
+        # 確保 description 是一行，避免破壞索引格式
         clean_desc = description.replace('\n', ' ').strip()
-        new_entry = f"| {name} | {clean_desc} | `{rel_path}` | `{params}` |\n"
-        
+        doc_path = self._write_tool_doc(name, clean_desc, script_path, params)
+        new_entry = f"- [{name}]({doc_path}) — {clean_desc}\n"
+
         if os.path.exists(self.index_file):
             with open(self.index_file, "r", encoding="utf-8") as f:
                 content = f.read()
-            
-            if f"| {name} |" in content:
-                return 
+
+            if f"[{name}]" in content:
+                return
 
             # 關鍵修正：確保文件末尾有換行符，防止新行直接貼在舊行屁股後面
             if content and not content.endswith('\n'):

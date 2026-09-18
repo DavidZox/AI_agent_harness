@@ -1,25 +1,39 @@
 # Agent Skills Index
 
-## 可用 CLI 工具清單
+> 這是輕量索引。每項技能只列出名稱與一行描述；完整的語法、參數、範例與異常處理請先用 `view_file` 讀取對應的連結文件後再執行。
 
-| 技能類型 | 技能名稱 | 功能描述 | 核心指令/腳本路徑 | 參數範例 |
-| :--- | :--- | :--- | :--- | :--- |
-| **系統內建** | `list_dir` | 查看指定環境語義單元（目錄）下的檔案清單 | `scripts/ls_cmd.py` | `-la /opt/ros` |
-| **系統內建** | `search_text`| 在檔案「內部文字」中過濾特定關鍵字。 | `scripts/grep_cmd.py` | `"ERROR" .` |
-| **系統內建** | `find_file` | 只搜尋「檔案名稱」本身。 | `scripts/find_file_cmd.py`| `"Modelfile" .` |
-| **系統內建** | `change_dir` | 切換當前工作目錄（注意：後端需維護 CWD 狀態） | `scripts/cd_cmd.py` | `/home/robot/workspace` |
-| **系統內建** | `view_file`  | 查看診斷報告或腳本內容 | `scripts/cat_cmd.py` | `config.yaml` |
-| **容器化環境** | `docker_est` | 創造指定映像檔的container | `scripts/docker_est_cmd.py` | `image_name` |
-| **容器化環境** | `docker_open` | 進入指定名稱的container中 | `scripts/docker_open_cmd.py` | `container_name` |
-| **容器化環境** | `docker_runcmd` | 若要在容器內使用指令時使用 | `scripts/docker_runcmd_cmd.py` | `container_name cmd_name` |
-| **多模態資訊** | `stt_engine` | 使用者需要進行語音輸入時使用 | `scripts/stt_engine_cmd.py` | `` |
-| **ROS2套件** | `ROS2_topic_list` | 在容器內使用查詢topic列表 | `scripts/ROS2_topic_list_cmd.py` | `container_name` |
-| **ROS2套件** | `ROS2_topic_echo` | 指定topic名稱進行echo命令，獲得topic詳細資訊 | `scripts/ROS2_topic_echo_cmd.py` | `container_name topic_name` |
-| **ROS2套件** | `ROS2_node_list` | 在容器內使用查詢node列表 | `scripts/ROS2_node_list_cmd.py` | `container_name` |
-| **ROS2套件** | `ROS2_node_info` | 指定node名稱進行info命令，獲得node詳細資訊 | `scripts/ROS2_node_info_cmd.py` | `container_name node_name` |
-| **調度系統** | `workitem_est` | 發送工作項目給調度系統時使用 | `scripts/workitem_est_cmd.py` | `robot_name(如："tb1") workstations(如："a0,a8,a6,a4") priority(如：10) state(如："duty") is_authored(如："yes")` |
-| **記憶修改** | `modify_memory`  | 寫入經驗記憶 | `scripts/modify_memory_cmd.py` | `Reflect` |
-| **專用運維** | `robot_ping` | 檢查 V4.9 機器人核心與語義層狀態 | `scripts/robot_ping_cmd.py` | (無參數) |
-| **專用運維** | `eval_speed` | 評估指定速度是否超出物理邊界限制 | `scripts/eval_speed_cmd.py` | `0.5` |
-| **專用運維** | `monitor_motor`| 監測動力組件溫度，評估運作狀態 | `scripts/monitor_motor_cmd.py` | `75` |
-| **專用運維** | `check_batch`| 接收逗號分隔的數值字串，檢查是否有數值超過限制 100 | `scripts/check_batch_cmd.py` | `98,102,45` |
+## 系統內建
+- [list_dir](/home/david/AI_agent_harness/skills_system/tools/list_dir.md) — 查看指定環境語義單元（目錄）下的檔案清單
+- [search_text](/home/david/AI_agent_harness/skills_system/tools/search_text.md) — 在檔案「內部文字」中過濾特定關鍵字
+- [find_file](/home/david/AI_agent_harness/skills_system/tools/find_file.md) — 只搜尋「檔案名稱」本身
+- [change_dir](/home/david/AI_agent_harness/skills_system/tools/change_dir.md) — 切換當前工作目錄（注意：後端需維護 CWD 狀態）
+- [view_file](/home/david/AI_agent_harness/skills_system/tools/view_file.md) — 查看診斷報告或腳本內容，也用於載入下方各技能的詳細規格文件
+
+## 容器化環境
+- [docker_est](/home/david/AI_agent_harness/skills_system/tools/docker_est.md) — 創造指定映像檔的 container
+- [docker_open](/home/david/AI_agent_harness/skills_system/tools/docker_open.md) — 進入指定名稱的 container 中
+- [docker_runcmd](/home/david/AI_agent_harness/skills_system/tools/docker_runcmd.md) — 若要在容器內使用指令時使用
+
+## 多模態資訊
+- [stt_engine](/home/david/AI_agent_harness/skills_system/tools/stt_engine.md) — 使用者需要進行語音輸入時使用
+
+## ROS2套件
+- [ROS2_topic_list](/home/david/AI_agent_harness/skills_system/tools/ROS2_topic_list.md) — 在容器內使用查詢 topic 列表
+- [ROS2_topic_echo](/home/david/AI_agent_harness/skills_system/tools/ROS2_topic_echo.md) — 指定 topic 名稱進行 echo 命令，獲得 topic 詳細資訊
+- [ROS2_node_list](/home/david/AI_agent_harness/skills_system/tools/ROS2_node_list.md) — 在容器內使用查詢 node 列表
+- [ROS2_node_info](/home/david/AI_agent_harness/skills_system/tools/ROS2_node_info.md) — 指定 node 名稱進行 info 命令，獲得 node 詳細資訊
+
+## 調度系統
+- [workitem_est](/home/david/AI_agent_harness/skills_system/tools/workitem_est.md) — 發送工作項目給調度系統時使用
+
+## 記憶修改
+- [modify_memory](/home/david/AI_agent_harness/skills_system/tools/modify_memory.md) — 寫入經驗記憶
+
+## 專用運維
+- [robot_ping](/home/david/AI_agent_harness/skills_system/tools/robot_ping.md) — 檢查 V4.9 機器人核心與語義層狀態
+- [eval_speed](/home/david/AI_agent_harness/skills_system/tools/eval_speed.md) — 評估指定速度是否超出物理邊界限制
+- [monitor_motor](/home/david/AI_agent_harness/skills_system/tools/monitor_motor.md) — 監測動力組件溫度，評估運作狀態
+- [check_batch](/home/david/AI_agent_harness/skills_system/tools/check_batch.md) — 接收逗號分隔的數值字串，檢查是否有數值超過限制 100
+
+## 自我進化
+- [manage_skill](/home/david/AI_agent_harness/skills_system/tools/manage_skill.md) — 當現有工具無法完成任務時，動態建立新技能並自動註冊

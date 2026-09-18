@@ -1,9 +1,9 @@
-# /home/david/CLI_Ops_Test/skills_system/scripts/manage_skill_cmd.py
+# /home/david/AI_agent_harness/skills_system/scripts/manage_skill_cmd.py
 import sys
 import os
 
 # 強制加入專案根目錄
-PROJECT_ROOT = "/home/david/CLI_Ops_Test"
+PROJECT_ROOT = "/home/david/AI_agent_harness"
 if PROJECT_ROOT not in sys.path:
     sys.path.insert(0, PROJECT_ROOT)
 
