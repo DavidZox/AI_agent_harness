@@ -21,7 +21,7 @@ DEFAULT_TOKEN_THRESHOLD = 8000  # 上下文預算閾值預設值，可由 SkillA
 DEFAULT_TOOL_IDLE_EVICTION_TURNS = 6  # 技能規格書連續閒置（未被 EXECUTE）幾輪後從上下文清除
 DEFAULT_HEARTBEAT_INTERVAL_SECONDS = 300  # 心跳預設間隔（5 分鐘），可由 /heartbeat interval 調整
 # 心跳固定唯讀健檢清單：(顯示標籤, 腳本檔名, 固定參數列表)。只跑不需要即時情境參數的唯讀技能，
-# 不經過 LLM 推論、不自動寫入記憶——這是刻意的安全邊界，見 ROBOT_AGENT.md 的 Memory Write Protocol
+# 不經過 LLM 推論、不自動寫入記憶——這是刻意的安全邊界，見 tools/modify_memory.md 的異常處理
 # （記憶寫入必須由使用者明確要求，心跳沒有人在場確認，不適用）。
 DEFAULT_HEARTBEAT_CHECKS = [
     ("robot_ping", "robot_ping_cmd.py", []),
@@ -280,10 +280,12 @@ class SkillAgent:
 {to_compress}
 """
         # 使用 Ollama 進行摘要
+        # think=False：gemma4:e4b 若不關閉思考模式，回覆會被 Ollama 分流到 message.thinking，
+        # message.content 永遠是空字串，等於壓縮摘要整段消失（見 ask_ai() 同樣的修法）
         res = ollama.chat(model=self.model, messages=[
             {'role': 'system', 'content': system_prompt},
             {'role': 'user', 'content': user_prompt}
-        ])
+        ], think=False)
         summary_content = res['message']['content']
         # 🔥 關鍵：重置對話時，保留 System Prompt + 我們想保留的最新對話
         # （注意：這裡刻意不再呼叫 reset_conversation() —— 舊版在這行之後緊接著呼叫它，
@@ -417,7 +419,7 @@ class SkillAgent:
     def _run_heartbeat_once(self):
         """
         執行一輪固定的唯讀健檢。刻意不呼叫 ask_ai()、不寫入 memory/、不碰 self.messages——
-        心跳期間沒有人在場確認，維持與 ROBOT_AGENT.md 一致的『記憶寫入需使用者明確要求』
+        心跳期間沒有人在場確認，維持與 tools/modify_memory.md 一致的『記憶寫入需使用者明確要求』
         『EXECUTE 需經過協議』等原則，只單純把結果記錄下來，留給下次真人互動時參考。
         """
         timestamp = time.strftime('%Y-%m-%d %H:%M:%S')
@@ -788,22 +790,20 @@ def main():
     REPL 主程式進入點：建立一個 SkillAgent、重置對話，然後進入無窮迴圈讀取
     使用者輸入並處理。
 
-    每輪輸入先比對是否命中內建的 slash 指令（/clear、/compress、/auto on|off、
-    /hybrid on|off、/budget、/skill_ttl、/heartbeat on|off|status|interval、
-    /objective，以及多行版本的 objective set/show/clear）並就地處理、continue
-    回主迴圈；否則視為一般訊息，進入內層迴圈：呼叫 ask_ai() 取得模型回覆 →
-    依序判斷 check_need_tool()（優先）與 run_tool() → 視結果與目前模式
-    （NEED_TOOL 一律自動繼續／auto/hybrid/manual）決定是否把結果加入對話並
-    繼續下一輪，或中斷交還使用者輸入。exit/quit 或 Ctrl+C 都會先呼叫
-    agent.stop_heartbeat() 再結束，避免心跳背景執行緒殘留。
+    每輪輸入先比對是否命中內建的 slash 指令（/clear、/compress、/budget、/skill_ttl、
+    /heartbeat on|off|status|interval、/objective，以及多行版本的 objective
+    set/show/clear）並就地處理、continue 回主迴圈；否則視為一般訊息，進入內層
+    迴圈：呼叫 ask_ai() 取得模型回覆 → 依序判斷 check_need_tool()（優先）與
+    run_tool() → 只要這輪有工具動作（NEED_TOOL 或 EXECUTE 任一）就一律自動把
+    結果加入對話並繼續下一輪；完全沒有工具動作（模型純文字回覆）才中斷交還
+    使用者輸入。exit/quit 或 Ctrl+C 都會先呼叫 agent.stop_heartbeat() 再結束，
+    避免心跳背景執行緒殘留。
     """
     agent = SkillAgent(
         model="gemma4:e4b",
         max_history=30
     )
     agent.reset_conversation()
-    auto_mode = False
-    hybrid_mode = False  # 👈 新增狀態
 
     print("\n" + "="*50)
     print("V7 Robot Agent + On-Demand Skill Loading 已啟動")
@@ -826,24 +826,6 @@ def main():
             if user_msg.lower() == '/compress':
                 agent.compress_context_to_file(num_to_keep=2)
                 print("🗜️ 歷史已手動壓縮並歸檔。")
-                continue
-
-            # --- 模式切換指令 ---
-            if user_msg.lower() == '/auto on':
-                auto_mode = True
-                print("🤖 已開啟 Auto Continue 模式")
-                continue
-            if user_msg.lower() == '/auto off':
-                auto_mode = False
-                print("🛑 已關閉 Auto Continue 模式")
-                continue
-            if user_msg.lower() == '/hybrid on':
-                hybrid_mode = True
-                print("🧬 已開啟 Hybrid Mode")
-                continue
-            if user_msg.lower() == '/hybrid off':
-                hybrid_mode = False
-                print("🧬 已關閉 Hybrid Mode")
                 continue
 
             # --- 📦 上下文預算閾值查詢／設定 ---
@@ -982,7 +964,7 @@ def main():
                 if not result:
                     break
 
-                # 0. NEED_TOOL：唯讀的規格書載入動作，一律自動繼續，不受 auto/hybrid/manual 影響
+                # 0. NEED_TOOL：唯讀的規格書載入動作，一律自動繼續
                 if is_need_tool:
                     spec_message = {
                         'role': 'user',
@@ -1003,42 +985,10 @@ def main():
                     print("♻️ 已載入規格書，自動繼續...")
                     continue
 
-                # 1. Auto Mode
-                if auto_mode:
-                    agent.messages.append({'role': 'user', 'content': f"[tool result]\n{result}"})
-                    print("♻️ Auto Continue 中...")
-                    continue
-
-                # 2. Hybrid Mode
-                if hybrid_mode:
-                    choice = input("\n🤔 Hybrid Mode - 加入上下文？(y/n): ").lower()
-                    if choice == 'y':
-                        agent.messages.append({'role': 'user', 'content': f"[tool result]\n{result}"})
-                        continue
-                    else:
-                        # 🔥 關鍵修正：回傳「工具已執行，但結果被隱藏」的訊息給 Agent
-                        agent.messages.append({
-                            'role': 'user',
-                            'content': "[tool result]\nTool execution completed, but the result was discarded by user request."
-                        })
-                        print("🚫 該結果已被略過 (已告知 Agent 執行結束)")
-                        # 這裡不使用 break，讓 AI 根據這個「工具執行完畢」的資訊繼續推論
-                        continue
-
-                # 3. Manual Mode
-                choice = input("\n是否將系統結果加入上下文？(y/n/stop): ").lower()
-                if choice == 'y':
-                    agent.messages.append({'role': 'user', 'content': f"【系統執行結果】:\n{result}"})
-                elif choice == 'stop':
-                    break
-                else:
-                # 🔥 關鍵修正：回傳「工具已執行，但結果被隱藏」的訊息給 Agent
-                    agent.messages.append({
-                        'role': 'user',
-                        'content': "[tool result]\nTool execution completed, but the result was discarded by user request."
-                    })
-                    print("👀 已略過")
-                    break
+                # 1. EXECUTE 結果：一律自動接續
+                agent.messages.append({'role': 'user', 'content': f"[tool result]\n{result}"})
+                print("♻️ 已取得執行結果，自動繼續...")
+                continue
 
         except KeyboardInterrupt:
             agent.stop_heartbeat()
