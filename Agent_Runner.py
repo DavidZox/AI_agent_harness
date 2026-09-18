@@ -38,7 +38,6 @@ class SkillAgent:
         # =========================
         self.sticky_objective = None
 
-
     def count_tokens(self, text: str) -> int:
         """
         Ollama Native tokenizer (Gemma 4 e4b)
@@ -70,7 +69,7 @@ class SkillAgent:
         print(f"\n⏳ 正在壓縮 {len(to_compress)} 筆舊對話...")
         print("\n⏳ 正在壓縮上下文並歸檔...")
 
-# 1. 系統提示詞：定義「身分」與「嚴格的輸出格式規則」
+        # 1. 系統提示詞：定義「身分」與「嚴格的輸出格式規則」
         system_prompt = f"""你是一位專業的系統分析師。
 你的任務是將對話內容總結為結構化的 Markdown 報告。
 你必須嚴格遵守以下範本格式進行輸出，不得隨意增刪標題：
@@ -152,11 +151,12 @@ class SkillAgent:
         except Exception as e:
             return f"[Memory Load Error] {e}"
 
-    def get_system_prompt(self):
+    def _build_objective_prompt(self):
+        """若有設定 sticky objective，組成提醒 AI 優先遵守的區塊；否則回傳空字串。"""
+        if not self.sticky_objective:
+            return ""
 
-        objective_prompt = ""
-        if self.sticky_objective:
-            objective_prompt = f"""
+        return f"""
             ## CURRENT PRIMARY OBJECTIVE
             {self.sticky_objective}
 
@@ -167,6 +167,10 @@ class SkillAgent:
             - 當上下文過長時，優先維持此目標
             """
 
+    def get_system_prompt(self):
+
+        objective_prompt = self._build_objective_prompt()
+
         profile = ""
         if os.path.exists(self.profile_file):
             with open(self.profile_file, "r", encoding="utf-8") as f:
@@ -174,8 +178,9 @@ class SkillAgent:
 
         with open(self.index_file, "r", encoding="utf-8") as f:
             skills = f.read()
-            memory_content = self.load_long_term_memory()
-            history_summary = self.load_recent_summary_logs()
+
+        memory_content = self.load_long_term_memory()
+        history_summary = self.load_recent_summary_logs()
 
         status_prompt = f"\n\n## Current Agent State\n- CURRENT_WORKING_DIRECTORY: {self.current_cwd}\nCURRENT_CONTAINER_DIRECTORY: {self.container_cwd}"
 
@@ -229,94 +234,123 @@ class SkillAgent:
         except Exception as e:
             return f"Ollama 連線錯誤: {e}"
 
+    def _extract_execute_payload(self, ai_response):
+        """從 AI 回應中取出 EXECUTE: 後面的內容；去除 code fence／註解殘留後為空則回傳 None。"""
+        start_marker = "EXECUTE:"
+        start_idx = ai_response.find(start_marker)
+        payload = ai_response[start_idx + len(start_marker):].strip()
+
+        if "```" in payload:
+            payload = payload.split("```")[0].strip()
+        if "# ---" in payload:
+            payload = payload.split("# ---")[0].strip()
+
+        return payload or None
+
+    def _load_skill_doc(self, skill_name):
+        """若 skill_name 對應到 tools/<skill_name>.md，回傳其內容；否則回傳 None。"""
+        doc_path = os.path.join(self.tools_dir, f"{skill_name}.md")
+        if not os.path.exists(doc_path):
+            return None
+        with open(doc_path, "r", encoding="utf-8") as f:
+            return f.read()
+
+    def _normalize_script_name(self, raw_token):
+        """確保腳本檔名以 _cmd.py 結尾（例如 cd -> cd_cmd.py，find_file.py -> find_file_cmd.py）。"""
+        if not raw_token.endswith("_cmd.py") and not raw_token.endswith(".py"):
+            return f"{raw_token}_cmd.py"
+        if raw_token.endswith(".py") and not raw_token.endswith("_cmd.py"):
+            return raw_token.replace(".py", "_cmd.py")
+        return raw_token
+
+    def _parse_script_args(self, script_name, remainder):
+        """依腳本類型解析參數字串。manage_skill 的參數含 `|` 分隔符，需保留原始字串；
+        其餘技能才用 shlex 依空白／引號拆分成參數列表。"""
+        if "manage_skill" in script_name:
+            return [remainder.strip()] if remainder else []
+        try:
+            return shlex.split(remainder)
+        except Exception:
+            return remainder.split()
+
+    def _sync_state_from_tool_output(self, output_text):
+        """解析工具輸出中的狀態標記，同步更新目前的工作目錄／容器目錄。"""
+        lines = output_text.splitlines()
+        for i, line in enumerate(lines):
+            if line.startswith("[CWD_CHANGED]"):
+                self.current_cwd = line.replace("[CWD_CHANGED]", "").strip()
+            # 抓取 [CONTAINER_CWD] 標記的下一行作為路徑
+            if line.startswith("[CONTAINER_CWD]") and i + 1 < len(lines):
+                self.container_cwd = lines[i + 1].strip()
+
     def run_tool(self, ai_response):
-        if "EXECUTE:" in ai_response:
-            try:
-                start_marker = "EXECUTE:"
-                start_idx = ai_response.find(start_marker)
-                full_content = ai_response[start_idx + len(start_marker):].strip()
+        """解析 AI 回應中的 EXECUTE: 指令並執行，行為分兩種：
 
-                if "```" in full_content:
-                    full_content = full_content.split("```")[0].strip()
-                if "# ---" in full_content:
-                    full_content = full_content.split("# ---")[0].strip()
-                if not full_content:
-                    return None
+        1. 若目標字串對應到 tools/<name>.md 的技能規格文件（代表 AI 用的是
+           SKILLS.md 索引裡的技能名稱），直接把規格文件內容當作系統回傳注入
+           上下文，不執行任何腳本——這就是按需載入 (Progressive Disclosure)。
+           不做技能名稱 -> 腳本檔名的猜測或對照；AI 讀完規格後，下一輪需改用
+           規格書中標明的實際腳本路徑（例如 scripts/cd_cmd.py）才會真正執行。
+        2. 否則將目標字串視為實際腳本路徑，執行對應的 CLI 腳本並回傳結果。
+        """
+        if "EXECUTE:" not in ai_response:
+            return None
 
-                parts = full_content.split(maxsplit=1)
-                raw_token = os.path.basename(parts[0])
+        try:
+            payload = self._extract_execute_payload(ai_response)
+            if not payload:
+                return None
 
-                # --- 不做技能名稱 -> 腳本檔名的猜測或對照。---
-                # 若 AI 給的字串剛好對應到 tools/ 底下的一份規格文件（代表它是用
-                # SKILLS.md 索引裡的技能名稱），就直接把該規格文件內容當作系統回傳
-                # 注入上下文，並不執行任何腳本；AI 讀完規格後，下一輪需改用規格書中
-                # 標明的實際腳本路徑（例如 scripts/cd_cmd.py）才會真正執行。
-                skill_doc_path = os.path.join(self.tools_dir, f"{raw_token}.md")
-                if os.path.exists(skill_doc_path):
-                    with open(skill_doc_path, "r", encoding="utf-8") as f:
-                        doc_content = f.read()
-                    print(f"📖 Agent 選擇技能索引: {raw_token}（載入規格文件，尚未執行）")
-                    return f"📘 已載入技能 '{raw_token}' 的規格文件（依此內容才可執行，請使用其中標明的實際腳本路徑）：\n{doc_content}"
+            parts = payload.split(maxsplit=1)
+            raw_token = os.path.basename(parts[0])
+            remainder = parts[1] if len(parts) > 1 else ""
 
-                script_name = raw_token
+            skill_doc = self._load_skill_doc(raw_token)
+            if skill_doc is not None:
+                print(f"📖 Agent 選擇技能索引: {raw_token}（載入規格文件，尚未執行）")
+                return f"📘 已載入技能 '{raw_token}' 的規格文件（依此內容才可執行，請使用其中標明的實際腳本路徑）：\n{skill_doc}"
 
-                if not script_name.endswith("_cmd.py") and not script_name.endswith(".py"):
-                    script_name = f"{script_name}_cmd.py"
-                elif script_name.endswith(".py") and not script_name.endswith("_cmd.py"):
-                    script_name = script_name.replace(".py", "_cmd.py")
+            script_name = self._normalize_script_name(raw_token)
+            script_path = os.path.join(self.base_path, "scripts", script_name)
 
-                script_path = os.path.join(self.base_path, "scripts", script_name)
+            print(f"🛠️  Agent 啟動工具: {script_name}")
+            if not os.path.exists(script_path):
+                return f"錯誤：找不到腳本 {script_path}"
 
-                # 參數處理
-                if "manage_skill" in script_name:
-                    clean_args = [parts[1].strip()] if len(parts) > 1 else []
-                else:
-                    remaining_args = parts[1] if len(parts) > 1 else ""
-                    try:
-                        clean_args = shlex.split(remaining_args)
-                    except Exception:
-                        clean_args = remaining_args.split()
+            clean_args = self._parse_script_args(script_name, remainder)
 
-                print(f"🛠️  Agent 啟動工具: {script_name}")
-                if not os.path.exists(script_path):
-                    return f"錯誤：找不到腳本 {script_path}"
+            # --- 執行工具 ---
+            # 將目前的容器路徑作為環境變數注入，讓 docker_run.py 讀取
+            env = os.environ.copy()
+            env["CONTAINER_CWD"] = self.container_cwd
 
-                # --- 執行工具 ---
-                # 將目前的容器路徑作為環境變數注入，讓 docker_run.py 讀取
-                env = os.environ.copy()
-                env["CONTAINER_CWD"] = self.container_cwd
+            res = subprocess.run(
+                [sys.executable, script_path] + clean_args,
+                capture_output=True,
+                text=True,
+                cwd=self.current_cwd,
+                env=env
+            )
 
-                res = subprocess.run(
-                    [sys.executable, script_path] + clean_args,
-                    capture_output=True,
-                    text=True,
-                    cwd=self.current_cwd,
-                    env=env
-                )
+            output_text = res.stdout.strip() if res.returncode == 0 else res.stderr
+            self._sync_state_from_tool_output(output_text)
+            return output_text
 
-                output_text = res.stdout.strip() if res.returncode == 0 else res.stderr
-                lines = output_text.splitlines()
-
-                # --- 狀態同步邏輯 ---
-                for i, line in enumerate(lines):
-                    if line.startswith("[CWD_CHANGED]"):
-                        self.current_cwd = line.replace("[CWD_CHANGED]", "").strip()
-                    
-                    # 抓取 [CONTAINER_CWD] 標記的下一行作為路徑
-                    if line.startswith("[CONTAINER_CWD]"):
-                        if i + 1 < len(lines):
-                            self.container_cwd = lines[i + 1].strip()
-
-                return output_text
-
-            except Exception as e:
-                return f"解析指令失敗: {e}"
-
-        return None
+        except Exception as e:
+            return f"解析指令失敗: {e}"
 
 # =========================================================
 # 🚀 MAIN LOOP (加入 Token Tracking 顯示)
 # =========================================================
+
+def _append_discarded_tool_result(agent):
+    """使用者選擇不把工具結果加入上下文時，仍需告知 AI「工具已執行完畢」，
+    避免它誤以為指令根本沒被處理而重複嘗試。"""
+    agent.messages.append({
+        'role': 'user',
+        'content': "[tool result]\nTool execution completed, but the result was discarded by user request."
+    })
+
 
 def main():
     agent = SkillAgent(
@@ -438,11 +472,7 @@ def main():
                         agent.messages.append({'role': 'user', 'content': f"[tool result]\n{result}"})
                         continue
                     else:
-                        # 🔥 關鍵修正：回傳「工具已執行，但結果被隱藏」的訊息給 Agent
-                        agent.messages.append({
-                            'role': 'user', 
-                            'content': "[tool result]\nTool execution completed, but the result was discarded by user request."
-                        })
+                        _append_discarded_tool_result(agent)
                         print("🚫 該結果已被略過 (已告知 Agent 執行結束)")
                         # 這裡不使用 break，讓 AI 根據這個「工具執行完畢」的資訊繼續推論
                         continue
@@ -454,11 +484,7 @@ def main():
                 elif choice == 'stop':
                     break
                 else:
-                # 🔥 關鍵修正：回傳「工具已執行，但結果被隱藏」的訊息給 Agent
-                    agent.messages.append({
-                        'role': 'user', 
-                        'content': "[tool result]\nTool execution completed, but the result was discarded by user request."
-                    })
+                    _append_discarded_tool_result(agent)
                     print("👀 已略過")
                     break
 
