@@ -594,6 +594,12 @@ class SkillAgent:
         except Exception as e:
             return f"Ollama 連線錯誤: {e}"
 
+    def _get_index_skill_names(self):
+        """讀取 INDEX.md 表格中以反引號包住的技能名稱清單，供 check_need_tool() 驗證用。"""
+        with open(self.index_file, "r", encoding="utf-8") as f:
+            content = f.read()
+        return set(re.findall(r"`([A-Za-z0-9_]+)`", content))
+
     def check_need_tool(self, ai_response):
         """
         解析 `NEED_TOOL: <技能名稱>`，命中時載入 skills_system/tools/<name>.md 全文，
@@ -624,6 +630,11 @@ class SkillAgent:
         if not re.fullmatch(r"[A-Za-z0-9_]+", safe_name):
             return f"[ERROR] 不合法的技能名稱: {raw_name}", None
 
+        # 硬性驗證：必須是 INDEX.md 實際列出的技能，避免模型憑空捏造名稱、
+        # 或載入到未登記於索引、僅存在孤兒規格書的技能
+        if safe_name not in self._get_index_skill_names():
+            return f"[ERROR] 技能 '{safe_name}' 未列於 INDEX.md，拒絕載入規格書。請確認技能名稱是否正確。", None
+
         if safe_name in self.loaded_tools:
             return f"[INFO] 技能 '{safe_name}' 規格書本次對話已載入，無需重複讀取。", None
 
@@ -650,21 +661,24 @@ class SkillAgent:
         主要步驟：
         1. 取出 EXECUTE: 之後的內容，若模型多輸出了 code fence 或 "# ---" 分隔線，
            一併裁掉；再切出腳本名稱與其餘參數字串。
-        2. 腳本名稱正規化——不論模型輸出的是技能顯示名稱、裸檔名還是已含
-           `_cmd.py` 副檔名，都統一補齊成實際檔名（如 change_dir → cd_cmd.py，
-           經 SKILL_NAME_TO_SCRIPT 或預設的 `<名稱>_cmd.py` 規則解析）。
-        3. 參數切分：`manage_skill` 系列因為參數本身是用 `|` 分隔的單一字串
+        2. 腳本名稱正規化——先查 SKILL_NAME_TO_SCRIPT 歷史例外表（如 change_dir →
+           cd_cmd.py，與 check_need_tool() 共用同一張表），查無對應才退回
+           `<名稱>_cmd.py` 預設規則，並統一補齊／修正 `_cmd.py` 副檔名。
+        3. 硬性協議關卡：若正規化後的腳本檔名不在 self.loaded_scripts（代表尚未
+           透過 NEED_TOOL 成功載入過對應規格書），直接回傳 `[ERROR]` 拒絕執行，
+           不會進到 subprocess 呼叫——NEED_TOOL 不只是省 token 機制，也是唯一
+           能驗證「技能真實存在於 INDEX.md」的關卡（見 check_need_tool() 的
+           _get_index_skill_names() 檢查）。
+        4. 參數切分：`manage_skill` 系列因為參數本身是用 `|` 分隔的單一字串
            （名稱｜描述｜參數名｜程式碼主體），整段原樣當一個參數傳入，不能用
            shlex 再切一次；其餘腳本則用 shlex.split（失敗時退回簡單 split）。
-        4. 用 subprocess 執行腳本，帶入目前的 current_cwd 與（透過環境變數
+        5. 用 subprocess 執行腳本，帶入目前的 current_cwd 與（透過環境變數
            CONTAINER_CWD 注入的）container_cwd。
-        5. 掃描輸出中的 `[CWD_CHANGED]`／`[CONTAINER_CWD]` 標記以同步 Agent 的
+        6. 掃描輸出中的 `[CWD_CHANGED]`／`[CONTAINER_CWD]` 標記以同步 Agent 的
            目錄狀態；若是成功的 manage_skill 呼叫，因為新技能是在子行程中建立、
            無法直接改到本行程的記憶體狀態，改由這裡從父行程解析同一份輸入把新
            技能名稱登記進 loaded_tools/loaded_scripts。
-        6. 記錄這個腳本這一輪確實被 EXECUTE 過（供 evict_idle_tools() 判斷閒置）；
-           若尚未透過 NEED_TOOL 載入過規格書就直接執行，附加一則不阻擋執行的
-           `[INFO]` 提醒（NEED_TOOL 是省 token 機制，不是權限控管）。
+        7. 記錄這個腳本這一輪確實被 EXECUTE 過（供 evict_idle_tools() 判斷閒置）。
 
         任何解析或執行過程中的例外都會被攔截，回傳說明錯誤的字串。
         """
@@ -682,12 +696,25 @@ class SkillAgent:
                     return None
 
                 parts = full_content.split(maxsplit=1)
-                script_name = os.path.basename(parts[0])
+                raw_name = os.path.basename(parts[0])
+                # 先查歷史例外表（顯示名稱與實際腳本檔名不一致，如 change_dir -> cd_cmd.py），
+                # 與 check_need_tool() 使用同一張表，避免兩處判斷各自為政而對不上
+                script_name = SKILL_NAME_TO_SCRIPT.get(raw_name, raw_name)
 
                 if not script_name.endswith("_cmd.py") and not script_name.endswith(".py"):
                     script_name = f"{script_name}_cmd.py"
                 elif script_name.endswith(".py") and not script_name.endswith("_cmd.py"):
                     script_name = script_name.replace(".py", "_cmd.py")
+
+                # --- 硬性協議關卡：EXECUTE 前必須先 NEED_TOOL 讀過規格書 ---
+                # 原本是軟性提醒（仍會放行執行），現改為硬性擋下：NEED_TOOL 不只是省 token
+                # 機制，也是「先確認技能真實存在於 INDEX.md 且已核閱規格書」的協議關卡，
+                # 未通過一律拒絕執行，不會呼叫 subprocess。
+                if script_name not in self.loaded_scripts:
+                    return (
+                        f"[ERROR] 尚未透過 NEED_TOOL 載入此技能的規格書，依協議禁止直接 EXECUTE '{raw_name}'。"
+                        f"請先輸出 NEED_TOOL: <INDEX.md 中列出的技能名稱>。"
+                    )
 
                 script_path = os.path.join(self.base_path, "scripts", script_name)
 
@@ -744,14 +771,6 @@ class SkillAgent:
                     if new_name and re.fullmatch(r"[A-Za-z0-9_]+", new_name):
                         self.loaded_tools.add(new_name)
                         self.loaded_scripts.add(f"{new_name}_cmd.py")
-
-                # --- 未先 NEED_TOOL 就 EXECUTE：軟性提醒，不阻擋 ---
-                # NEED_TOOL 是省 token 的機制，不是權限控管，因此絕不因未載入規格書而拒絕執行。
-                if script_name not in self.loaded_scripts:
-                    output_text = (
-                        "[INFO] 提醒：尚未透過 NEED_TOOL 載入此技能的規格書，仍已依既有邏輯執行下方結果。\n"
-                        f"{output_text}"
-                    )
 
                 return output_text
 
@@ -965,7 +984,14 @@ def main():
 
                 # 0. NEED_TOOL：唯讀的規格書載入動作，一律自動繼續，不受 auto/hybrid/manual 影響
                 if is_need_tool:
-                    spec_message = {'role': 'user', 'content': f"[tool spec]\n{result}"}
+                    spec_message = {
+                        'role': 'user',
+                        'content': (
+                            f"[tool spec]\n{result}\n\n"
+                            "[SYSTEM] 已自動載入上方規格書並交還給你，這一輪請直接根據規格書與使用者原始需求"
+                            "輸出對應的 EXECUTE: 指令；若參數已齊全，嚴禁反問使用者「接下來要做什麼」。"
+                        ),
+                    }
                     agent.messages.append(spec_message)
                     if freshly_loaded_name:
                         # 登記訊息物件參照，供 evict_idle_tools() 之後精準移除（而非用索引，
