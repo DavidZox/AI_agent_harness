@@ -20,7 +20,7 @@ dependencies: []
 3. 以 5 秒逾時執行 `find -iname` 並回傳結果。
 
 # 範例 (Examples)
-* 尋找 Modelfile：`EXECUTE: find_file "Modelfile" .`
+* 尋找 Modelfile：`EXECUTE: scripts/find_file_cmd.py "Modelfile" .`
 
 # 異常處理 (Edge Cases)
 * 搜尋路徑為 `/` 時阻斷。

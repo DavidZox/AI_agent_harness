@@ -18,7 +18,7 @@ dependencies: ["docker"]
 2. 回傳啟動結果。
 
 # 範例 (Examples)
-* 建立容器：`EXECUTE: docker_est ros2_humble`
+* 建立容器：`EXECUTE: scripts/docker_est_cmd.py ros2_humble`
 
 # 異常處理 (Edge Cases)
 * 找不到 docker 指令時回傳 `[ERROR]`（請確認 Docker 是否安裝）。

@@ -19,8 +19,8 @@ dependencies: ["docker"]
 2. 執行並回傳標準輸出（含指令結果與最終路徑）。
 
 # 範例 (Examples)
-* 於容器內列出檔案：`EXECUTE: docker_runcmd ros2_humble "ls -la /opt/ros"`
-* 於容器內建置：`EXECUTE: docker_runcmd ros2_humble "colcon build"`
+* 於容器內列出檔案：`EXECUTE: scripts/docker_runcmd_cmd.py ros2_humble "ls -la /opt/ros"`
+* 於容器內建置：`EXECUTE: scripts/docker_runcmd_cmd.py ros2_humble "colcon build"`
 
 # 異常處理 (Edge Cases)
 * 指令執行失敗時回傳 `[ERROR]` 與 stderr。

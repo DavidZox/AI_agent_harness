@@ -18,7 +18,7 @@ dependencies: []
 2. 逐一檢查是否有數值 `> 100`。
 
 # 範例 (Examples)
-* 批次檢查：`EXECUTE: check_batch 98,102,45`
+* 批次檢查：`EXECUTE: scripts/check_batch_cmd.py 98,102,45`
 
 # 異常處理 (Edge Cases)
 * 任一數值超過 100 立即回傳 `[ALERT]` 並中止檢查。

@@ -19,7 +19,7 @@ dependencies: []
 
 # 範例 (Examples)
 * 切換至機器人工作區：
-  `EXECUTE: change_dir "/home/robot/workspace"`
+  `EXECUTE: scripts/cd_cmd.py "/home/robot/workspace"`
 
 # 異常處理 (Edge Cases)
 * 若路徑不存在或無切換權限，狀態將保持不變，AI 應建立目錄或修正路徑。

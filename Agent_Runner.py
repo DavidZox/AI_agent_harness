@@ -2,7 +2,6 @@ import os
 import sys
 import subprocess
 import ollama  # 導入官方庫
-import re
 import shlex
 import time
 
@@ -24,8 +23,8 @@ class SkillAgent:
         if not os.path.exists(self.index_file):
             raise FileNotFoundError(f"找不到技能索引：{self.index_file}")
 
+        # 技能規格文件（OKF：Open Knowledge Format）目錄，每個技能一份 tools/<name>.md
         self.tools_dir = os.path.join(self.base_path, "tools")
-        self.skill_script_map = self._load_skill_script_map()
 
         # =========================
         # 🧠 Token Tracker
@@ -207,10 +206,15 @@ class SkillAgent:
 
             self._truncate_memory()
 
+            # 關閉 Ollama 的獨立 thinking 模式：此版本 Ollama 會把推理過程放進
+            # message.thinking 欄位，而非像舊版把 <thought> 內嵌在 content 裡。
+            # 若不關閉，模型有時會把整個決策都留在 thinking 裡，
+            # 導致 content 回傳空字串（並非被截斷，而是模型判斷自己已經回答完畢）。
             response = ollama.chat(
                 model=self.model,
                 messages=self.messages,
-                options={'temperature': 0.2}
+                options={'temperature': 0.2},
+                think=False 
             )
 
             raw_content = response['message']['content'].strip()
@@ -224,31 +228,6 @@ class SkillAgent:
 
         except Exception as e:
             return f"Ollama 連線錯誤: {e}"
-
-    def _load_skill_script_map(self):
-        """
-        掃描 skills_system/tools/*.md，建立「技能友善名稱 -> 實際腳本檔名」對照表。
-        每份規格文件內都會有一行反引號包住的 `scripts/xxx_cmd.py`，藉此讓
-        AI 輸出索引中的技能名稱（如 change_dir）時，仍能正確對應到底層腳本（cd_cmd.py）。
-        """
-        skill_map = {}
-        if not os.path.isdir(self.tools_dir):
-            return skill_map
-
-        for filename in os.listdir(self.tools_dir):
-            if not filename.endswith(".md"):
-                continue
-            skill_name = filename[:-3]
-            try:
-                with open(os.path.join(self.tools_dir, filename), "r", encoding="utf-8") as f:
-                    content = f.read()
-                match = re.search(r"`scripts/([\w./-]+\.py)`", content)
-                if match:
-                    skill_map[skill_name] = os.path.basename(match.group(1))
-            except Exception:
-                continue
-
-        return skill_map
 
     def run_tool(self, ai_response):
         if "EXECUTE:" in ai_response:
@@ -266,9 +245,20 @@ class SkillAgent:
 
                 parts = full_content.split(maxsplit=1)
                 raw_token = os.path.basename(parts[0])
-                # 先查「技能名稱 -> 腳本檔名」對照表（如 change_dir -> cd_cmd.py），
-                # 查不到則沿用舊邏輯，把輸入字串本身當作腳本名稱猜測。
-                script_name = self.skill_script_map.get(raw_token, raw_token)
+
+                # --- 不做技能名稱 -> 腳本檔名的猜測或對照。---
+                # 若 AI 給的字串剛好對應到 tools/ 底下的一份規格文件（代表它是用
+                # SKILLS.md 索引裡的技能名稱），就直接把該規格文件內容當作系統回傳
+                # 注入上下文，並不執行任何腳本；AI 讀完規格後，下一輪需改用規格書中
+                # 標明的實際腳本路徑（例如 scripts/cd_cmd.py）才會真正執行。
+                skill_doc_path = os.path.join(self.tools_dir, f"{raw_token}.md")
+                if os.path.exists(skill_doc_path):
+                    with open(skill_doc_path, "r", encoding="utf-8") as f:
+                        doc_content = f.read()
+                    print(f"📖 Agent 選擇技能索引: {raw_token}（載入規格文件，尚未執行）")
+                    return f"📘 已載入技能 '{raw_token}' 的規格文件（依此內容才可執行，請使用其中標明的實際腳本路徑）：\n{doc_content}"
+
+                script_name = raw_token
 
                 if not script_name.endswith("_cmd.py") and not script_name.endswith(".py"):
                     script_name = f"{script_name}_cmd.py"

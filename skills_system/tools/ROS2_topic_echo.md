@@ -19,7 +19,7 @@ dependencies: ["docker", "ros2"]
 2. 執行並回傳單筆訊息內容。
 
 # 範例 (Examples)
-* 查看話題資料：`EXECUTE: ROS2_topic_echo ros2_humble /cmd_vel`
+* 查看話題資料：`EXECUTE: scripts/ROS2_topic_echo_cmd.py ros2_humble /cmd_vel`
 
 # 異常處理 (Edge Cases)
 * topic 不存在或無資料發布時可能無輸出，且此工具無內建逾時保護，需留意可能卡住等待。

@@ -18,7 +18,7 @@ dependencies: []
 2. 依區間回傳對應等級：`>80` CRITICAL、`60~80` WARNING、`20~60` NORMAL、`<20` NOTICE。
 
 # 範例 (Examples)
-* 檢查馬達溫度：`EXECUTE: monitor_motor 75`
+* 檢查馬達溫度：`EXECUTE: scripts/monitor_motor_cmd.py 75`
 
 # 異常處理 (Edge Cases)
 * 溫度超過 80 度時回傳 `[CRITICAL]`，Agent 應建議立即停機。

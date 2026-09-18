@@ -18,7 +18,7 @@ dependencies: []
 2. 回傳狀態字串。
 
 # 範例 (Examples)
-* 檢查核心狀態：`EXECUTE: robot_ping`
+* 檢查核心狀態：`EXECUTE: scripts/robot_ping_cmd.py`
 
 # 異常處理 (Edge Cases)
 * `skills/nav_core.py` 載入失敗時會拋出例外並由外層印出錯誤訊息。

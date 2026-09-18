@@ -19,7 +19,7 @@ dependencies: ["docker", "ros2"]
 2. 執行並回傳節點詳細資訊。
 
 # 範例 (Examples)
-* 查詢節點資訊：`EXECUTE: ROS2_node_info ros2_humble /nav_node`
+* 查詢節點資訊：`EXECUTE: scripts/ROS2_node_info_cmd.py ros2_humble /nav_node`
 
 # 異常處理 (Edge Cases)
 * 節點名稱錯誤或不存在時回傳 `[ERROR]`。

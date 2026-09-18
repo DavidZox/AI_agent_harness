@@ -19,7 +19,7 @@ dependencies: []
 3. 回傳寫入結果確認。
 
 # 範例 (Examples)
-* 記錄偏好：`EXECUTE: modify_memory "偏好問題 | 使用者偏好繁體中文 | 後續回答優先使用繁體中文"`
+* 記錄偏好：`EXECUTE: scripts/modify_memory_cmd.py "偏好問題 | 使用者偏好繁體中文 | 後續回答優先使用繁體中文"`
 
 # 異常處理 (Edge Cases)
 * 內容為空時回傳 `[ERROR]`。

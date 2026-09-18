@@ -23,7 +23,7 @@ dependencies: ["requests", "調度系統 API (localhost:8000)"]
 3. POST 至調度系統並回傳結果。
 
 # 範例 (Examples)
-* 發送任務：`EXECUTE: workitem_est tb1 a0,a8,a6,a4 10 duty yes`
+* 發送任務：`EXECUTE: scripts/workitem_est_cmd.py tb1 a0,a8,a6,a4 10 duty yes`
 
 # 異常處理 (Edge Cases)
 * 參數不足 5 個時腳本會直接印出用法並結束。

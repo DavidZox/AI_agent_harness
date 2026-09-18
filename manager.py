@@ -11,7 +11,7 @@ class SkillManager:
 
         for d in [self.skills_dir, self.scripts_dir, self.tools_dir]:
             os.makedirs(d, exist_ok=True)
-            if "skills" in d and not os.path.exists(os.path.join(d, "__init__.py")):
+            if d == self.skills_dir and not os.path.exists(os.path.join(d, "__init__.py")):
                 with open(os.path.join(d, "__init__.py"), "w") as f: pass
 
     def _write_tool_doc(self, name, description, script_path, params):

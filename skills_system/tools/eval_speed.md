@@ -18,7 +18,7 @@ dependencies: []
 2. 與安全門檻 1.2 m/s 比較並回傳結果。
 
 # 範例 (Examples)
-* 評估速度：`EXECUTE: eval_speed 0.5`
+* 評估速度：`EXECUTE: scripts/eval_speed_cmd.py 0.5`
 
 # 異常處理 (Edge Cases)
 * 輸入非數字時回傳「錯誤：速度參數必須為數字」。

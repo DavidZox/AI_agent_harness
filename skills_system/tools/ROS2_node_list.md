@@ -18,7 +18,7 @@ dependencies: ["docker", "ros2"]
 2. 回傳節點清單。
 
 # 範例 (Examples)
-* 查詢節點列表：`EXECUTE: ROS2_node_list ros2_humble`
+* 查詢節點列表：`EXECUTE: scripts/ROS2_node_list_cmd.py ros2_humble`
 
 # 異常處理 (Edge Cases)
 * 容器未啟動或無節點運行時回傳空結果或 `[ERROR]`。

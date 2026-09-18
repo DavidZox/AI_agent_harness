@@ -20,8 +20,8 @@ dependencies: []
 3. 以 8 秒逾時執行並回傳結果。
 
 # 範例 (Examples)
-* 搜尋錯誤紀錄：`EXECUTE: search_text "ERROR" .`
-* 搜尋設定值：`EXECUTE: search_text "model" ./skills_system`
+* 搜尋錯誤紀錄：`EXECUTE: scripts/grep_cmd.py "ERROR" .`
+* 搜尋設定值：`EXECUTE: scripts/grep_cmd.py "model" ./skills_system`
 
 # 異常處理 (Edge Cases)
 * 搜尋目標為 `/` 時會直接阻斷並回傳安全邊界錯誤。

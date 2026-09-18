@@ -7,7 +7,7 @@ dependencies: []
 ---
 
 # 背景 / 運作原理
-讀取指定檔案的純文字內容並回傳。這也是載入本索引系統中「工具詳細規格文件」（`tools/*.md`）的標準方式：當需要更完整的參數規範或範例時，先以此工具讀取對應的技能文件，再執行實際指令。
+讀取指定檔案的純文字內容並回傳，用於查看一般檔案（設定檔、log、腳本原始碼等）。技能規格文件不需要用這個工具載入——直接 `EXECUTE: [技能名稱]` 系統就會自動注入對應的 `tools/<name>.md`；view_file 只用於讀取規格文件以外的一般檔案。
 
 # 語法 / 參數規範
 * `file_path` (string, required): 欲讀取的檔案路徑，可為相對路徑或絕對路徑。
@@ -20,8 +20,7 @@ dependencies: []
 3. 讀取並回傳完整文字內容。
 
 # 範例 (Examples)
-* 查看設定檔：`EXECUTE: view_file config.yaml`
-* 載入工具詳細規格：`EXECUTE: view_file /home/david/AI_agent_harness/skills_system/tools/docker_runcmd.md`
+* 查看設定檔：`EXECUTE: scripts/cat_cmd.py config.yaml`
 
 # 異常處理 (Edge Cases)
 * 檔案不存在、是目錄、或超過 1MB 時回傳 `[ERROR]`。

@@ -18,7 +18,7 @@ dependencies: ["docker", "ros2"]
 2. 執行並回傳話題清單。
 
 # 範例 (Examples)
-* 查詢話題列表：`EXECUTE: ROS2_topic_list ros2_humble`
+* 查詢話題列表：`EXECUTE: scripts/ROS2_topic_list_cmd.py ros2_humble`
 
 # 異常處理 (Edge Cases)
 * 容器未啟動或未安裝 ROS2 時回傳 `[ERROR]`。

@@ -20,8 +20,8 @@ dependencies: []
 3. 以 5 秒逾時執行並回傳標準輸出。
 
 # 範例 (Examples)
-* 查看 ROS 套件目錄：`EXECUTE: list_dir -la /opt/ros`
-* 查看當前目錄：`EXECUTE: list_dir`
+* 查看 ROS 套件目錄：`EXECUTE: scripts/ls_cmd.py -la /opt/ros`
+* 查看當前目錄：`EXECUTE: scripts/ls_cmd.py`
 
 # 異常處理 (Edge Cases)
 * 路徑不存在或無權限時回傳 `[ERROR]` 與 stderr 訊息。

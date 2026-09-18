@@ -19,7 +19,7 @@ dependencies: ["docker"]
 3. 回傳連線結果。
 
 # 範例 (Examples)
-* 進入容器：`EXECUTE: docker_open ros2_humble`
+* 進入容器：`EXECUTE: scripts/docker_open_cmd.py ros2_humble`
 
 # 異常處理 (Edge Cases)
 * 找不到名稱包含輸入字串的容器時回傳 `[ERROR]`。

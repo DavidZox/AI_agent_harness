@@ -21,7 +21,7 @@ dependencies: []
 
 # 範例 (Examples)
 * 建立電量計算技能：
-  `EXECUTE: manage_skill calc_battery | 電量計算 | voltage | v = float(voltage)\nreturn "Low" if v < 20 else "OK"`
+  `EXECUTE: scripts/manage_skill_cmd.py calc_battery | 電量計算 | voltage | v = float(voltage)\nreturn "Low" if v < 20 else "OK"`
 
 # 異常處理 (Edge Cases)
 * 輸入缺少 `|` 分隔符或欄位不足 4 個時回傳格式錯誤訊息。

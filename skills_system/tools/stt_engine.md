@@ -19,7 +19,7 @@ dependencies: ["faster_whisper", "ffmpeg (Windows)"]
 3. 輸出辨識文字。
 
 # 範例 (Examples)
-* 啟動語音輸入：`EXECUTE: stt_engine`
+* 啟動語音輸入：`EXECUTE: scripts/stt_engine_cmd.py`
 
 # 異常處理 (Edge Cases)
 * 找不到音訊檔案（錄音失敗）時拋出例外並中止。
