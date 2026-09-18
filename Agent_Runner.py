@@ -448,7 +448,7 @@ def main():
                 full_context = agent.get_system_prompt() + "\n" + "".join([f"{m['role']}: {m['content']}\n" for m in agent.messages])
                 print(f"\n📦 Context Tokens: {agent.count_tokens(full_context)}")
                 # --- 自動壓縮觸發器 ---
-                TOKEN_THRESHOLD = 4000 # 根據你的需求調整
+                TOKEN_THRESHOLD = 8000 # 根據你的需求調整
                 if agent.count_tokens(full_context) > TOKEN_THRESHOLD:
                     agent.compress_context_to_file(num_to_keep=2)
                     print(f"\n📦 Compressed Context Tokens: {agent.count_tokens(full_context)}")
