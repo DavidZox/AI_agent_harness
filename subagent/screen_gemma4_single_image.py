@@ -258,7 +258,9 @@ class ScreenshotSniper:
                     'role': 'user',
                     'content': user_prompt,
                     'images': [img_bytes]
-                }]
+                }],
+                options={'temperature': 0.2, 'num_ctx': 12288},
+                think=False,
             )
             
             self.root.after(0, self.update_result, response['message']['content'])

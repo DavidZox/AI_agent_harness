@@ -481,7 +481,9 @@ class ScreenshotSniper:
                     'role': 'user',
                     'content': user_prompt,
                     'images': all_images_bytes
-                }]
+                }],
+                options={'temperature': 0.2, 'num_ctx': 12288},
+                think=False,
             )
             self.root.after(
                 0,
