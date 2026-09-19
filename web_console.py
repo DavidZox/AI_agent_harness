@@ -42,8 +42,9 @@ from Agent_Runner import (
 agent = SkillAgent(model=os.environ.get("WEB_CONSOLE_MODEL", "gemma4:e4b"), max_history=30)
 agent.reset_conversation()
 
-state = {"auto_mode": False, "hybrid_mode": False, "tool_summary_mode": False}
+state = {"auto_mode": False, "hybrid_mode": False, "tool_summary_mode": False, "plan_mode": False}
 pending = {"result": None, "mode": None, "tokens": None}  # 等待使用者決策的工具結果（hybrid / manual 模式用）
+plan_pending = {"active": False}  # 等待使用者核准／修改意見的任務計畫（/plan 模式用）
 lock = threading.Lock()
 
 MAX_AUTO_ITERATIONS = 25  # 安全防護：避免 auto 模式下模型無限迴圈卡住伺服器
@@ -55,12 +56,19 @@ MENU_TEXT = """可用指令：
 /auto on / /auto off    切換 Auto Continue 模式（工具結果自動帶入下一輪，不需確認）
 /hybrid on / /hybrid off 切換 Hybrid 模式（每次工具結果都詢問是否加入上下文）
 /summarize on / /summarize off 切換工具回傳摘要模式（見下方說明，預設關閉）
+/plan on / /plan off    切換 Plan 模式（新任務會先規劃步驟，經你核准後才會執行，預設關閉）
 /objective set <內容>   設定 Sticky Objective（最高優先任務，會持續提醒 AI）
 /objective show         查看目前的 Objective
 /objective clear        清除 Objective
 
 不切換 auto／hybrid 時，預設為「手動模式」：每次工具執行完都會等待你確認
 是否要把結果加入上下文，畫面下方會出現決策按鈕。
+
+開啟 /plan on 後，輸入新任務時 AI 不會馬上執行，而是先依 SKILLS.md 規劃出
+步驟清單顯示出來，畫面下方會出現「✅ 核准並執行 / 🚫 取消任務」按鈕；也可以
+直接在輸入框打字送出修改意見，AI 會依意見重新規劃，直到你核准或取消為止。
+規劃階段完全不會呼叫任何工具，即使 AI 不小心在計畫裡夾帶了 EXECUTE 指令
+也不會被執行——確認關卡是靠系統不執行工具保證的，不是單純提醒 AI 而已。
 
 單一工具回傳若超過 {threshold} tokens，不論目前是什麼模式，預設 AI 只會收到
 精簡的成功／失敗摘要（避免大量原始輸出干擾推理）。開啟 /summarize on 後，
@@ -90,6 +98,7 @@ def build_stats():
     return {
         "mode": current_mode_label(),
         "tool_summary_mode": state["tool_summary_mode"],
+        "plan_mode": state["plan_mode"],
         "current_cwd": agent.current_cwd,
         "container_cwd": agent.container_cwd,
         "objective": agent.sticky_objective or None,
@@ -110,6 +119,57 @@ def _emit_summary_event(content, events):
     而不是只能從主對話推測 AI 收到了什麼。"""
     if content.startswith(_SUMMARY_TAG):
         events.append({"channel": "summary", "text": content})
+
+
+def _ask_and_present_plan(events):
+    """呼叫一次 ask_ai() 取得計畫文字，推到 events 給前端顯示，並把
+    plan_pending 標記為待核准。跟 CLI 的 _run_plan_flow 用同一套
+    SkillAgent.build_plan_request / build_plan_revision_request，
+    只是這裡拆成「單次 HTTP 請求處理一小段」的非同步形式。"""
+    plan_msg = agent.ask_ai()
+    agent.total_ai_tokens += agent.count_tokens(plan_msg)
+    agent.messages.append({'role': 'assistant', 'content': plan_msg})
+    events.append({"channel": "plan", "text": plan_msg})
+    plan_pending["active"] = True
+
+
+def start_plan_flow(user_task, events):
+    """/plan 模式：把使用者任務包裝成規劃請求送出，取得第一版計畫。"""
+    agent.messages.append({'role': 'user', 'content': agent.build_plan_request(user_task)})
+    _ask_and_present_plan(events)
+
+
+def handle_plan_response(text, events):
+    """處理使用者對目前待核准計畫的回應（y／n／修改意見三選一，比照 CLI）。
+
+    安全設計跟 CLI 版一致：這個函式從頭到尾不會呼叫 agent.run_tool()，
+    確認關卡不依賴 AI 是否遵守「先別執行」的指示。
+
+    回傳 "approved" / "rejected" / "revised"。
+    """
+    choice = text.strip()
+
+    if choice.lower() == 'y':
+        agent.messages.append({
+            'role': 'user',
+            'content': "[PLAN_CONFIRMED]\n使用者已核准上述計畫，現在開始依計畫執行第一個步驟。"
+        })
+        plan_pending["active"] = False
+        return "approved"
+
+    if choice == "" or choice.lower() in ("n", "no"):
+        agent.messages.append({
+            'role': 'user',
+            'content': "[PLAN_REJECTED]\n使用者取消了上述計畫，本次任務不會執行，請等待使用者的新指示。"
+        })
+        plan_pending["active"] = False
+        events.append({"channel": "system", "text": "🚫 已取消，本次任務不會執行。"})
+        return "rejected"
+
+    # 其餘輸入視為修改意見，重新規劃一次
+    agent.messages.append({'role': 'user', 'content': agent.build_plan_revision_request(choice)})
+    _ask_and_present_plan(events)
+    return "revised"
 
 
 def run_turn(events):
@@ -255,6 +315,14 @@ def handle_slash_command(message, events):
         state["tool_summary_mode"] = False
         events.append({"channel": "system", "text": "🧠 已關閉工具回傳摘要模式（改回精簡成功/失敗判定）"})
         return True
+    if lower == "/plan on":
+        state["plan_mode"] = True
+        events.append({"channel": "system", "text": "📝 已開啟 Plan 模式（新任務會先規劃步驟，經你核准後才會執行）"})
+        return True
+    if lower == "/plan off":
+        state["plan_mode"] = False
+        events.append({"channel": "system", "text": "📝 已關閉 Plan 模式（恢復直接執行）"})
+        return True
     if lower.startswith("/objective set "):
         agent.sticky_objective = text[len("/objective set "):].strip()
         events.append({"channel": "system", "text": "🎯 已設定 Objective"})
@@ -307,6 +375,8 @@ HTML_PAGE = r"""<!DOCTYPE html>
   .entry.system { background: #2a2620; border: 1px solid #4a4030; color: #d8c9a3; font-style: italic; }
   .entry.summary { background: #241f33; border: 1px solid #5a4a8f; color: #cfc3f0; }
   .entry.summary .tag { color: #b39ddb; opacity: 1; }
+  .entry.plan { background: #16302c; border: 1px solid #2f6f5e; }
+  .entry.plan .tag { color: #4fd8ba; opacity: 1; }
   .entry.tool.oversized { border: 1px solid #b0873f; box-shadow: 0 0 0 1px #b0873f inset; }
   .entry.tool.oversized .tag { color: #e6b95c; opacity: 1; }
   .entry.tool.oversized.reviewed { border-color: #2f4a3a; box-shadow: none; opacity: 0.75; }
@@ -316,9 +386,9 @@ HTML_PAGE = r"""<!DOCTYPE html>
     background: #4a4c50; border-radius: 4px; cursor: pointer;
   }
   footer { border-top: 1px solid #3a3c40; padding: 10px 12px; background: #2b2d31; }
-  #decision-bar { display: none; margin-bottom: 8px; gap: 8px; align-items: center; font-size: 13px; }
-  #decision-bar.show { display: flex; }
-  #decision-bar button { cursor: pointer; }
+  #decision-bar, #plan-bar { display: none; margin-bottom: 8px; gap: 8px; align-items: center; font-size: 13px; flex-wrap: wrap; }
+  #decision-bar.show, #plan-bar.show { display: flex; }
+  #decision-bar button, #plan-bar button { cursor: pointer; }
   .input-row { display: flex; gap: 8px; }
   textarea#msg {
     flex: 1; resize: none; height: 54px; background: #1e1f22; color: #e3e3e3;
@@ -359,6 +429,11 @@ HTML_PAGE = r"""<!DOCTYPE html>
     <button class="secondary" id="decision-n">🚫 捨棄</button>
     <button class="danger" id="decision-stop" onclick="sendDecision('stop')">⏹️ 停止本回合</button>
   </div>
+  <div id="plan-bar">
+    <span>📝 有計畫待你核准（也可以直接在下方輸入修改意見送出，AI 會重新規劃）：</span>
+    <button onclick="sendPlanDecision('y')">✅ 核准並執行</button>
+    <button class="danger" onclick="sendPlanDecision('n')">🚫 取消任務</button>
+  </div>
   <div class="input-row">
     <textarea id="msg" placeholder="輸入訊息，或用 /menu 查詢可用指令...（Enter 送出，Shift+Enter 換行）"></textarea>
     <button id="send-btn" onclick="sendMessage()">送出</button>
@@ -371,6 +446,7 @@ const toolLog = document.getElementById('tool-log');
 const msgBox = document.getElementById('msg');
 const sendBtn = document.getElementById('send-btn');
 const decisionBar = document.getElementById('decision-bar');
+const planBar = document.getElementById('plan-bar');
 
 function renderEntry(container, cls, tag, text, oversized) {
   const div = document.createElement('div');
@@ -406,6 +482,8 @@ function renderEvents(events) {
       renderEntry(toolLog, 'tool', '系統回傳', ev.text, ev.oversized);
     } else if (ev.channel === 'summary') {
       renderEntry(toolLog, 'summary', '🧠 AI 摘要（獨立 session）', ev.text);
+    } else if (ev.channel === 'plan') {
+      renderEntry(chatLog, 'plan', '📝 計畫（待你確認）', ev.text);
     } else if (ev.channel === 'system') {
       renderEntry(toolLog, 'system', '系統', ev.text);
     }
@@ -437,6 +515,14 @@ function hideDecisionBar() {
   decisionBar.classList.remove('show');
 }
 
+function showPlanBar() {
+  planBar.classList.add('show');
+}
+
+function hidePlanBar() {
+  planBar.classList.remove('show');
+}
+
 async function postJSON(url, body) {
   const res = await fetch(url, {
     method: 'POST',
@@ -451,6 +537,7 @@ async function sendMessage() {
   if (!text) return;
   setBusy(true);
   hideDecisionBar();
+  hidePlanBar();
   msgBox.value = '';
   try {
     const data = await postJSON('/api/send', { message: text });
@@ -461,6 +548,7 @@ async function sendMessage() {
     renderEvents(data.events);
     updateStatus(data.stats);
     if (data.awaiting_decision) showDecisionBar(data.pending_mode);
+    if (data.awaiting_plan) showPlanBar();
   } finally {
     setBusy(false);
     msgBox.focus();
@@ -478,6 +566,25 @@ async function sendDecision(action) {
     }
     renderEvents(data.events);
     updateStatus(data.stats);
+    if (data.awaiting_decision) showDecisionBar(data.pending_mode);
+  } finally {
+    setBusy(false);
+    msgBox.focus();
+  }
+}
+
+async function sendPlanDecision(action) {
+  setBusy(true);
+  hidePlanBar();
+  try {
+    const data = await postJSON('/api/send', { message: action });
+    if (data.error) {
+      renderEntry(toolLog, 'system', '錯誤', data.error);
+      return;
+    }
+    renderEvents(data.events);
+    updateStatus(data.stats);
+    if (data.awaiting_plan) showPlanBar();
     if (data.awaiting_decision) showDecisionBar(data.pending_mode);
   } finally {
     setBusy(false);
@@ -554,6 +661,25 @@ class ConsoleHandler(BaseHTTPRequestHandler):
             self._send_json({"error": "尚有待決策的工具結果，請先回應決策再繼續。"}, status=409)
             return
 
+        # 有計畫待核准時，輸入框的內容一律視為對計畫的回應（y／n／修改意見），
+        # 不當作新指令或 slash command 處理——跟 CLI 版 _run_plan_flow 的
+        # input() 迴圈行為一致。
+        if plan_pending["active"]:
+            outcome = handle_plan_response(message, events)
+            awaiting_decision = False
+            if outcome == "approved":
+                awaiting_decision = run_turn(events)
+            resp = {
+                "events": events,
+                "awaiting_decision": awaiting_decision,
+                "awaiting_plan": plan_pending["active"],
+                "stats": build_stats(),
+            }
+            if awaiting_decision:
+                resp["pending_mode"] = pending["mode"]
+            self._send_json(resp)
+            return
+
         if not message:
             self._send_json({"events": [], "awaiting_decision": False, "stats": build_stats()})
             return
@@ -564,9 +690,19 @@ class ConsoleHandler(BaseHTTPRequestHandler):
 
         user_tokens = agent.count_tokens(message)
         agent.total_user_tokens += user_tokens
-        agent.messages.append({'role': 'user', 'content': message})
         events.append({"channel": "chat", "role": "user", "text": message, "tokens": user_tokens})
 
+        if state["plan_mode"]:
+            start_plan_flow(message, events)
+            self._send_json({
+                "events": events,
+                "awaiting_decision": False,
+                "awaiting_plan": True,
+                "stats": build_stats(),
+            })
+            return
+
+        agent.messages.append({'role': 'user', 'content': message})
         awaiting = run_turn(events)
         resp = {"events": events, "awaiting_decision": awaiting, "stats": build_stats()}
         if awaiting:

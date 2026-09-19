@@ -189,6 +189,32 @@ class SkillAgent:
         except Exception as e:
             return f"[Memory Load Error] {e}"
 
+    def build_plan_request(self, user_task):
+        """/plan 模式用：把使用者的原始任務包裝成「先規劃、別執行」的請求。
+        不需要另外把技能索引塞進來，因為 SKILLS.md 已經在系統提示詞裡，
+        AI 本來就看得到，這裡只需要下達規劃指令即可。"""
+        return f"""請先不要執行任何指令。請依照你目前看到的 SKILLS.md 技能索引，
+針對下面的任務規劃出所需的步驟清單，列出來讓使用者確認後才會開始執行。
+
+規則：
+- 用條列式（1. 2. 3. ...）列出步驟，簡短清楚即可
+- 每個步驟盡量標明會用到的技能名稱（來自 SKILLS.md），以及這步要做什麼
+- 如果某步驟不需要任何技能，直接說明要做什麼即可
+- 這一輪絕對不要輸出 EXECUTE: 指令，只列出計畫，等待使用者確認
+
+任務：
+{user_task}
+"""
+
+    def build_plan_revision_request(self, feedback):
+        """/plan 模式用：使用者對計畫不滿意時，帶著回饋重新規劃一次。規則同上。"""
+        return f"""使用者對你剛才列出的計畫有以下修改意見，請依照意見重新規劃一份新的步驟清單。
+規則同上：只列出計畫、不要輸出 EXECUTE: 指令，等待使用者確認。
+
+修改意見：
+{feedback}
+"""
+
     def _build_objective_prompt(self):
         """若有設定 sticky objective，組成提醒 AI 優先遵守的區塊；否則回傳空字串。"""
         if not self.sticky_objective:
@@ -394,6 +420,46 @@ def _append_discarded_tool_result(agent):
     })
 
 
+def _run_plan_flow(agent, user_task):
+    """/plan 模式：先讓 AI 依 SKILLS.md 規劃步驟、印出來給使用者看，
+    使用者核准後才讓 main() 的主迴圈開始真正執行（ask_ai -> run_tool）。
+
+    安全設計：規劃階段自始至終不會呼叫 agent.run_tool()，就算模型不聽話
+    在計畫裡夾帶了 EXECUTE: 指令也不會被執行——確認關卡是靠「這個函式
+    根本不執行工具」保證的，不依賴模型是否遵守「先不要執行」的指示。
+
+    回傳 True 代表使用者已核准，main() 可以繼續往下進入正常執行迴圈；
+    回傳 False 代表使用者取消，本次任務到此為止，不會呼叫任何工具。
+    """
+    agent.messages.append({'role': 'user', 'content': agent.build_plan_request(user_task)})
+
+    while True:
+        plan_msg = agent.ask_ai()
+        agent.total_ai_tokens += agent.count_tokens(plan_msg)
+        agent.messages.append({'role': 'assistant', 'content': plan_msg})
+        print(f"\n📝 AI 規劃的任務計畫:\n{'-'*30}\n{plan_msg}\n{'-'*30}")
+
+        choice = input("\n是否核准此計畫並開始執行？(y=核准 / n=取消 / 直接輸入修改意見=重新規劃): ").strip()
+
+        if choice.lower() == 'y':
+            agent.messages.append({
+                'role': 'user',
+                'content': "[PLAN_CONFIRMED]\n使用者已核准上述計畫，現在開始依計畫執行第一個步驟。"
+            })
+            return True
+
+        if choice == "" or choice.lower() in ('n', 'no'):
+            agent.messages.append({
+                'role': 'user',
+                'content': "[PLAN_REJECTED]\n使用者取消了上述計畫，本次任務不會執行，請等待使用者的新指示。"
+            })
+            print("🚫 已取消，本次任務不會執行。")
+            return False
+
+        # 其餘輸入視為修改意見，重新規劃一次
+        agent.messages.append({'role': 'user', 'content': agent.build_plan_revision_request(choice)})
+
+
 # 整體上下文超過此 token 數時，自動觸發壓縮並歸檔（見 compress_context_to_file）。
 TOKEN_THRESHOLD = 8000
 
@@ -442,6 +508,7 @@ def main():
     auto_mode = False
     hybrid_mode = False  # 👈 新增狀態
     tool_summary_mode = False  # 👈 工具回傳超過門檻時，是否改用獨立 session 做語意摘要
+    plan_mode = False  # 👈 開啟後，每個新任務都要先規劃、經使用者核准才會執行
 
     print("\n" + "="*50)
     print("V6 Robot Agent + Token Tracker 已啟動")
@@ -490,6 +557,14 @@ def main():
                 tool_summary_mode = False
                 print("🧠 已關閉工具回傳摘要模式（超過門檻的結果改回精簡成功/失敗判定）")
                 continue
+            if user_msg.lower() == '/plan on':
+                plan_mode = True
+                print("📝 已開啟 Plan 模式（新任務會先規劃步驟，經你核准後才會執行）")
+                continue
+            if user_msg.lower() == '/plan off':
+                plan_mode = False
+                print("📝 已關閉 Plan 模式（恢復直接執行）")
+                continue
 
             # --- 🎯 OBJECTIVE 設定 ---
             if user_msg.lower() == "objective set":
@@ -513,7 +588,13 @@ def main():
             user_tokens = agent.count_tokens(user_msg)
             agent.total_user_tokens += user_tokens
             print(f"📥 User Tokens: {user_tokens}")
-            agent.messages.append({'role': 'user', 'content': user_msg})
+
+            # --- 📝 PLAN 模式：先規劃、經使用者核准才進入下面的執行迴圈 ---
+            if plan_mode:
+                if not _run_plan_flow(agent, user_msg):
+                    continue  # 使用者取消了計畫，回到最上層等待新的輸入
+            else:
+                agent.messages.append({'role': 'user', 'content': user_msg})
 
             while True:
                 # --- 🧠 AI 推論 ---
