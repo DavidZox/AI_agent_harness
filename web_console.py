@@ -42,7 +42,7 @@ from Agent_Runner import (
 agent = SkillAgent(model=os.environ.get("WEB_CONSOLE_MODEL", "gemma4:e4b"), max_history=30)
 agent.reset_conversation()
 
-state = {"auto_mode": False, "hybrid_mode": False}
+state = {"auto_mode": False, "hybrid_mode": False, "tool_summary_mode": False}
 pending = {"result": None, "mode": None, "tokens": None}  # 等待使用者決策的工具結果（hybrid / manual 模式用）
 lock = threading.Lock()
 
@@ -54,6 +54,7 @@ MENU_TEXT = """可用指令：
 /compress               手動壓縮並歸檔目前的歷史對話
 /auto on / /auto off    切換 Auto Continue 模式（工具結果自動帶入下一輪，不需確認）
 /hybrid on / /hybrid off 切換 Hybrid 模式（每次工具結果都詢問是否加入上下文）
+/summarize on / /summarize off 切換工具回傳摘要模式（見下方說明，預設關閉）
 /objective set <內容>   設定 Sticky Objective（最高優先任務，會持續提醒 AI）
 /objective show         查看目前的 Objective
 /objective clear        清除 Objective
@@ -61,9 +62,13 @@ MENU_TEXT = """可用指令：
 不切換 auto／hybrid 時，預設為「手動模式」：每次工具執行完都會等待你確認
 是否要把結果加入上下文，畫面下方會出現決策按鈕。
 
-單一工具回傳若超過 {threshold} tokens，不論目前是什麼模式，AI 都只會收到
-精簡的成功／失敗摘要（避免大量原始輸出干擾推理），完整內容仍會顯示在
-「系統 / 工具回傳」面板並標記 ⚠️ 待確認，需自行點「✅ 我已確認」。""".format(
+單一工具回傳若超過 {threshold} tokens，不論目前是什麼模式，預設 AI 只會收到
+精簡的成功／失敗摘要（避免大量原始輸出干擾推理）。開啟 /summarize on 後，
+超過門檻的結果會改由一個獨立、乾淨的 session 做語意摘要（不會混進主對話
+的上下文），主 session 拿到的會是摘要後的重點而不只是成功/失敗；若摘要
+session 失敗會自動退回原本的成功/失敗摘要，不影響主流程。完整原始內容
+永遠都會顯示在「系統 / 工具回傳」面板並標記 ⚠️ 待確認，需自行點
+「✅ 我已確認」。""".format(
     threshold=TOOL_RESULT_TOKEN_THRESHOLD
 )
 
@@ -84,6 +89,7 @@ def current_mode_label():
 def build_stats():
     return {
         "mode": current_mode_label(),
+        "tool_summary_mode": state["tool_summary_mode"],
         "current_cwd": agent.current_cwd,
         "container_cwd": agent.container_cwd,
         "objective": agent.sticky_objective or None,
@@ -142,7 +148,9 @@ def run_turn(events):
             return False
 
         if state["auto_mode"]:
-            content = _content_for_context(result, tool_tokens)
+            content = _content_for_context(
+                result, tool_tokens, agent=agent, use_summary=state["tool_summary_mode"]
+            )
             agent.messages.append({'role': 'user', 'content': f"[tool result]\n{content}"})
             events.append({"channel": "system", "text": "♻️ Auto Continue 中..."})
             continue
@@ -166,7 +174,9 @@ def apply_decision(action, events):
     pending["mode"] = None
     pending["tokens"] = None
 
-    content = _content_for_context(result, tool_tokens)
+    content = _content_for_context(
+        result, tool_tokens, agent=agent, use_summary=state["tool_summary_mode"]
+    )
 
     if mode == "hybrid":
         if action == "y":
@@ -216,6 +226,14 @@ def handle_slash_command(message, events):
     if lower == "/hybrid off":
         state["hybrid_mode"] = False
         events.append({"channel": "system", "text": "🧬 已關閉 Hybrid 模式"})
+        return True
+    if lower == "/summarize on":
+        state["tool_summary_mode"] = True
+        events.append({"channel": "system", "text": "🧠 已開啟工具回傳摘要模式（超過門檻的結果會由獨立 session 摘要）"})
+        return True
+    if lower == "/summarize off":
+        state["tool_summary_mode"] = False
+        events.append({"channel": "system", "text": "🧠 已關閉工具回傳摘要模式（改回精簡成功/失敗判定）"})
         return True
     if lower.startswith("/objective set "):
         agent.sticky_objective = text[len("/objective set "):].strip()

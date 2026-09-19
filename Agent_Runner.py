@@ -123,6 +123,41 @@ class SkillAgent:
         self.reset_conversation()
         print(f"💾 [系統] 歷史已壓縮並存入: {os.path.basename(file_path)}")
 
+    def summarize_tool_result(self, result, tool_tokens):
+        """比照 compress_context_to_file 的作法：開一個獨立、乾淨的一次性
+        session（自己的 system/user prompt，不接觸 self.messages），專門
+        把過大的工具回傳內容摘要成精簡版，摘要完就丟棄，不會留在主對話裡。
+
+        這樣主 session 拿到的是「有意義的摘要」而不是單純的成功／失敗判定，
+        同時不會因為把原始大量輸出直接塞進主上下文而干擾主 session 的推理。
+        """
+        system_prompt = """你是一位專業的資料摘要助手。
+你的任務是把一段指令執行後的原始輸出，摘要成精簡但保留關鍵資訊的版本，
+交給另一個負責決策的 AI 使用，那個 AI 不會看到原始內容，只會看到你的摘要。
+
+規則：
+- 必須保留：成功或失敗、關鍵數值、錯誤訊息、檔案／路徑名稱、數量等會影響下一步決策的資訊
+- 可以捨棄：重複的樣板文字、無關的排版細節
+- 直接輸出摘要內容，不要加上「以下是摘要」之類的前言，也不要加你自己的建議
+- 盡量控制在 200 字以內
+"""
+        user_prompt = f"以下是需要摘要的原始工具輸出（原始約 {tool_tokens} tokens）：\n\n{result}"
+
+        res = ollama.chat(
+            model=self.model,
+            messages=[
+                {'role': 'system', 'content': system_prompt},
+                {'role': 'user', 'content': user_prompt},
+            ],
+            options={'temperature': 0.2, 'num_ctx': 12288},
+            think=False,
+        )
+        summary = res['message']['content'].strip()
+        return (
+            f"[tool result - AI 摘要]\n{summary}\n\n"
+            f"(原始輸出約 {tool_tokens} tokens，完整內容已顯示在剛才的系統回傳訊息中)"
+        )
+
     def load_recent_summary_logs(self, max_files=5):
         """讀取 logs 目錄下最新的幾個壓縮紀錄檔案，作為 Agent 的近期歷史知識"""
         log_dir = os.path.join(self.script_dir, "logs")
@@ -369,12 +404,25 @@ TOKEN_THRESHOLD = 8000
 TOOL_RESULT_TOKEN_THRESHOLD = 250
 
 
-def _content_for_context(result, tool_tokens):
-    """決定要餵給 AI 上下文的內容：正常大小就原封不動放進去；超過
-    TOOL_RESULT_TOKEN_THRESHOLD 則改用精簡摘要，同時仍讓 AI 知道指令本身
-    是成功還是失敗，避免推理過程被誤導或被大量原始輸出干擾。"""
+def _content_for_context(result, tool_tokens, agent=None, use_summary=False):
+    """決定要餵給 AI 上下文的內容：正常大小就原封不動放進去。超過
+    TOOL_RESULT_TOKEN_THRESHOLD 時有兩種精簡方式：
+
+    - use_summary=False（預設）：原本的行為，只回傳成功／失敗的判定，
+      不需要額外呼叫模型，穩定、零延遲。
+    - use_summary=True 且提供 agent：改用 agent.summarize_tool_result()
+      開一個獨立 session 做語意摘要，讓主 session 拿到的不只是成功/失敗，
+      還有內容重點。此為可選功能，摘要 session 若失敗會自動退回成功/失敗
+      判定，不會讓主 session 的推理流程中斷。
+    """
     if tool_tokens <= TOOL_RESULT_TOKEN_THRESHOLD:
         return result
+
+    if use_summary and agent is not None:
+        try:
+            return agent.summarize_tool_result(result, tool_tokens)
+        except Exception as e:
+            print(f"⚠️ 摘要 session 執行失敗，改用精簡成功/失敗判定：{e}")
 
     status = "失敗" if result.lstrip().startswith("[ERROR]") else "成功"
     return (
@@ -393,6 +441,7 @@ def main():
     agent.reset_conversation()
     auto_mode = False
     hybrid_mode = False  # 👈 新增狀態
+    tool_summary_mode = False  # 👈 工具回傳超過門檻時，是否改用獨立 session 做語意摘要
 
     print("\n" + "="*50)
     print("V6 Robot Agent + Token Tracker 已啟動")
@@ -432,6 +481,14 @@ def main():
             if user_msg.lower() == '/hybrid off':
                 hybrid_mode = False
                 print("🧬 已關閉 Hybrid Mode")
+                continue
+            if user_msg.lower() == '/summarize on':
+                tool_summary_mode = True
+                print("🧠 已開啟工具回傳摘要模式（超過門檻的結果會由獨立 session 摘要後再交給主對話）")
+                continue
+            if user_msg.lower() == '/summarize off':
+                tool_summary_mode = False
+                print("🧠 已關閉工具回傳摘要模式（超過門檻的結果改回精簡成功/失敗判定）")
                 continue
 
             # --- 🎯 OBJECTIVE 設定 ---
@@ -497,7 +554,7 @@ def main():
 
                 # 1. Auto Mode
                 if auto_mode:
-                    agent.messages.append({'role': 'user', 'content': f"[tool result]\n{_content_for_context(result, tool_tokens)}"})
+                    agent.messages.append({'role': 'user', 'content': f"[tool result]\n{_content_for_context(result, tool_tokens, agent=agent, use_summary=tool_summary_mode)}"})
                     print("♻️ Auto Continue 中...")
                     continue
 
@@ -505,7 +562,7 @@ def main():
                 if hybrid_mode:
                     choice = input("\n🤔 Hybrid Mode - 加入上下文？(y/n): ").lower()
                     if choice == 'y':
-                        agent.messages.append({'role': 'user', 'content': f"[tool result]\n{_content_for_context(result, tool_tokens)}"})
+                        agent.messages.append({'role': 'user', 'content': f"[tool result]\n{_content_for_context(result, tool_tokens, agent=agent, use_summary=tool_summary_mode)}"})
                         continue
                     else:
                         _append_discarded_tool_result(agent)
@@ -516,7 +573,7 @@ def main():
                 # 3. Manual Mode
                 choice = input("\n是否將系統結果加入上下文？(y/n/stop): ").lower()
                 if choice == 'y':
-                    agent.messages.append({'role': 'user', 'content': f"【系統執行結果】:\n{_content_for_context(result, tool_tokens)}"})
+                    agent.messages.append({'role': 'user', 'content': f"【系統執行結果】:\n{_content_for_context(result, tool_tokens, agent=agent, use_summary=tool_summary_mode)}"})
                 elif choice == 'stop':
                     break
                 else:
