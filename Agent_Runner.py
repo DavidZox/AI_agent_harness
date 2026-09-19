@@ -38,6 +38,14 @@ class SkillAgent:
         # =========================
         self.sticky_objective = None
 
+        # =========================
+        # 📝 已核准、正在執行中的任務計畫（/plan 模式用）
+        # 跟 sticky_objective 一樣塞進 system prompt，而不是放在 self.messages
+        # 裡的一般訊息，這樣才不會被 _truncate_memory 的滑動視窗或
+        # compress_context_to_file 的壓縮摘要沖掉，整個任務執行期間都在。
+        # =========================
+        self.current_plan = None
+
     def count_tokens(self, text: str) -> int:
         """
         Ollama Native tokenizer (Gemma 4 e4b)
@@ -231,9 +239,29 @@ class SkillAgent:
             - 當上下文過長時，優先維持此目標
             """
 
+    def _build_plan_context_prompt(self):
+        """若有已核准、正在執行中的任務計畫，組成提醒 AI 依計畫執行的區塊；
+        否則回傳空字串。跟 _build_objective_prompt 同一種模式：每次組
+        system prompt 都重新塞入，才不會被滑動視窗或壓縮摘要沖掉。"""
+        if not self.current_plan:
+            return ""
+
+        return f"""
+            ## CURRENT APPROVED TASK PLAN
+            使用者已核准以下步驟計畫，請依計畫逐步執行：
+            {self.current_plan}
+
+            規則:
+            - 依計畫逐步執行，一次只做一步，等系統回傳這一步的結果後再進行下一步
+            - 除非使用者明確要求變更，否則不可自行更改或遺忘此計畫
+            - 不會自動判斷「計畫已完成」而清除這個區塊；即使所有步驟都做完了，
+              這裡仍會持續出現，直到使用者輸入 /plan done 手動清除為止
+            """
+
     def get_system_prompt(self):
 
         objective_prompt = self._build_objective_prompt()
+        plan_prompt = self._build_plan_context_prompt()
 
         profile = ""
         if os.path.exists(self.profile_file):
@@ -252,6 +280,7 @@ class SkillAgent:
                 {profile}
                 {status_prompt}
                 {objective_prompt}
+                {plan_prompt}
                 ## Long Term Memory
                 {memory_content}
                 ## Recent Compressed History Summary
@@ -261,6 +290,7 @@ class SkillAgent:
                 """
 
     def reset_conversation(self):
+        self.current_plan = None  # /clear 時一併清掉進行中的計畫，避免舊計畫殘留誤導新任務
         self.messages = [{'role': 'system', 'content': self.get_system_prompt()}]
 
     def _truncate_memory(self):
@@ -442,6 +472,7 @@ def _run_plan_flow(agent, user_task):
         choice = input("\n是否核准此計畫並開始執行？(y=核准 / n=取消 / 直接輸入修改意見=重新規劃): ").strip()
 
         if choice.lower() == 'y':
+            agent.current_plan = plan_msg
             agent.messages.append({
                 'role': 'user',
                 'content': "[PLAN_CONFIRMED]\n使用者已核准上述計畫，現在開始依計畫執行第一個步驟。"
@@ -564,6 +595,13 @@ def main():
             if user_msg.lower() == '/plan off':
                 plan_mode = False
                 print("📝 已關閉 Plan 模式（恢復直接執行）")
+                continue
+            if user_msg.lower() == '/plan done':
+                if agent.current_plan:
+                    agent.current_plan = None
+                    print("✅ 已清除目前進行中的計畫（system prompt 不再提醒 AI 依計畫執行）")
+                else:
+                    print("ℹ️ 目前沒有進行中的計畫")
                 continue
 
             # --- 🎯 OBJECTIVE 設定 ---

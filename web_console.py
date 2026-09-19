@@ -44,7 +44,7 @@ agent.reset_conversation()
 
 state = {"auto_mode": False, "hybrid_mode": False, "tool_summary_mode": False, "plan_mode": False}
 pending = {"result": None, "mode": None, "tokens": None}  # 等待使用者決策的工具結果（hybrid / manual 模式用）
-plan_pending = {"active": False}  # 等待使用者核准／修改意見的任務計畫（/plan 模式用）
+plan_pending = {"active": False, "text": None}  # 等待使用者核准／修改意見的任務計畫（/plan 模式用）
 lock = threading.Lock()
 
 MAX_AUTO_ITERATIONS = 25  # 安全防護：避免 auto 模式下模型無限迴圈卡住伺服器
@@ -57,6 +57,7 @@ MENU_TEXT = """可用指令：
 /hybrid on / /hybrid off 切換 Hybrid 模式（每次工具結果都詢問是否加入上下文）
 /summarize on / /summarize off 切換工具回傳摘要模式（見下方說明，預設關閉）
 /plan on / /plan off    切換 Plan 模式（新任務會先規劃步驟，經你核准後才會執行，預設關閉）
+/plan done              手動清除目前已核准、正在執行中的計畫（見下方說明）
 /objective set <內容>   設定 Sticky Objective（最高優先任務，會持續提醒 AI）
 /objective show         查看目前的 Objective
 /objective clear        清除 Objective
@@ -69,6 +70,11 @@ MENU_TEXT = """可用指令：
 直接在輸入框打字送出修改意見，AI 會依意見重新規劃，直到你核准或取消為止。
 規劃階段完全不會呼叫任何工具，即使 AI 不小心在計畫裡夾帶了 EXECUTE 指令
 也不會被執行——確認關卡是靠系統不執行工具保證的，不是單純提醒 AI 而已。
+
+計畫一旦核准，會存進系統提示詞（跟 Sticky Objective 同一種做法），確保
+即使後續執行很多輪工具、甚至觸發了自動壓縮，AI 都不會忘記這個計畫。
+系統不會自動判斷「所有步驟都做完了」而清掉它，需要你在任務結束後手動
+輸入 /plan done 清除，避免舊計畫殘留干擾之後的新任務。
 
 單一工具回傳若超過 {threshold} tokens，不論目前是什麼模式，預設 AI 只會收到
 精簡的成功／失敗摘要（避免大量原始輸出干擾推理）。開啟 /summarize on 後，
@@ -99,6 +105,7 @@ def build_stats():
         "mode": current_mode_label(),
         "tool_summary_mode": state["tool_summary_mode"],
         "plan_mode": state["plan_mode"],
+        "current_plan": agent.current_plan or None,
         "current_cwd": agent.current_cwd,
         "container_cwd": agent.container_cwd,
         "objective": agent.sticky_objective or None,
@@ -131,6 +138,7 @@ def _ask_and_present_plan(events):
     agent.messages.append({'role': 'assistant', 'content': plan_msg})
     events.append({"channel": "plan", "text": plan_msg})
     plan_pending["active"] = True
+    plan_pending["text"] = plan_msg
 
 
 def start_plan_flow(user_task, events):
@@ -150,11 +158,13 @@ def handle_plan_response(text, events):
     choice = text.strip()
 
     if choice.lower() == 'y':
+        agent.current_plan = plan_pending["text"]
         agent.messages.append({
             'role': 'user',
             'content': "[PLAN_CONFIRMED]\n使用者已核准上述計畫，現在開始依計畫執行第一個步驟。"
         })
         plan_pending["active"] = False
+        plan_pending["text"] = None
         return "approved"
 
     if choice == "" or choice.lower() in ("n", "no"):
@@ -163,6 +173,7 @@ def handle_plan_response(text, events):
             'content': "[PLAN_REJECTED]\n使用者取消了上述計畫，本次任務不會執行，請等待使用者的新指示。"
         })
         plan_pending["active"] = False
+        plan_pending["text"] = None
         events.append({"channel": "system", "text": "🚫 已取消，本次任務不會執行。"})
         return "rejected"
 
@@ -322,6 +333,13 @@ def handle_slash_command(message, events):
     if lower == "/plan off":
         state["plan_mode"] = False
         events.append({"channel": "system", "text": "📝 已關閉 Plan 模式（恢復直接執行）"})
+        return True
+    if lower == "/plan done":
+        if agent.current_plan:
+            agent.current_plan = None
+            events.append({"channel": "system", "text": "✅ 已清除目前進行中的計畫（system prompt 不再提醒 AI 依計畫執行）"})
+        else:
+            events.append({"channel": "system", "text": "ℹ️ 目前沒有進行中的計畫"})
         return True
     if lower.startswith("/objective set "):
         agent.sticky_objective = text[len("/objective set "):].strip()
