@@ -99,6 +99,19 @@ def build_stats():
     }
 
 
+# summarize_tool_result() 產生的內容固定以這個標籤開頭，用來判斷
+# _content_for_context() 這次回傳的是不是「AI 摘要」版本。
+_SUMMARY_TAG = "[tool result - AI 摘要]"
+
+
+def _emit_summary_event(content, events):
+    """若這次餵給 AI 的內容是獨立摘要 session 產生的，額外推一個事件到
+    前端的「系統 / 工具回傳」面板，讓使用者也能看到摘要結果，
+    而不是只能從主對話推測 AI 收到了什麼。"""
+    if content.startswith(_SUMMARY_TAG):
+        events.append({"channel": "summary", "text": content})
+
+
 def run_turn(events):
     """反覆執行 ask_ai -> run_tool，直到這一回合自然結束（沒有工具需要執行），
     或是需要使用者對工具結果做決策為止（hybrid / manual 模式）。
@@ -151,6 +164,7 @@ def run_turn(events):
             content = _content_for_context(
                 result, tool_tokens, agent=agent, use_summary=state["tool_summary_mode"]
             )
+            _emit_summary_event(content, events)
             agent.messages.append({'role': 'user', 'content': f"[tool result]\n{content}"})
             events.append({"channel": "system", "text": "♻️ Auto Continue 中..."})
             continue
@@ -174,12 +188,14 @@ def apply_decision(action, events):
     pending["mode"] = None
     pending["tokens"] = None
 
-    content = _content_for_context(
-        result, tool_tokens, agent=agent, use_summary=state["tool_summary_mode"]
-    )
-
+    # 只有真的要把結果加入上下文時才計算 content——若是摘要模式，這會觸發
+    # 一次獨立的 ollama 呼叫，使用者選擇「捨棄」時就不需要浪費這次呼叫。
     if mode == "hybrid":
         if action == "y":
+            content = _content_for_context(
+                result, tool_tokens, agent=agent, use_summary=state["tool_summary_mode"]
+            )
+            _emit_summary_event(content, events)
             agent.messages.append({'role': 'user', 'content': f"[tool result]\n{content}"})
         else:
             _append_discarded_tool_result(agent)
@@ -187,6 +203,10 @@ def apply_decision(action, events):
 
     # manual 模式
     if action == "y":
+        content = _content_for_context(
+            result, tool_tokens, agent=agent, use_summary=state["tool_summary_mode"]
+        )
+        _emit_summary_event(content, events)
         agent.messages.append({'role': 'user', 'content': f"【系統執行結果】:\n{content}"})
         return True
     if action == "stop":
@@ -285,6 +305,8 @@ HTML_PAGE = r"""<!DOCTYPE html>
   .entry.assistant { background: #2b2d31; border: 1px solid #3a3c40; }
   .entry.tool { background: #1f2a24; border: 1px solid #2f4a3a; font-family: "Cascadia Code", Consolas, monospace; }
   .entry.system { background: #2a2620; border: 1px solid #4a4030; color: #d8c9a3; font-style: italic; }
+  .entry.summary { background: #241f33; border: 1px solid #5a4a8f; color: #cfc3f0; }
+  .entry.summary .tag { color: #b39ddb; opacity: 1; }
   .entry.tool.oversized { border: 1px solid #b0873f; box-shadow: 0 0 0 1px #b0873f inset; }
   .entry.tool.oversized .tag { color: #e6b95c; opacity: 1; }
   .entry.tool.oversized.reviewed { border-color: #2f4a3a; box-shadow: none; opacity: 0.75; }
@@ -382,6 +404,8 @@ function renderEvents(events) {
       renderEntry(chatLog, ev.role, ev.role === 'user' ? '你' : 'AI', ev.text);
     } else if (ev.channel === 'tool') {
       renderEntry(toolLog, 'tool', '系統回傳', ev.text, ev.oversized);
+    } else if (ev.channel === 'summary') {
+      renderEntry(toolLog, 'summary', '🧠 AI 摘要（獨立 session）', ev.text);
     } else if (ev.channel === 'system') {
       renderEntry(toolLog, 'system', '系統', ev.text);
     }
