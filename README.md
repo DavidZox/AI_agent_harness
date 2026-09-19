@@ -28,16 +28,20 @@
 
 這代表模型**必須先讀過規格文件、拿到裡面寫的真實腳本路徑，才有辦法成功執行**——用技能名稱直接呼叫永遠只會拿到規格書，不會誤打誤撞執行成功。這個設計本身就是一種按需載入（progressive disclosure），且是靠架構天然達成，不依賴模型自律或額外的強制攔截邏輯（先前試過用獨立 `NEED_TOOL:` 指令、或後端攔截並強制注入規格的做法，都因為讓模型的「我要執行」跟系統實際回傳的東西對不上、破壞推理連貫性而放棄）。
 
-### 1.3 上下文管理：兩層 token 門檻
+### 1.3 上下文管理：兩層 token 門檻與可選的 AI 摘要
 
 定義在 `Agent_Runner.py`，CLI 與 Web Console 共用：
 
 | 常數 | 目前值 | 作用 |
 | :--- | :--- | :--- |
 | `TOKEN_THRESHOLD` | 8000 | 整體對話上下文超過此 token 數，自動觸發 `compress_context_to_file()`：用 LLM 把舊對話摘要成結構化 Markdown 存到 `logs/`，只保留最近幾筆對話 + 摘要繼續。 |
-| `TOOL_RESULT_TOKEN_THRESHOLD` | 250 | 單一工具回傳超過此 token 數時，**不會**把完整原始輸出塞進 AI 的上下文，改用 `_content_for_context()` 產生的精簡摘要（依內容是否以 `[ERROR]` 開頭，回報「成功」或「失敗」），避免一次大量的搜尋/列目錄結果打斷模型的推理節奏。完整內容仍會顯示給使用者（CLI 印出、或 Web Console 的「系統 / 工具回傳」面板並標記 ⚠️ 待確認）。 |
+| `TOOL_RESULT_TOKEN_THRESHOLD` | 250 | 單一工具回傳超過此 token 數時，**不會**把完整原始輸出塞進 AI 的上下文，預設改用 `_content_for_context()` 產生的精簡摘要（依內容是否以 `[ERROR]` 開頭，回報「成功」或「失敗」），避免一次大量的搜尋/列目錄結果打斷模型的推理節奏。完整內容仍會顯示給使用者（CLI 印出、或 Web Console 的「系統 / 工具回傳」面板並標記 ⚠️ 待確認）。 |
 
 Web Console 另外加了 `MAX_AUTO_ITERATIONS = 25`：Auto 模式下連續執行工具超過此輪數會強制中止本回合，避免模型陷入迴圈時把伺服器卡死（CLI 版本因為有人在終端機前，可以直接 Ctrl+C，暫無此限制）。
+
+**`num_ctx`**：`ask_ai()` 與 `compress_context_to_file()` 呼叫 `ollama.chat()` 時都明確帶入 `num_ctx=12288`。若不指定，Ollama 會用內建預設值 4096，遠小於模型（`gemma4:e4b`）實際支援的 131072，也小於 `TOKEN_THRESHOLD` 設計的 8000——代表對話還沒到我們自己設計的壓縮門檻，Ollama 就已經在背後悄悄截斷最舊的內容並擠壓輸出空間，看起來就像模型的輸出被無故砍短。拉高 `num_ctx` 是為了讓實際視窗跟應用層自己設計的門檻對齊。
+
+**工具回傳摘要模式（可選，預設關閉）**：CLI 用 `/summarize on|off`、Web Console 用同名指令切換（狀態各自存在 `main()` 的區域變數 / `state["tool_summary_mode"]`）。關閉時就是上表「成功/失敗」判定的預設行為；開啟後，超過 `TOOL_RESULT_TOKEN_THRESHOLD` 的內容會改由 `SkillAgent.summarize_tool_result()` 處理——做法比照 `compress_context_to_file()`：另外開一個獨立、乾淨的一次性 session（專屬 system/user prompt，不接觸主對話的 `self.messages`），對原始輸出做語意摘要，讓主 session 拿到的是「有意義的重點摘要」而不只是成功/失敗判定，摘要完即丟棄。若摘要 session 本身失敗（例如模型出錯），`_content_for_context()` 會自動 fallback 回成功/失敗判定，不會讓主推理流程中斷。Web Console 會把這次獨立摘要的結果額外用紫色卡片顯示在「系統 / 工具回傳」面板（標籤「🧠 AI 摘要（獨立 session）」）。這是本節提到 token 門檻機制的加強版，代價是超過門檻時會多一次 LLM 呼叫、增加延遲，因此設計成可自由開關。
 
 ### 1.4 三種執行模式
 
@@ -47,7 +51,7 @@ Web Console 另外加了 `MAX_AUTO_ITERATIONS = 25`：Auto 模式下連續執行
 
 ### 1.5 記憶
 
-- **長期記憶**（`Memory.md`）：只有使用者明確要求（「記住這件事」等）才會透過 `modify_memory` 技能寫入，格式固定為 `[問題種類] | [問題描述] | [解決方法或結論]`（規則見 `AGENT.md`）。
+- **長期記憶**（`Memory.md`）：只有使用者明確要求（「記住這件事」等）才會透過 `modify_memory` 技能寫入，格式固定為 `[問題種類] | [問題描述] | [解決方法或結論]`（規則見 `AGENT.md`）。`modify_memory_cmd.py` 內的檔案路徑是根據腳本自身位置往上推算出的絕對路徑，固定指向專案根目錄下的 `Memory.md`，**不受 `current_cwd` 影響**——早期版本用相對路徑，若 AI 當下的虛擬工作目錄（`current_cwd`，可被 `change_dir` 技能改變）剛好在別的專案，會把記憶寫到那個專案底下而不是這裡，已修正。
 - **壓縮歷史**（`logs/summary_*.md`）：`compress_context_to_file()` 產生，`get_system_prompt()` 每次都會讀最近 5 份放進系統提示詞的「Recent Compressed History Summary」。
 - **Sticky Objective**：使用者可設定一個最高優先任務，會持續出現在系統提示詞裡提醒模型，直到被清除。
 
@@ -86,7 +90,7 @@ AI_agent_harness/
 python3 Agent_Runner.py
 ```
 
-常用指令：`/clear`、`/compress`、`/auto on|off`、`/hybrid on|off`、`objective set|show|clear`、`exit`/`quit`。
+常用指令：`/clear`、`/compress`、`/auto on|off`、`/hybrid on|off`、`/summarize on|off`、`objective set|show|clear`、`exit`/`quit`。
 
 ### 3.3 Web Console
 
@@ -102,7 +106,7 @@ python3 web_console.py
 | `WEB_CONSOLE_HOST` | `127.0.0.1` | 綁定位址，設 `0.0.0.0` 可開放區網存取 |
 | `WEB_CONSOLE_PORT` | `8765` | 監聽埠 |
 
-畫面分成左右兩欄：左邊是「使用者 ↔ Agent 對話」，右邊是「系統 / 工具回傳」（規格文件載入內容、腳本執行結果、系統通知都會出現在這裡）。輸入 `/menu` 可查詢目前支援的所有指令。
+畫面分成左右兩欄：左邊是「使用者 ↔ Agent 對話」，右邊是「系統 / 工具回傳」（規格文件載入內容、腳本執行結果、系統通知都會出現在這裡）。輸入 `/menu` 可查詢目前支援的所有指令。開啟 `/summarize on` 後，超過門檻的工具結果除了原始輸出，右欄還會多一張紫色的「🧠 AI 摘要（獨立 session）」卡片。
 
 ---
 
@@ -123,32 +127,26 @@ python3 web_console.py
 
 ## 5. 未來修改方向
 
-依討論優先順序排列：
+依討論優先順序排列。原本排在這裡的「用真正的摘要取代死板的成功/失敗訊息」方向已經實作完成（見 1.3 的「工具回傳摘要模式」），故從清單移除。
 
 ### 5.1（低成本）讓 AI 自己把檢索範圍縮小
 
-現有的 `search_text`（`grep_cmd.py`）、`find_file`、`list_dir` 已經是「精準檢索」的雛形，但 `TOOL_RESULT_TOKEN_THRESHOLD` 目前的處理方式是「超過門檻就整包捨棄、換成死板的成功/失敗摘要」，屬於治標。更根本的做法是在對應的 `tools/*.md` 規格文件與 `AGENT.md` 的搜尋約束裡，明確要求模型：
+現有的 `search_text`（`grep_cmd.py`）、`find_file`、`list_dir` 已經是「精準檢索」的雛形，但工具回傳預設處理方式仍是「超過門檻就整包捨棄、換成死板的成功/失敗摘要」（除非另外開啟 1.3 提到的摘要模式），屬於治標。更根本的做法是在對應的 `tools/*.md` 規格文件與 `AGENT.md` 的搜尋約束裡，明確要求模型：
 
 - 搜尋前先縮小路徑範圍（已有雛形：禁止對 `/` 遞迴搜尋）。
 - 提供關鍵字時盡量具體、必要時分批查詢，而不是一次撈一大片再交給系統事後裁切。
 
 這幾乎零成本（只是改規格文件文字），但效果依賴模型是否確實遵守。
 
-### 5.2（中高成本）用真正的摘要取代死板的成功/失敗訊息
-
-目前 `_content_for_context()` 對超過門檻的工具回傳，只會回報「指令已成功/失敗執行」，資訊量趨近於零。比較理想的做法是：當偵測到工具回傳過大時，額外呼叫一次模型（可以是同一顆、也可以是更小更快的模型）針對原始輸出做語意摘要，把「這段輸出裡真正重要的部分」濃縮後才餵給主要的推理迴圈——這就是業界常見的「子 agent 負責探索、只回傳結論」模式（例如 Claude Code 自己的 Explore subagent）。
-
-代價：每次都要多一次 LLM 呼叫，對目前用 Ollama 跑本地小模型的架構而言，會增加明顯的延遲；也需要額外設計「摘要失敗時的 fallback」。
-
-### 5.3 修復已知限制
+### 5.2 修復已知限制
 
 依第 4 節列出的項目逐項處理，特別是 `robot_ping` / `eval_speed` 的 `nav_core.py` 缺失，以及 `current_cwd` 的硬編碼路徑，這兩項會直接影響任何非原作者環境下的可用性。
 
-### 5.4 重新設計自我進化機制
+### 5.3 重新設計自我進化機制
 
 如果之後想恢復「AI 自己新增技能」的能力，建議一開始就對齊現有的 OKF 架構：新技能建立時同時產生 `tools/<name>.md`（而不是像舊版那樣產生內容陽春的骨架文件），並確保新技能名稱不會跟既有的 `tools/*.md` 檔名衝突。
 
-### 5.5 補齊測試與可攜性
+### 5.4 補齊測試與可攜性
 
 - 把目前開發過程中用來驗證行為的 stub 測試腳本，整理成正式的 `tests/` 目錄（用假的 `ollama.chat` 逐一驗證 `run_tool`、`_content_for_context`、`run_turn`、`apply_decision` 等關鍵函式的行為）。
 - 把 `current_cwd`、模型名稱等寫死的預設值改成可透過環境變數或設定檔覆寫，方便在不同機器上部署。
