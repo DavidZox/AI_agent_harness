@@ -2,7 +2,12 @@ import sys
 import os
 from datetime import datetime
 
-MEMORY_FILE = "Memory.md"
+# 固定指向 harness 專案根目錄下的 Memory.md，
+# 不可用相對路徑：腳本執行時的 cwd 是 AI 的虛擬工作目錄（可被 change_dir 改變），
+# 與 harness 自身安裝位置無關。
+_SCRIPTS_DIR = os.path.dirname(os.path.abspath(__file__))
+_PROJECT_ROOT = os.path.dirname(os.path.dirname(_SCRIPTS_DIR))
+MEMORY_FILE = os.path.join(_PROJECT_ROOT, "Memory.md")
 
 def execute(memory_content):
     try:
@@ -14,7 +19,7 @@ def execute(memory_content):
         current_time = datetime.now().strftime("%m-%d %H:%M")
 
         # 建立格式化記憶
-        formatted_memory = f"[{current_time}] {memory_content}\n"
+        formatted_memory = f"\n[{current_time}] {memory_content}\n"
 
         # 如果 Memory.md 不存在則建立
         if not os.path.exists(MEMORY_FILE):
