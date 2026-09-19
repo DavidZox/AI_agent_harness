@@ -98,10 +98,13 @@ class SkillAgent:
 {to_compress}
 """
         # 使用 Ollama 進行摘要
-        res = ollama.chat(model=self.model, messages=[
-            {'role': 'system', 'content': system_prompt},
-            {'role': 'user', 'content': user_prompt}
-        ])
+        res = ollama.chat(model=self.model, 
+                        messages=[
+                            {'role': 'system', 'content': system_prompt},
+                            {'role': 'user', 'content': user_prompt},],
+                        options={'temperature': 0.2, 'num_ctx': 12288},
+                        think=False
+        )
         summary_content = res['message']['content']
         # 🔥 關鍵：重置對話時，保留 System Prompt + 我們想保留的最新對話
         self.messages = [self.messages[0]] + to_keep
@@ -215,11 +218,15 @@ class SkillAgent:
             # message.thinking 欄位，而非像舊版把 <thought> 內嵌在 content 裡。
             # 若不關閉，模型有時會把整個決策都留在 thinking 裡，
             # 導致 content 回傳空字串（並非被截斷，而是模型判斷自己已經回答完畢）。
+            # num_ctx：若不指定，Ollama 會用內建預設值（4096），而非模型實際支援的上限。
+            # 4096 遠小於 TOKEN_THRESHOLD（見檔案下方），代表對話還沒到我們設計的
+            # 壓縮門檻，Ollama 就已經在背後截斷最舊的內容，擠壓掉輸出可用的空間。
+            # 這裡拉高到超過 TOKEN_THRESHOLD，並保留額外空間給模型的輸出。
             response = ollama.chat(
                 model=self.model,
                 messages=self.messages,
-                options={'temperature': 0.2},
-                think=False 
+                options={'temperature': 0.2, 'num_ctx': 12288},
+                think=False
             )
 
             raw_content = response['message']['content'].strip()
