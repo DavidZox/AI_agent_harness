@@ -449,7 +449,6 @@ def _append_discarded_tool_result(agent):
         'content': "[tool result]\nTool execution completed, but the result was discarded by user request."
     })
 
-
 def _run_plan_flow(agent, user_task):
     """/plan 模式：先讓 AI 依 SKILLS.md 規劃步驟、印出來給使用者看，
     使用者核准後才讓 main() 的主迴圈開始真正執行（ask_ai -> run_tool）。
@@ -500,7 +499,6 @@ TOKEN_THRESHOLD = 8000
 # 仍會顯示給使用者（CLI 印出、或 web_console 的系統/工具回傳面板）。
 TOOL_RESULT_TOKEN_THRESHOLD = 250
 
-
 def _content_for_context(result, tool_tokens, agent=None, use_summary=False):
     """決定要餵給 AI 上下文的內容：正常大小就原封不動放進去。超過
     TOOL_RESULT_TOKEN_THRESHOLD 時有兩種精簡方式：
@@ -528,7 +526,6 @@ def _content_for_context(result, tool_tokens, agent=None, use_summary=False):
         f"{TOOL_RESULT_TOKEN_THRESHOLD}）。完整內容已顯示在剛才的系統回傳訊息中，"
         f"未直接加入上下文，以維持推理穩定。"
     )
-
 
 def main():
     agent = SkillAgent(
