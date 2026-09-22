@@ -32,20 +32,23 @@
 
 ### 1.3 上下文管理：兩層 token 門檻與可選的 AI 摘要
 
+**Token 計量方式（真實 token 尺度）**：Ollama 沒有 tokenize API（Python 套件與伺服器皆無），所以採「能精確就精確、不能就校準估算」：AI 回覆用每次 `ollama.chat()` 回報的 `eval_count`；整體上下文大小用回報的 `prompt_eval_count`（完整 prompt 的 token 數，含 chat 模板；prompt cache 命中時仍回報完整值，已實測），兩次呼叫之間新增的訊息以校準比估算增量（`SkillAgent.context_tokens()`）；使用者輸入與工具回傳沒有模型呼叫可依，用「字元數 ÷ `chars_per_token`」估算，`chars_per_token` 每次呼叫後以 `prompt_eval_count` 對整個 prompt 重新校準（`_record_usage()`，中文為主的內容實測約 1.8～1.9）。因此下表所有門檻與 `num_ctx` 同一尺度，可以直接比較。Web Console 標題列的 `ctx` 顯示目前上下文大小，前面有 `≈` 代表估算值。
+
 定義在 `Agent_Runner.py`，CLI 與 Web Console 共用：
 
 | 常數 | 目前值 | 作用 |
 | :--- | :--- | :--- |
-| `TOKEN_THRESHOLD` | 8000 | 整體對話上下文超過此 token 數，自動觸發 `compress_context_to_file()`：用 LLM 把舊對話摘要成結構化 Markdown 存到 `logs/`，只保留最近幾筆對話 + 摘要繼續。 |
-| `TOOL_RESULT_TOKEN_THRESHOLD` | 250 | 單一工具回傳超過此 token 數時，**不會**把完整原始輸出塞進 AI 的上下文，預設改用 `_content_for_context()` 產生的精簡摘要（依內容是否以 `[ERROR]` 開頭，回報「成功」或「失敗」），避免一次大量的搜尋/列目錄結果打斷模型的推理節奏。完整內容仍會顯示給使用者（CLI 印出、或 Web Console 的「系統 / 工具回傳」面板並標記 ⚠️ 待確認）。**技能規格文件例外**：`run_tool` 載入規格文件的回傳（以 `SKILL_DOC_PREFIX` 開頭）一律完整進入上下文、不標 ⚠️——它是按需載入機制的核心，被精簡掉 AI 就拿不到腳本路徑；規格書本身以 200 tokens 以內為原則。 |
+| `NUM_CTX` | 12288（環境變數 `AGENT_NUM_CTX`） | 一次請求給 Ollama 的 context 上限，主對話、壓縮摘要、工具摘要三種 session 共用。模型本身支援 131072，這是為記憶體與速度自設的。 |
+| `TOKEN_THRESHOLD` | `NUM_CTX × 70%`（預設 8601） | 整體上下文超過此 token 數，自動觸發 `compress_context_to_file()`：用 LLM 把舊對話摘要成結構化 Markdown 存到 `logs/`，只保留最近 2 筆對話 + 摘要繼續（進行中的計畫與任務敘述一併保留；舊版會在壓縮時誤呼叫 `reset_conversation()` 把這些都清掉，已修正）。檢查點有兩處：每輪工具執行後（`run_turn` / `main`），以及 `ask_ai()` 呼叫模型前——後者確保使用者貼一大段文字時，壓縮也一定發生在 Ollama 於 `num_ctx` 靜默截斷之前。 |
+| `TOOL_RESULT_TOKEN_THRESHOLD` | 500（約 1000 字元） | 單一工具回傳超過此 token 數時，**不會**把完整原始輸出塞進 AI 的上下文，預設改用 `_content_for_context()` 產生的精簡摘要（依內容是否以 `[ERROR]` 開頭，回報「成功」或「失敗」），避免一次大量的搜尋/列目錄結果打斷模型的推理節奏。完整內容仍會顯示給使用者（CLI 印出、或 Web Console 的「系統 / 工具回傳」面板並標記 ⚠️ 待確認）。**技能規格文件例外**：`run_tool` 載入規格文件的回傳（以 `SKILL_DOC_PREFIX` 開頭）一律完整進入上下文、不標 ⚠️——它是按需載入機制的核心，被精簡掉 AI 就拿不到腳本路徑；規格書本身以 400 tokens（約 800 字元）以內為原則。 |
 
 Web Console 另外加了 `MAX_AUTO_ITERATIONS = 25`：Auto 模式下連續執行工具超過此輪數會強制中止本回合，避免模型陷入迴圈時把伺服器卡死（CLI 版本因為有人在終端機前，可以直接 Ctrl+C，暫無此限制）。
 
-**`num_ctx`**：`ask_ai()` 與 `compress_context_to_file()` 呼叫 `ollama.chat()` 時都明確帶入 `num_ctx=12288`。若不指定，Ollama 會用內建預設值 4096，遠小於模型（`gemma4:e4b`）實際支援的 131072，也小於 `TOKEN_THRESHOLD` 設計的 8000——代表對話還沒到我們自己設計的壓縮門檻，Ollama 就已經在背後悄悄截斷最舊的內容並擠壓輸出空間，看起來就像模型的輸出被無故砍短。拉高 `num_ctx` 是為了讓實際視窗跟應用層自己設計的門檻對齊。
+**`num_ctx` 與門檻的關係**：所有 `ollama.chat()` 呼叫都帶 `num_ctx=NUM_CTX`。若不指定，Ollama 會用內建預設值 4096，對話還沒到壓縮門檻就會在背後悄悄截斷最舊的內容並擠壓輸出空間，看起來就像模型的輸出被無故砍短。`TOKEN_THRESHOLD` 直接定義為 `NUM_CTX` 的 70%，兩者同一尺度，壓縮一定先於截斷發生。歷史教訓：舊版 `TOKEN_THRESHOLD = 8000` 是以「字元÷4」計量，換成真實 token 約 17000，早已超過 `num_ctx` 12288，壓縮實際上永遠來不及觸發。
 
 **工具回傳摘要模式（可選，預設關閉）**：CLI 用 `/summarize on|off`、Web Console 用同名指令切換（狀態各自存在 `main()` 的區域變數 / `state["tool_summary_mode"]`）。關閉時就是上表「成功/失敗」判定的預設行為；開啟後，超過 `TOOL_RESULT_TOKEN_THRESHOLD` 的內容會改由 `SkillAgent.summarize_tool_result()` 處理——做法比照 `compress_context_to_file()`：另外開一個獨立、乾淨的一次性 session（專屬 system/user prompt，不接觸主對話的 `self.messages`），對原始輸出做語意摘要，讓主 session 拿到的是「有意義的重點摘要」而不只是成功/失敗判定，摘要完即丟棄。若摘要 session 本身失敗（例如模型出錯），`_content_for_context()` 會自動 fallback 回成功/失敗判定，不會讓主推理流程中斷。Web Console 會把這次獨立摘要的結果額外用紫色卡片顯示在「系統 / 工具回傳」面板（標籤「🧠 AI 摘要（獨立 session）」）。這是本節提到 token 門檻機制的加強版，代價是超過門檻時會多一次 LLM 呼叫、增加延遲，因此設計成可自由開關。
 
-**訊息數量的滑動視窗（`_truncate_memory`）**：跟上面兩個以 token 為單位的門檻是**互相獨立**的第三道機制，以「訊息則數」為單位。`SkillAgent(max_history=...)` 目前 CLI 與 Web Console 都設為 30；`ask_ai()` 每次呼叫前都會檢查，一旦 `self.messages`（不含開頭的 system prompt）超過 30 則，就直接執行 `self.messages = [self.messages[0]] + self.messages[-30:]`——**沒有摘要、沒有歸檔，超過的部分直接捨棄**。這跟 `compress_context_to_file()` 是兩套不同邏輯：後者是以 token 量觸發、會先摘要存檔才清空；前者純粹以則數為觸發條件，只要一次對話來回夠多（例如工具呼叫很密集的多步驟任務），就可能在還沒累積到 `TOKEN_THRESHOLD` 之前就先被這個機制悄悄丟掉最舊的訊息。這點目前是已知的設計缺口，見第 5.5 節。
+**訊息則數的滑動視窗（`_truncate_memory`）已預設停用**：`SkillAgent(max_history=None)` 是 CLI 與 Web Console 的預設值，上下文大小只由上面的 token 門檻決定，舊內容一律「摘要歸檔」而不是「無聲丟棄」。`max_history` 保留為可選的保險絲（例如設 200），啟用時超過則數會直接砍掉最舊訊息、不摘要不歸檔，一般情況不建議開。
 
 ### 1.4 三種執行模式
 
@@ -151,7 +154,7 @@ python3 web_console.py
 5. **小型本地模型的工具呼叫可靠度**：實測過 `gemma4:e4b` 在需要判斷、選技能的情境下，偶爾會不輸出 `EXECUTE:` 指令、直接「腦補」一份假的執行結果（例如編造一份不存在的目錄列表）。這是模型能力限制，不是架構問題，但值得在後續設計中納入考量（例如偵測回應裡有沒有實際呼叫工具、要求時偵測到可疑輸出就要求重答）。1.6 節的 Plan 模式是針對這個限制的其中一種緩解方式——執行前的確認關卡是靠程式碼路徑保證的（規劃階段不呼叫 `run_tool()`），不依賴模型本身是否守規矩。
 6. **CLI 與 Web Console 功能不完全對等**：CLI 的 `objective set` 是互動式多行輸入（輸入到 `objective end` 為止），Web Console 為了適應單次 HTTP 請求，簡化成單行的 `/objective set <內容>`。
 7. **沒有自動化測試**：目前所有驗證都是開發過程中手動寫的一次性腳本（stub `ollama.chat`、模擬多輪對話），沒有留在專案裡形成正式的測試套件。
-8. **`count_tokens` 實際上永遠走 `len(text)//4` 的 fallback**：目前的 ollama Python 套件沒有 `tokenize()`，伺服器也沒有 `/api/tokenize`，因此畫面上所有 token 數字都是「字元數 ÷ 4」的估計；中文實際 token 數約為顯示值的 2～3 倍。`TOKEN_THRESHOLD`、`TOOL_RESULT_TOKEN_THRESHOLD` 與規格書「200 tokens 以內」都是以這個估計尺度校準的，若日後換成真正的 tokenizer 需一併重新校準。
+8. **使用者輸入與工具回傳的 token 數仍是估算值**：Ollama 沒有 tokenize API，只有 AI 回覆（`eval_count`）與整體上下文（`prompt_eval_count`）是精確的；其餘以每次呼叫後校準的字元比估算（見 1.3 節），對中文為主的內容誤差通常在一成以內，但夾雜大量程式碼或 URL 的工具輸出可能偏差較大。`count_tokens()` 保留了對 `ollama.tokenize()` 的偵測，日後套件提供時會自動改用精確值。
 
 ---
 
@@ -181,9 +184,9 @@ python3 web_console.py
 - 把目前開發過程中用來驗證行為的 stub 測試腳本，整理成正式的 `tests/` 目錄（用假的 `ollama.chat` 逐一驗證 `run_tool`、`_content_for_context`、`run_turn`、`apply_decision` 等關鍵函式的行為）。
 - 把 `current_cwd`、模型名稱等寫死的預設值改成可透過環境變數或設定檔覆寫，方便在不同機器上部署。
 
-### 5.5 滑動視窗（`_truncate_memory`）改成「壓縮＋保留最新幾筆」，而不是直接丟棄
+### 5.5 ～已解決～ 滑動視窗與 token 壓縮收斂成同一套機制
 
-見 1.3 節：目前超過 `max_history`（30 則）就直接 `self.messages[-30:]` 硬砍，沒有摘要、沒有歸檔。這跟 `compress_context_to_file()` 的處理方式不一致，也代表如果一次任務工具呼叫特別密集（例如多步驟的 Plan 模式任務），有可能還沒累積到 `TOKEN_THRESHOLD` 就先被這個機制悄悄丟掉最舊的訊息，而且丟掉的內容完全沒有留下任何摘要痕跡（`compress_context_to_file()` 至少會存一份到 `logs/`）。比較好的做法是讓 `_truncate_memory` 觸發時比照 `compress_context_to_file()` 走一次壓縮流程——把要丟棄的最舊那批訊息摘要後存檔，只保留最新幾筆原始對話（不摘要，維持細節完整），而不是無聲無息地整批消失。理想上兩套「上下文太大時該怎麼辦」的邏輯（token 觸發、則數觸發）應該收斂成同一套壓縮機制，只是觸發條件不同。
+原本 `_truncate_memory` 以「訊息則數」（30 則）硬砍、`compress_context_to_file` 以 token 觸發，兩套邏輯並存且前者可能先於後者無聲丟棄內容。現在：token 計量改為真實尺度（`prompt_eval_count` / `eval_count` + 校準估算，見 1.3），`TOKEN_THRESHOLD` 定義為 `NUM_CTX` 的 70%，壓縮檢查點涵蓋每輪工具執行後與 `ask_ai()` 呼叫前，因此壓縮一定先於 Ollama 截斷發生；則數視窗預設停用（`max_history=None`），只保留為可選保險絲。
 
 ### 5.6 grep（精準檢索）vs 獨立 session 摘要，該用哪個不應該只看 token 量
 

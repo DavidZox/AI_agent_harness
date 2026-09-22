@@ -6,7 +6,9 @@ import shlex
 import time
 
 class SkillAgent:
-    def __init__(self, model="gemma4:e4b", max_history=10):
+    def __init__(self, model="gemma4:e4b", max_history=None):
+        # max_history：訊息「則數」滑動視窗，預設停用（None）。上下文大小統一以 token 門檻
+        # （TOKEN_THRESHOLD）觸發壓縮歸檔；這個參數只保留作為極端情境的保險絲，需要時再開。
         self.model = model
         self.script_dir = os.path.dirname(os.path.abspath(__file__))
         self.base_path = os.path.join(self.script_dir, "skills_system")
@@ -28,11 +30,17 @@ class SkillAgent:
         self.tools_dir = os.path.join(self.base_path, "tools")
 
         # =========================
-        # 🧠 Token Tracker
+        # 🧠 Token Tracker（真實 token 尺度，見檔尾 NUM_CTX / TOKEN_THRESHOLD 說明）
         # =========================
         self.total_user_tokens = 0
         self.total_ai_tokens = 0
         self.total_tool_tokens = 0
+        self.chars_per_token = DEFAULT_CHARS_PER_TOKEN  # 字元→token 校準比，每次 ask_ai 後用 prompt_eval_count 更新
+        self.last_prompt_tokens = None   # 最近一次 ask_ai 由 Ollama 回報的完整 prompt token 數（精確）
+        self.last_prompt_chars = None    # 該次 prompt 的字元數，之後用來估算增量
+        self.last_eval_tokens = None     # 最近一次 ask_ai 產生的 token 數（精確）
+        self.auto_compressed = False     # 最近一次 ask_ai 呼叫前是否因超過門檻而自動壓縮（供 UI 顯示）
+        self._tokenize_unavailable = False
 
         # =========================
         # 🎯 Sticky Objective
@@ -56,24 +64,62 @@ class SkillAgent:
         self.current_task = None
 
     def count_tokens(self, text: str) -> int:
-        """
-        Ollama Native tokenizer (Gemma 4 e4b)
-        """
-        try:
-            tokens = ollama.tokenize(model=self.model, prompt=text)
-            return len(tokens)
-        except Exception:
-            # fallback
-            return len(text) // 4
+        """估算一段文字的 token 數（真實 token 尺度）。
 
-    def count_context_tokens(self) -> int:
-        """
-        計算整體 context tokens
-        """
-        full_text = ""
-        for m in self.messages:
-            full_text += f"{m['role']}: {m['content']}\n"
-        return self.count_tokens(full_text)
+        Ollama 目前沒有 tokenize API（Python 套件與伺服器皆無），無法對任意文字精確計數，
+        這裡用「字元數 ÷ chars_per_token」估算。chars_per_token 會在每次 ask_ai 之後，用
+        Ollama 回報的 prompt_eval_count 對整個 prompt 重新校準（見 _record_usage），所以
+        使用者輸入、工具回傳的估算尺度跟模型實際計算一致（中文為主的內容實測約 1.8～1.9
+        字元/token，舊版寫死的 ÷4 會低估一半以上）。若未來 ollama 套件提供 tokenize()
+        會優先使用。"""
+        if not text:
+            return 0
+        if not self._tokenize_unavailable:
+            tokenize = getattr(ollama, "tokenize", None)
+            if tokenize is None:
+                self._tokenize_unavailable = True
+            else:
+                try:
+                    return len(tokenize(model=self.model, prompt=text))
+                except Exception:
+                    self._tokenize_unavailable = True
+        return max(1, round(len(text) / self.chars_per_token))
+
+    def _messages_chars(self) -> int:
+        return sum(len(m['content']) for m in self.messages)
+
+    def context_tokens(self) -> int:
+        """目前主對話（system prompt + 全部 messages）的 token 數，真實尺度。
+
+        剛呼叫完模型時，以 Ollama 回報的 prompt_eval_count 為基準（精確，含 chat 模板；
+        prompt cache 命中時仍回報完整值，已實測），之後每加入一則訊息就用校準比估算增量
+        加上去；還沒呼叫過模型（或剛壓縮過）時整段用校準比估算。"""
+        chars = self._messages_chars()
+        if self.last_prompt_tokens is not None and self.last_prompt_chars is not None:
+            delta = chars - self.last_prompt_chars
+            return max(0, self.last_prompt_tokens + round(delta / self.chars_per_token))
+        return round(chars / self.chars_per_token)
+
+    count_context_tokens = context_tokens  # 舊名稱相容
+
+    def _record_usage(self, response):
+        """用 Ollama 回應的精確計量更新校準與狀態：
+        prompt_eval_count = 這次送出的完整 prompt token 數，eval_count = 這次產生的 token 數。"""
+        get = getattr(response, "get", None)
+        prompt_tokens = get('prompt_eval_count') if get else None
+        eval_tokens = get('eval_count') if get else None
+        chars = self._messages_chars()
+        if prompt_tokens and chars:
+            self.last_prompt_tokens = int(prompt_tokens)
+            self.last_prompt_chars = chars
+            ratio = chars / prompt_tokens
+            if MIN_CHARS_PER_TOKEN <= ratio <= MAX_CHARS_PER_TOKEN:
+                self.chars_per_token = ratio
+        self.last_eval_tokens = int(eval_tokens) if eval_tokens else None
+
+    def last_ai_tokens(self, text: str) -> int:
+        """最近一次 ask_ai 產生內容的 token 數：優先用 Ollama 回報的 eval_count（精確），沒有才估算。"""
+        return self.last_eval_tokens if self.last_eval_tokens is not None else self.count_tokens(text)
 
     def compress_context_to_file(self, num_to_keep=2):
         history_to_compress = self.messages[1:]
@@ -119,7 +165,7 @@ class SkillAgent:
                         messages=[
                             {'role': 'system', 'content': system_prompt},
                             {'role': 'user', 'content': user_prompt},],
-                        options={'temperature': 0.2, 'num_ctx': 12288},
+                        options={'temperature': 0.2, 'num_ctx': NUM_CTX},
                         think=False
         )
         summary_content = res['message']['content']
@@ -136,8 +182,14 @@ class SkillAgent:
         file_path = os.path.join(log_dir, f"summary_{timestamp}.md")
         with open(file_path, "w", encoding="utf-8") as f:
             f.write(f"# Summary at {timestamp}\n\n{summary_content}")
-            
-        self.reset_conversation()
+
+        # 只刷新 system prompt，讓剛寫入的摘要檔透過 load_recent_summary_logs 進入上下文；
+        # 保留 to_keep、current_plan、current_task。舊版這裡呼叫 reset_conversation()，
+        # 會把號稱保留的最新幾筆對話、以及進行中的計畫與任務敘述一起清掉。
+        self.messages[0] = {'role': 'system', 'content': self.get_system_prompt()}
+        # Ollama 上次回報的精確 prompt 大小已失效，改用校準比估算直到下一次呼叫
+        self.last_prompt_tokens = None
+        self.last_prompt_chars = None
         print(f"💾 [系統] 歷史已壓縮並存入: {os.path.basename(file_path)}")
 
     def summarize_tool_result(self, result, tool_tokens):
@@ -178,7 +230,7 @@ class SkillAgent:
                 {'role': 'system', 'content': system_prompt},
                 {'role': 'user', 'content': user_prompt},
             ],
-            options={'temperature': 0.2, 'num_ctx': 12288},
+            options={'temperature': 0.2, 'num_ctx': NUM_CTX},
             think=False,
         )
         summary = res['message']['content'].strip()
@@ -354,7 +406,9 @@ class SkillAgent:
         self.messages = [{'role': 'system', 'content': self.get_system_prompt()}]
 
     def _truncate_memory(self):
-        if len(self.messages) > self.max_history + 1:
+        """訊息「則數」滑動視窗，預設停用（max_history=None）。啟用時超過則數會直接丟棄最舊訊息、
+        不摘要不歸檔，與 token 觸發的 compress_context_to_file 是不同邏輯，只當保險絲用。"""
+        if self.max_history and len(self.messages) > self.max_history + 1:
             print(f"⚠️  [記憶優化] 啟動滑動視窗（保留 {self.max_history} 筆）")
             self.messages = [self.messages[0]] + self.messages[-self.max_history:]
 
@@ -365,20 +419,29 @@ class SkillAgent:
 
             self._truncate_memory()
 
+            # 呼叫前先確認上下文預算：使用者若貼了一大段文字，加入 messages 之後不會先經過
+            # run_turn / main 的壓縮檢查就直接送模型，這裡補上最後一道檢查，確保壓縮一定發生在
+            # Ollama 於 num_ctx 處靜默截斷最舊內容之前。
+            self.auto_compressed = False
+            if self.context_tokens() > TOKEN_THRESHOLD:
+                self.compress_context_to_file(num_to_keep=2)
+                self.auto_compressed = True
+
             # 關閉 Ollama 的獨立 thinking 模式：此版本 Ollama 會把推理過程放進
             # message.thinking 欄位，而非像舊版把 <thought> 內嵌在 content 裡。
             # 若不關閉，模型有時會把整個決策都留在 thinking 裡，
             # 導致 content 回傳空字串（並非被截斷，而是模型判斷自己已經回答完畢）。
             # num_ctx：若不指定，Ollama 會用內建預設值（4096），而非模型實際支援的上限。
-            # 4096 遠小於 TOKEN_THRESHOLD（見檔案下方），代表對話還沒到我們設計的
-            # 壓縮門檻，Ollama 就已經在背後截斷最舊的內容，擠壓掉輸出可用的空間。
-            # 這裡拉高到超過 TOKEN_THRESHOLD，並保留額外空間給模型的輸出。
+            # 4096 遠小於我們的壓縮門檻，代表對話還沒到門檻 Ollama 就已經在背後截斷最舊的
+            # 內容。這裡統一用 NUM_CTX，TOKEN_THRESHOLD 定義為它的 70%（同一尺度：真實 token），
+            # 保留空間給模型輸出與下一則訊息。
             response = ollama.chat(
                 model=self.model,
                 messages=self.messages,
-                options={'temperature': 0.2, 'num_ctx': 12288},
+                options={'temperature': 0.2, 'num_ctx': NUM_CTX},
                 think=False
             )
+            self._record_usage(response)
 
             raw_content = response['message']['content'].strip()
 
@@ -542,7 +605,7 @@ def _run_plan_flow(agent, user_task):
 
     while True:
         plan_msg = agent.ask_ai()
-        agent.total_ai_tokens += agent.count_tokens(plan_msg)
+        agent.total_ai_tokens += agent.last_ai_tokens(plan_msg)
         agent.messages.append({'role': 'assistant', 'content': plan_msg})
         print(f"\n📝 AI 規劃的任務計畫:\n{'-'*30}\n{plan_msg}\n{'-'*30}")
 
@@ -568,19 +631,41 @@ def _run_plan_flow(agent, user_task):
         agent.messages.append({'role': 'user', 'content': agent.build_plan_revision_request(choice)})
 
 
-# 整體上下文超過此 token 數時，自動觸發壓縮並歸檔（見 compress_context_to_file）。
-TOKEN_THRESHOLD = 8000
+# =========================================================
+# 🔢 Token 計量與上下文預算（全部為「真實 token」尺度）
+# =========================================================
+# 計量來源：
+#   - AI 回覆        → Ollama 回報的 eval_count（精確）
+#   - 整體上下文大小 → Ollama 回報的 prompt_eval_count（精確；快取命中時仍為完整值，已實測），
+#                     兩次呼叫之間新增的訊息以校準比估算增量
+#   - 使用者輸入、工具回傳 → 字元數 ÷ chars_per_token，chars_per_token 每次呼叫後用
+#                     prompt_eval_count 重新校準（Ollama 沒有 tokenize API，無法精確計數）
+# 下面所有門檻因此都與 num_ctx 同一尺度，可以直接比較。
+
+# Ollama 一次請求的 context 上限。模型本身支援更長（gemma4:e4b 為 131072），這裡是為了記憶體
+# 與速度自設的；主對話、壓縮摘要、工具摘要三種 session 共用同一個值。可用 AGENT_NUM_CTX 覆寫。
+NUM_CTX = int(os.environ.get("AGENT_NUM_CTX", "12288"))
+
+# 整體上下文超過此 token 數時自動壓縮並歸檔（見 compress_context_to_file）。取 NUM_CTX 的 70%，
+# 保留約 30% 給模型輸出與下一則使用者／工具訊息，確保壓縮一定發生在 Ollama 靜默截斷之前。
+# （舊版寫死 8000 且以「字元÷4」計量，換算成真實 token 約 17000，早已超過 num_ctx，壓縮永遠來不及觸發。）
+TOKEN_THRESHOLD = int(NUM_CTX * 0.70)
+
+# 字元→token 校準比的預設值與合理範圍。中文為主的內容實測約 1.8～1.9 字元/token。
+DEFAULT_CHARS_PER_TOKEN = 1.9
+MIN_CHARS_PER_TOKEN, MAX_CHARS_PER_TOKEN = 1.0, 6.0
 
 # 單一工具回傳內容的 token 門檻：超過此值時，不會把完整原始內容塞進 AI 的
 # 上下文（避免一次搜尋/列目錄的大量輸出把 context 灌爆、干擾推理），而是
 # 改用精簡的「成功／失敗」摘要餵給 AI，讓它的推理流程保持穩定；完整內容
 # 仍會顯示給使用者（CLI 印出、或 web_console 的系統/工具回傳面板）。
-TOOL_RESULT_TOKEN_THRESHOLD = 250
+# 約 1000 字元。（舊值 250 是「字元÷4」尺度，換成真實尺度即為 500。）
+TOOL_RESULT_TOKEN_THRESHOLD = 500
 
 # run_tool 載入技能規格文件時回傳字串的固定開頭。規格文件是「按需載入」機制的核心，
 # 內容（尤其是實際腳本路徑與參數格式）必須完整進入上下文，因此 _content_for_context
 # 對這類結果一律放行、不套用 TOOL_RESULT_TOKEN_THRESHOLD，Web Console 也不標記 ⚠️。
-# 規格書本身仍應維持精簡（以 200 tokens 以內為原則），節省每次載入的上下文成本。
+# 規格書本身仍應維持精簡（以 400 tokens／約 800 字元以內為原則），節省每次載入的上下文成本。
 SKILL_DOC_PREFIX = "📘 已載入技能"
 
 
@@ -625,7 +710,7 @@ def _content_for_context(result, tool_tokens, agent=None, use_summary=False):
 def main():
     agent = SkillAgent(
         model="gemma4:e4b",
-        max_history=30
+        max_history=None,  # 則數視窗停用，統一以 token 門檻壓縮
     )
     agent.reset_conversation()
     auto_mode = False
@@ -734,8 +819,10 @@ def main():
             while True:
                 # --- 🧠 AI 推論 ---
                 ai_msg = agent.ask_ai()
-                ai_tokens = agent.count_tokens(ai_msg)
+                ai_tokens = agent.last_ai_tokens(ai_msg)
                 agent.total_ai_tokens += ai_tokens
+                if agent.auto_compressed:
+                    print("📦 上下文超過門檻，呼叫前已自動壓縮並歸檔。")
                 print(f"\n🧠 AI:\n{'-'*30}\n{ai_msg}\n{'-'*30}")
                 print(f"📤 AI Tokens: {ai_tokens}")
                 agent.messages.append({'role': 'assistant', 'content': ai_msg})
@@ -755,12 +842,11 @@ def main():
                     print("✅ 無工具需要執行")
 
                 # --- 📊 TOKEN 統計顯示 ---
-                full_context = agent.get_system_prompt() + "\n" + "".join([f"{m['role']}: {m['content']}\n" for m in agent.messages])
-                print(f"\n📦 Context Tokens: {agent.count_tokens(full_context)}")
+                print(f"\n📦 Context Tokens: {agent.context_tokens()} / 門檻 {TOKEN_THRESHOLD}（num_ctx {NUM_CTX}）")
                 # --- 自動壓縮觸發器 ---
-                if agent.count_tokens(full_context) > TOKEN_THRESHOLD:
+                if agent.context_tokens() > TOKEN_THRESHOLD:
                     agent.compress_context_to_file(num_to_keep=2)
-                    print(f"\n📦 Compressed Context Tokens: {agent.count_tokens(full_context)}")
+                    print(f"\n📦 Compressed Context Tokens: {agent.context_tokens()}")
                     continue # 壓縮後重新循環，確保下一輪 Agent 讀取到更新後的 system prompt
                 print(f"📊 Stats | User: {agent.total_user_tokens} | AI: {agent.total_ai_tokens} | Tool: {agent.total_tool_tokens}")
 

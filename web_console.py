@@ -37,6 +37,7 @@ from Agent_Runner import (
     SkillAgent,
     _append_discarded_tool_result,
     _content_for_context,
+    NUM_CTX,
     TOKEN_THRESHOLD,
     TOOL_RESULT_TOKEN_THRESHOLD,
     is_skill_doc_result,
@@ -57,7 +58,7 @@ from vision.web import static_file as vision_static_file
 # Agent 狀態（單一使用者、單一 Agent 實例）
 # =========================================================
 
-agent = SkillAgent(model=os.environ.get("WEB_CONSOLE_MODEL", "gemma4:e4b"), max_history=30)
+agent = SkillAgent(model=os.environ.get("WEB_CONSOLE_MODEL", "gemma4:e4b"), max_history=None)  # 則數視窗停用，統一以 token 門檻壓縮
 agent.reset_conversation()
 
 state = {"auto_mode": False, "hybrid_mode": False, "tool_summary_mode": False, "plan_mode": False}
@@ -116,8 +117,14 @@ web_console 那台機器的螢幕。送出訊息時，附加的影像先由獨�
 壓縮與 token 統計。視覺分析結果不套用工具回傳的精簡門檻（它是影像唯一的文字
 表示），超過門檻時卡片會標 ⚠️ 待確認提醒你留意長度。影像只在送出一次新任務時使用，送出後即清空；slash 指令
 與計畫核准／修改意見不會消耗附加的影像。只附圖不打字送出時，會用預設的
-「請描述這些影像的內容」當作提示詞。""".format(
-    threshold=TOOL_RESULT_TOKEN_THRESHOLD, vision_model=VISION_MODEL
+「請描述這些影像的內容」當作提示詞。
+
+Token 計量：AI 回覆與整體上下文大小以 Ollama 回報的精確值為準（eval_count／
+prompt_eval_count），使用者輸入與工具回傳以每次呼叫後校準的字元比估算，所有
+數字都是真實 token 尺度。整體上下文超過 {token_threshold}（num_ctx {num_ctx} 的
+70%）時會自動壓縮歸檔，標題列的 ctx 會顯示目前大小（≈ 代表估算值）。""".format(
+    threshold=TOOL_RESULT_TOKEN_THRESHOLD, vision_model=VISION_MODEL,
+    token_threshold=TOKEN_THRESHOLD, num_ctx=NUM_CTX,
 )
 
 
@@ -148,6 +155,11 @@ def build_stats():
         "total_user_tokens": agent.total_user_tokens,
         "total_ai_tokens": agent.total_ai_tokens,
         "total_tool_tokens": agent.total_tool_tokens,
+        "context_tokens": agent.context_tokens(),
+        "context_exact": agent.last_prompt_tokens is not None,
+        "token_threshold": TOKEN_THRESHOLD,
+        "num_ctx": NUM_CTX,
+        "chars_per_token": round(agent.chars_per_token, 2),
         "attachments": vision_session.count(),
         "vision_model": VISION_MODEL,
     }
@@ -209,7 +221,9 @@ def _ask_and_present_plan(events):
     SkillAgent.build_plan_request / build_plan_revision_request，
     只是這裡拆成「單次 HTTP 請求處理一小段」的非同步形式。"""
     plan_msg = agent.ask_ai()
-    agent.total_ai_tokens += agent.count_tokens(plan_msg)
+    agent.total_ai_tokens += agent.last_ai_tokens(plan_msg)
+    if agent.auto_compressed:
+        events.append({"channel": "system", "text": "📦 上下文超過門檻，呼叫前已自動壓縮並歸檔。"})
     agent.messages.append({'role': 'assistant', 'content': plan_msg})
     events.append({"channel": "plan", "text": plan_msg})
     plan_pending["active"] = True
@@ -266,8 +280,10 @@ def run_turn(events):
     """
     for _ in range(MAX_AUTO_ITERATIONS):
         ai_msg = agent.ask_ai()
-        ai_tokens = agent.count_tokens(ai_msg)
+        ai_tokens = agent.last_ai_tokens(ai_msg)
         agent.total_ai_tokens += ai_tokens
+        if agent.auto_compressed:
+            events.append({"channel": "system", "text": "📦 上下文超過門檻，呼叫前已自動壓縮並歸檔。"})
         agent.messages.append({'role': 'assistant', 'content': ai_msg})
         events.append({"channel": "chat", "role": "assistant", "text": ai_msg, "tokens": ai_tokens})
 
@@ -296,10 +312,7 @@ def run_turn(events):
         else:
             events.append({"channel": "system", "text": "✅ 無工具需要執行"})
 
-        full_context = agent.get_system_prompt() + "\n" + "".join(
-            f"{m['role']}: {m['content']}\n" for m in agent.messages
-        )
-        if agent.count_tokens(full_context) > TOKEN_THRESHOLD:
+        if agent.context_tokens() > TOKEN_THRESHOLD:
             agent.compress_context_to_file(num_to_keep=2)
             events.append({"channel": "system", "text": "📦 上下文超過門檻，已自動壓縮並歸檔。"})
             continue
@@ -632,7 +645,8 @@ function updateStatus(stats) {
   document.getElementById('stat-mode').textContent = 'mode: ' + stats.mode;
   document.getElementById('stat-cwd').textContent = 'cwd: ' + stats.current_cwd;
   document.getElementById('stat-tokens').textContent =
-    `tokens: user ${stats.total_user_tokens} / ai ${stats.total_ai_tokens} / tool ${stats.total_tool_tokens}`;
+    `tokens: user ${stats.total_user_tokens} / ai ${stats.total_ai_tokens} / tool ${stats.total_tool_tokens}` +
+    ` · ctx ${stats.context_exact ? '' : '≈'}${stats.context_tokens}/${stats.token_threshold}`;
   // 伺服器端附件已被消費（送出新任務）或清空時，同步清掉輸入框上方的縮圖
   if (stats.attachments === 0) clearAttachStrip();
 }
