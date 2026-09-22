@@ -41,6 +41,17 @@ from Agent_Runner import (
     TOOL_RESULT_TOKEN_THRESHOLD,
 )
 
+# 📷 多模態影像：附圖走 vision library 的獨立視覺 sub-session（見 _run_vision_subsession），
+# 主對話永遠是純文字，既有的壓縮／token 計算／滑動視窗都不需要知道影像的存在。
+from vision import (
+    DEFAULT_MODEL as VISION_MODEL,
+    SUBSESSION_SYSTEM_PROMPT,
+    VisionError,
+    VisionSession,
+    analyze as vision_analyze,
+)
+from vision.web import static_file as vision_static_file
+
 # =========================================================
 # Agent 狀態（單一使用者、單一 Agent 實例）
 # =========================================================
@@ -51,6 +62,7 @@ agent.reset_conversation()
 state = {"auto_mode": False, "hybrid_mode": False, "tool_summary_mode": False, "plan_mode": False}
 pending = {"result": None, "mode": None, "tokens": None}  # 等待使用者決策的工具結果（hybrid / manual 模式用）
 plan_pending = {"active": False, "text": None}  # 等待使用者核准／修改意見的任務計畫（/plan 模式用）
+vision_session = VisionSession()  # 📷 尚未送出的影像附件（框選截圖／上傳的檔案），送出新任務時一次消費
 lock = threading.Lock()
 
 MAX_AUTO_ITERATIONS = 25  # 安全防護：避免 auto 模式下模型無限迴圈卡住伺服器
@@ -90,8 +102,20 @@ session 失敗會自動退回原本的成功/失敗摘要，不影響主流程�
 會拿到「使用者原始問題敘述」當聚焦依據（優先用 Objective，其次是目前核准
 中的 plan 執行到哪一步，都沒有就用這一輪任務原始輸入的文字），避免摘要
 時因為不知道重點是什麼而漏掉關鍵資訊。完整原始內容永遠都會顯示在
-「系統 / 工具回傳」面板並標記 ⚠️ 待確認，需自行點「✅ 我已確認」。""".format(
-    threshold=TOOL_RESULT_TOKEN_THRESHOLD
+「系統 / 工具回傳」面板並標記 ⚠️ 待確認，需自行點「✅ 我已確認」。
+
+輸入框旁的 📷 可以附加影像：「框選畫面」會擷取螢幕並進入全螢幕框選（可連續
+框選多張，Esc 離開），「選擇檔案」可挑本機的圖片檔；縮圖會排在輸入框上方，
+可個別移除。擷取方式自動判斷：伺服器在 WSL（PowerShell）或 Linux X11 桌面時
+由伺服器端截圖（多螢幕會先讓你選）；否則改用瀏覽器的「分享畫面」功能由你挑
+螢幕（頁面需以 http://localhost 或 https 開啟）。注意伺服器端截的是執行
+web_console 那台機器的螢幕。送出訊息時，附加的影像先由獨立的視覺 sub-session（模型
+{vision_model}）依你的訊息內容做分析，分析結果以文字連同你的訊息一起交給
+主 Agent（右欄會多一張「🖼️ 視覺分析」卡片），主對話本身維持純文字，不影響
+壓縮與 token 統計。影像只在送出一次新任務時使用，送出後即清空；slash 指令
+與計畫核准／修改意見不會消耗附加的影像。只附圖不打字送出時，會用預設的
+「請描述這些影像的內容」當作提示詞。""".format(
+    threshold=TOOL_RESULT_TOKEN_THRESHOLD, vision_model=VISION_MODEL
 )
 
 
@@ -122,6 +146,8 @@ def build_stats():
         "total_user_tokens": agent.total_user_tokens,
         "total_ai_tokens": agent.total_ai_tokens,
         "total_tool_tokens": agent.total_tool_tokens,
+        "attachments": vision_session.count(),
+        "vision_model": VISION_MODEL,
     }
 
 
@@ -136,6 +162,32 @@ def _emit_summary_event(content, events):
     而不是只能從主對話推測 AI 收到了什麼。"""
     if content.startswith(_SUMMARY_TAG):
         events.append({"channel": "summary", "text": content})
+
+
+DEFAULT_VISION_PROMPT = "請描述這些影像的內容，並逐字列出可見的文字、數值、錯誤訊息與任何值得注意的異常。"
+
+
+def _run_vision_subsession(message, images, events):
+    """📷 附圖的獨立視覺 sub-session（跟 SkillAgent.summarize_tool_result 同一種模式）：
+    影像 + 使用者訊息交給視覺模型得到文字，主對話只收到文字、不接觸影像 bytes，
+    所以 compress_context_to_file / count_tokens / _truncate_memory 全都不用改。
+    代價是主 Agent 看到的是描述而非原圖，追問時要重新附圖。
+    回傳要放進主對話的完整使用者訊息內容（原文 + [vision result] 區塊）。"""
+    n = len(images)
+    events.append({"channel": "system", "text": f"🖼️ 視覺推論中（{n} 張影像，模型 {VISION_MODEL}）..."})
+    try:
+        result = vision_analyze(images, message, system_prompt=SUBSESSION_SYSTEM_PROMPT)
+    except VisionError as e:
+        result = f"[ERROR] 視覺分析失敗：{e}"
+    tokens = agent.count_tokens(result)
+    agent.total_tool_tokens += tokens
+    events.append({"channel": "vision", "text": result, "tokens": tokens, "count": n})
+    return (
+        f"{message}\n\n"
+        f"[vision result]\n"
+        f"（使用者附上了 {n} 張影像；以下是獨立視覺模型針對上述訊息對影像的分析結果。"
+        f"你看不到原圖，請以這份分析為依據回應或決定下一步。）\n{result}"
+    )
 
 
 def _ask_and_present_plan(events):
@@ -375,6 +427,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
 <head>
 <meta charset="UTF-8">
 <title>SkillAgent Web Console</title>
+<link rel="stylesheet" href="/static/vision/snip.css">
 <style>
   :root { color-scheme: dark; }
   * { box-sizing: border-box; }
@@ -426,6 +479,30 @@ HTML_PAGE = r"""<!DOCTYPE html>
   button:disabled { opacity: 0.5; cursor: not-allowed; }
   button.secondary { background: #4a4c50; }
   button.danger { background: #b0473f; }
+
+  /* ===== 📷 影像附件 ===== */
+  .entry.vision { background: #1f2b33; border: 1px solid #3d6b80; color: #cfe6f0; }
+  .entry.vision .tag { color: #7fc8e8; opacity: 1; }
+  .entry.user .attach-note { font-size: 11px; color: #9fc3e6; margin-top: 4px; }
+  #attach-strip { display: none; gap: 8px; flex-wrap: wrap; margin-bottom: 8px; align-items: center; }
+  #attach-strip.show { display: flex; }
+  #attach-hint { font-size: 12px; color: #9aa0a6; }
+  .attach-item { position: relative; }
+  .attach-item img { width: 72px; height: 54px; object-fit: cover; border-radius: 4px; border: 1px solid #3a3c40; display: block; }
+  .attach-item .rm {
+    position: absolute; top: -6px; right: -6px; width: 18px; height: 18px; border-radius: 50%;
+    background: #b0473f; color: white; font-size: 11px; line-height: 18px; text-align: center; cursor: pointer;
+  }
+  .input-row { position: relative; }
+  #attach-btn { white-space: nowrap; }
+  #attach-menu {
+    display: none; position: absolute; bottom: 62px; left: 0; z-index: 100;
+    background: #26282c; border: 1px solid #3a3c40; border-radius: 8px; padding: 6px;
+    flex-direction: column; gap: 4px;
+  }
+  #attach-menu.show { display: flex; }
+  #attach-menu button { background: #34363b; text-align: left; cursor: pointer; }
+  #attach-menu button:hover { background: #3a6df0; }
 </style>
 </head>
 <body>
@@ -436,6 +513,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
     <span id="stat-mode">mode: manual</span>
     <span id="stat-cwd">cwd: -</span>
     <span id="stat-tokens">tokens: -</span>
+    <span id="stat-attach"></span>
   </div>
 </header>
 
@@ -462,12 +540,20 @@ HTML_PAGE = r"""<!DOCTYPE html>
     <button onclick="sendPlanDecision('y')">✅ 核准並執行</button>
     <button class="danger" onclick="sendPlanDecision('n')">🚫 取消任務</button>
   </div>
+  <div id="attach-strip"><span id="attach-hint">📎 已附加影像（送出時一起分析）：</span></div>
   <div class="input-row">
-    <textarea id="msg" placeholder="輸入訊息，或用 /menu 查詢可用指令...（Enter 送出，Shift+Enter 換行）"></textarea>
+    <div id="attach-menu">
+      <button onclick="attachFromScreen()">🖥️ 框選畫面</button>
+      <button onclick="attachFromFile()">📁 選擇檔案</button>
+    </div>
+    <button class="secondary" id="attach-btn" title="附加影像：框選畫面或選擇檔案" onclick="toggleAttachMenu()">📷</button>
+    <textarea id="msg" placeholder="輸入訊息，或用 /menu 查詢可用指令...（Enter 送出，Shift+Enter 換行；📷 可附加影像）"></textarea>
     <button id="send-btn" onclick="sendMessage()">送出</button>
+    <input type="file" id="file-input" accept="image/*" multiple style="display:none">
   </div>
 </footer>
 
+<script src="/static/vision/snip.js"></script>
 <script>
 const chatLog = document.getElementById('chat-log');
 const toolLog = document.getElementById('tool-log');
@@ -475,6 +561,10 @@ const msgBox = document.getElementById('msg');
 const sendBtn = document.getElementById('send-btn');
 const decisionBar = document.getElementById('decision-bar');
 const planBar = document.getElementById('plan-bar');
+const attachStrip = document.getElementById('attach-strip');
+const attachMenu = document.getElementById('attach-menu');
+const attachBtn = document.getElementById('attach-btn');
+const fileInput = document.getElementById('file-input');
 
 function renderEntry(container, cls, tag, text, oversized) {
   const div = document.createElement('div');
@@ -505,7 +595,10 @@ function renderEntry(container, cls, tag, text, oversized) {
 function renderEvents(events) {
   events.forEach(ev => {
     if (ev.channel === 'chat') {
-      renderEntry(chatLog, ev.role, ev.role === 'user' ? '你' : 'AI', ev.text);
+      const note = (ev.role === 'user' && ev.attachments) ? `\n📎 附加了 ${ev.attachments} 張影像` : '';
+      renderEntry(chatLog, ev.role, ev.role === 'user' ? '你' : 'AI', ev.text + note);
+    } else if (ev.channel === 'vision') {
+      renderEntry(toolLog, 'vision', `🖼️ 視覺分析（獨立 session，${ev.count} 張影像）`, ev.text);
     } else if (ev.channel === 'tool') {
       renderEntry(toolLog, 'tool', '系統回傳', ev.text, ev.oversized);
     } else if (ev.channel === 'summary') {
@@ -523,11 +616,14 @@ function updateStatus(stats) {
   document.getElementById('stat-cwd').textContent = 'cwd: ' + stats.current_cwd;
   document.getElementById('stat-tokens').textContent =
     `tokens: user ${stats.total_user_tokens} / ai ${stats.total_ai_tokens} / tool ${stats.total_tool_tokens}`;
+  // 伺服器端附件已被消費（送出新任務）或清空時，同步清掉輸入框上方的縮圖
+  if (stats.attachments === 0) clearAttachStrip();
 }
 
 function setBusy(busy) {
   sendBtn.disabled = busy;
   msgBox.disabled = busy;
+  attachBtn.disabled = busy;
 }
 
 function showDecisionBar(pendingMode) {
@@ -645,6 +741,62 @@ async function sendPlanDecision(action) {
   }
 }
 
+// ===== 📷 影像附件：框選畫面／選擇檔案。附件本體存在伺服器端的 VisionSession，
+// 這裡只顯示縮圖並記住 id 以便移除；送出新任務時伺服器一次消費全部附件。 =====
+function toggleAttachMenu() { attachMenu.classList.toggle('show'); }
+document.addEventListener('click', (e) => {
+  if (!attachMenu.contains(e.target) && e.target !== attachBtn) attachMenu.classList.remove('show');
+});
+
+function syncAttachStrip() {
+  const n = attachStrip.querySelectorAll('.attach-item').length;
+  attachStrip.classList.toggle('show', n > 0);
+  attachBtn.textContent = n > 0 ? `📷 ${n}` : '📷';
+}
+function clearAttachStrip() {
+  attachStrip.querySelectorAll('.attach-item').forEach(el => el.remove());
+  syncAttachStrip();
+}
+function addAttachment(item) {
+  const wrap = document.createElement('div');
+  wrap.className = 'attach-item'; wrap.dataset.id = item.id;
+  const img = document.createElement('img');
+  img.src = item.thumbnail; img.title = `${item.width}x${item.height}`;
+  const rm = document.createElement('div');
+  rm.className = 'rm'; rm.textContent = '✕'; rm.title = '移除';
+  rm.onclick = async () => {
+    await VisionSnip.postJSON('/api/vision/remove', { id: item.id });
+    wrap.remove();
+    syncAttachStrip();
+  };
+  wrap.appendChild(img); wrap.appendChild(rm);
+  attachStrip.appendChild(wrap);
+  syncAttachStrip();
+}
+function attachFromScreen() { attachMenu.classList.remove('show'); VisionSnip.capture(); }
+function attachFromFile() { attachMenu.classList.remove('show'); fileInput.value = ''; fileInput.click(); }
+fileInput.addEventListener('change', async () => {
+  for (const file of Array.from(fileInput.files || [])) {
+    try {
+      const dataUrl = await new Promise((resolve, reject) => {
+        const r = new FileReader(); r.onload = () => resolve(r.result); r.onerror = () => reject(r.error); r.readAsDataURL(file);
+      });
+      const data = await VisionSnip.postJSON('/api/vision/upload', { name: file.name, data: dataUrl });
+      if (data.error) { renderEntry(toolLog, 'system', '錯誤', `附加 ${file.name} 失敗：${data.error}`); continue; }
+      addAttachment(data);
+    } catch (e) {
+      renderEntry(toolLog, 'system', '錯誤', `讀取 ${file.name} 失敗：${e}`);
+    }
+  }
+});
+document.body.insertAdjacentHTML('beforeend', VisionSnip.markup());
+VisionSnip.init({
+  apiBase: '/api/vision',
+  onAdded: addAttachment,
+  onStatus: (t) => { document.getElementById('stat-attach').textContent = '📷 ' + t; },
+  onError: (t) => renderEntry(toolLog, 'system', '錯誤', t),
+});
+
 msgBox.addEventListener('keydown', (e) => {
   if (e.key === 'Enter' && !e.shiftKey) {
     e.preventDefault();
@@ -751,9 +903,21 @@ class ConsoleHandler(BaseHTTPRequestHandler):
         if self.path == "/api/status":
             self._send_json(build_stats())
             return
+        static = vision_static_file(self.path)
+        if static:
+            body, content_type = static
+            self.send_response(200)
+            self.send_header("Content-Type", content_type)
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+            return
         self.send_error(404)
 
     def do_POST(self):
+        if self.path.startswith("/api/vision/"):
+            self._handle_vision(self.path[len("/api/vision/"):])
+            return
         if self.path not in ("/api/send", "/api/decision"):
             self.send_error(404)
             return
@@ -771,6 +935,40 @@ class ConsoleHandler(BaseHTTPRequestHandler):
                 traceback.print_exc()
                 stream.error(f"伺服器處理時發生錯誤：{e}")
                 self._finish(stream, bool(pending["mode"]))
+
+    def _handle_vision(self, action):
+        """📷 影像附件的一般 JSON 端點（不串流）。附件狀態在 vision_session 自己的 lock 裡，
+        不進 agent 的 lock：擷取畫面（PowerShell）可能要幾秒，不該卡住其他請求。"""
+        data = self._read_json()
+        try:
+            if action == "screens":
+                payload = vision_session.screens()
+            elif action == "capture":
+                payload = vision_session.capture(data.get("screen_index"))
+            elif action == "crop":
+                payload = vision_session.crop(
+                    data.get("x1"), data.get("y1"), data.get("x2"), data.get("y2"),
+                    data.get("preview_width"), data.get("preview_height"),
+                )
+            elif action == "upload":
+                payload = vision_session.add_data_url(data.get("data"), data.get("name") or "上傳的影像")
+            elif action == "remove":
+                payload = vision_session.remove(data.get("id"))
+            elif action == "clear":
+                payload = vision_session.clear()
+            elif action == "status":
+                payload = vision_session.status()
+            else:
+                self.send_error(404)
+                return
+        except VisionError as e:
+            self._send_json({"error": str(e)}, status=400)
+            return
+        except Exception as e:
+            traceback.print_exc()
+            self._send_json({"error": f"伺服器處理影像時發生錯誤：{e}"}, status=500)
+            return
+        self._send_json(payload)
 
     def _handle_send(self, data, stream):
         message = (data.get("message") or "").strip()
@@ -792,28 +990,40 @@ class ConsoleHandler(BaseHTTPRequestHandler):
             return
 
         if not message:
-            self._finish(stream, False)
-            return
+            if vision_session.count() == 0:
+                self._finish(stream, False)
+                return
+            message = DEFAULT_VISION_PROMPT  # 只附圖不打字：用預設提示詞
 
         if handle_slash_command(message, stream):
-            self._finish(stream, False)
+            self._finish(stream, False)  # slash 指令不消耗附件
             return
+
+        # 📷 只有「新任務」才消費附件（slash 指令與計畫核准／修改意見不會）
+        attachments = vision_session.take_all()
 
         user_tokens = agent.count_tokens(message)
         agent.total_user_tokens += user_tokens
-        stream.append({"channel": "chat", "role": "user", "text": message, "tokens": user_tokens})
+        stream.append({
+            "channel": "chat", "role": "user", "text": message,
+            "tokens": user_tokens, "attachments": len(attachments),
+        })
 
         # 記錄這一輪任務最原始的使用者敘述，跟 CLI 版（Agent_Runner.main）
         # 行為一致，供獨立摘要 session 在沒有 objective／plan 可用時，
         # 當作「原始問題」聚焦摘要內容（見 SkillAgent._build_task_anchor_text）
         agent.current_task = message
 
+        # 有附加影像：先跑獨立視覺 sub-session，把分析結果以文字併入這次的使用者訊息，
+        # 之後不論是 plan 模式還是直接執行，主 Agent 拿到的都是「原文 + 影像分析」的純文字
+        content = _run_vision_subsession(message, attachments, stream) if attachments else message
+
         if state["plan_mode"]:
-            start_plan_flow(message, stream)
+            start_plan_flow(content, stream)
             self._finish(stream, False)
             return
 
-        agent.messages.append({'role': 'user', 'content': message})
+        agent.messages.append({'role': 'user', 'content': content})
         self._finish(stream, run_turn(stream))
 
     def _handle_decision(self, data, stream):

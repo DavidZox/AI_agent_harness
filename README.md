@@ -69,6 +69,20 @@ CLI 與 Web Console 都支援 `/plan on|off`（狀態各自是 `main()` 的區�
 4. 核准後，計畫文字會存進 `self.current_plan`，並跟 Sticky Objective 用同一種模式：由 `_build_plan_context_prompt()` 注入 `get_system_prompt()`，**每次組系統提示詞都會重新塞入**，因此不會被 1.3 節提到的滑動視窗或壓縮摘要沖掉，整個多步驟任務執行期間都能持續提醒模型「依計畫逐步執行」。
 5. 系統不會自動判斷「所有步驟都做完了」而清除計畫（對 `gemma4:e4b` 這種小模型的自我判斷能力不夠信任），需要使用者在任務結束後手動輸入 `/plan done` 清除；`/clear`（`reset_conversation()`）也會一併清空 `current_plan`，避免舊計畫殘留干擾下一個任務。
 
+### 1.7 多模態影像：`vision/` library 與 📷 附圖
+
+影像相關的邏輯集中在頂層套件 `vision/`，三個使用者共用同一份：Web Console 的 📷 附圖、獨立的 `subagent/screen_gemma4_web.py`（框選截圖 → 推論的單頁工具，現在只是 library 的薄殼）、以及 `image_inspect` 技能（讓 Agent 自己對檔案路徑做圖像推論）。
+
+- `vision/capture.py`：伺服器端螢幕擷取，後端自動偵測：WSL → PowerShell（原 sniper 做法）、Linux X11 桌面 → Pillow `ImageGrab` + `xrandr` 列螢幕；都沒有時 `backend()` 回傳 None，前端改用瀏覧器的 `getDisplayMedia`（分享畫面）擷取，任何作業系統都能用，但頁面需以 `http://localhost` 或 https 開啟。裁切一律在瀏覽器端以原始解析度完成後上傳 PNG，底圖以等比例（letterbox）顯示，多螢幕拼接的寬桌面不會被拉變形。
+- `vision/images.py`：任何來源（檔案、bytes、data URL、截圖裁切）統一成 `PIL.Image`。
+- `vision/inference.py`：`analyze(images, prompt)` 呼叫多模態模型（預設 `gemma4:e4b`，可用 `VISION_MODEL` / `VISION_TIMEOUT` 環境變數調整），逾時與錯誤分類只在這裡維護一份，失敗一律拋 `VisionError`。
+- `vision/session.py`：`VisionSession`，Web Console 與 sniper 共用的「螢幕選單 → 擷取 → 框選裁切 → 影像清單」工作階段。
+- `vision/web/`：前端共用的框選覆蓋層與螢幕選單（`snip.js` / `snip.css`），兩個頁面都以 `/static/vision/...` 載入。
+
+**附圖如何進入主對話**：採「獨立視覺 sub-session」，而不是把影像直接塞進主對話的 messages。使用者送出帶影像的訊息時，後端先把影像 + 使用者訊息交給 `analyze()`（system prompt 要求它直接回答問題，並逐字抄錄影像中與問題相關的文字、數值、錯誤訊息），得到的文字以 `[vision result]` 區塊附在使用者訊息後面，再進入原本的 `run_turn()`（plan 模式則進入規劃）。主對話因此永遠是純文字，`compress_context_to_file`、`count_tokens`、`_truncate_memory` 都不需要知道影像的存在；代價是主 Agent 看到的是描述而非原圖，追問時需重新附圖。這跟 1.3 節的獨立摘要 session 是同一種設計。影像只在送出一次新任務時消費，slash 指令與 plan 的核准／修改意見不會用掉附件。
+
+**新增影像來源**：只要能產出 `PIL.Image` 或檔案路徑，呼叫 `vision.analyze([img], prompt)` 即可；要讓 Agent 自己使用，比照 `scripts/image_inspect_cmd.py` 寫一支腳本並登錄到 `SKILLS.md`。
+
 ---
 
 ## 2. 目錄結構
@@ -83,8 +97,9 @@ AI_agent_harness/
 ├── skills_system/
 │   ├── SKILLS.md             # 技能輕量索引
 │   ├── tools/<name>.md       # 各技能的 OKF 規格文件（按需載入）
-│   └── scripts/<name>_cmd.py # 各技能實際執行的腳本
-├── subagent/                 # 獨立的螢幕截圖 + Gemma4 視覺分析腳本（與主流程無關聯）
+│   └── scripts/<name>_cmd.py # 各技能實際執行的腳本（容器類共用 _docker_common.py）
+├── vision/                   # 多模態影像 library：擷取 / 影像處理 / 推論 / 工作階段 / 前端框選資源（見 1.7）
+├── subagent/                 # 獨立的框選截圖 → 視覺推論單頁工具（vision library 的薄殼）
 └── doc/                      # 目前為空
 ```
 
@@ -97,6 +112,7 @@ AI_agent_harness/
 - 已安裝並執行中的 [Ollama](https://ollama.com/)，且已 `ollama pull` 對應模型（預設 `gemma4:e4b`）。
 - Python 3.10+ 與 `ollama` Python 套件（`pip install ollama`）。
 - Web Console 使用純標準庫，不需要額外安裝任何套件。
+- 多模態影像功能（Web Console 的 📷、`image_inspect` 技能、`subagent/screen_gemma4_web.py`）需要 `Pillow`（`pip install pillow`）。「框選畫面」的伺服器端截圖支援 WSL（PowerShell）與 Linux X11 桌面（需 Pillow 有 xcb 支援、有 `xrandr`）；其他環境（Wayland、macOS、瀏覽器在別台電腦）會改由瀏覽器的分享畫面功能擷取，此時頁面需以 `http://localhost` 或 https 開啟。伺服器端截的是執行 web_console 那台機器的螢幕。
 
 ### 3.2 CLI
 
@@ -120,7 +136,7 @@ python3 web_console.py
 | `WEB_CONSOLE_HOST` | `127.0.0.1` | 綁定位址，設 `0.0.0.0` 可開放區網存取 |
 | `WEB_CONSOLE_PORT` | `8765` | 監聽埠 |
 
-畫面分成左右兩欄：左邊是「使用者 ↔ Agent 對話」，右邊是「系統 / 工具回傳」（規格文件載入內容、腳本執行結果、系統通知都會出現在這裡）。輸入 `/menu` 可查詢目前支援的所有指令。開啟 `/summarize on` 後，超過門檻的工具結果除了原始輸出，右欄還會多一張紫色的「🧠 AI 摘要（獨立 session）」卡片。開啟 `/plan on` 後，新任務會先在左欄顯示一張青綠色的「📝 計畫（待你確認）」卡片，畫面下方會出現核准／取消按鈕，詳見 1.6 節。
+畫面分成左右兩欄：左邊是「使用者 ↔ Agent 對話」，右邊是「系統 / 工具回傳」（規格文件載入內容、腳本執行結果、系統通知都會出現在這裡）。輸入 `/menu` 可查詢目前支援的所有指令。開啟 `/summarize on` 後，超過門檻的工具結果除了原始輸出，右欄還會多一張紫色的「🧠 AI 摘要（獨立 session）」卡片。開啟 `/plan on` 後，新任務會先在左欄顯示一張青綠色的「📝 計畫（待你確認）」卡片，畫面下方會出現核准／取消按鈕，詳見 1.6 節。輸入框旁的 📷 可以「框選畫面」或「選擇檔案」附加影像，送出後右欄會先出現藍色的「🖼️ 視覺分析（獨立 session）」卡片，再由主 Agent 依分析結果回應，詳見 1.7 節；視覺模型可用 `VISION_MODEL`、逾時可用 `VISION_TIMEOUT` 環境變數調整。
 
 ---
 

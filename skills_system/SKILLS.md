@@ -20,6 +20,7 @@
 
 ## 多模態資訊
 - [stt_engine](tools/stt_engine.md) — 使用者需要進行語音輸入時使用
+- [image_inspect](tools/image_inspect.md) — 對指定路徑的影像檔（截圖、相機快照）依提示詞做視覺模型分析，回傳文字描述
 
 ## ROS2套件
 - [ROS2_topic_list](tools/ROS2_topic_list.md) — 在容器內使用查詢 topic 列表
