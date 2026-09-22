@@ -14,7 +14,8 @@ class SkillAgent:
         self.profile_file = os.path.join(self.script_dir, "AGENT.md")
         self.memory_file = os.path.join(self.script_dir, "Memory.md")
 
-        self.current_cwd = "/home/david"
+        # 預設工作目錄以程式所在位置為準，不寫死機器特定路徑
+        self.current_cwd = self.script_dir
         self.container_cwd = ""
 
         self.messages = []
@@ -405,7 +406,10 @@ class SkillAgent:
         return payload or None
 
     def _load_skill_doc(self, skill_name):
-        """若 skill_name 對應到 tools/<skill_name>.md，回傳其內容；否則回傳 None。"""
+        """若 skill_name 對應到 tools/<skill_name>.md，回傳其內容；否則回傳 None。
+        容忍 AI 直接照抄索引連結而帶上 .md 後綴（例如 list_dir.md）。"""
+        if skill_name.endswith(".md"):
+            skill_name = skill_name[:-3]
         doc_path = os.path.join(self.tools_dir, f"{skill_name}.md")
         if not os.path.exists(doc_path):
             return None

@@ -130,10 +130,9 @@ python3 web_console.py
 2. **自我進化（Self-Evolution）機制已被移除**：`manager.py`、`manage_skill_cmd.py`、`manage_skill.md` 都已從專案中刪除，`AGENT.md` 也拿掉了對應章節。目前 `Agent_Runner.py` 的 `_parse_script_args()` 裡仍留著一行 `if "manage_skill" in script_name` 的特判邏輯，屬於死代碼，不影響功能但可以之後順手清掉。
 3. **`workitem_est` 依賴外部調度服務**：對應的 `scripts/mock_server.py` 用 FastAPI + Uvicorn 實作，但目前環境（`common_env`）並未安裝這兩個套件，這支 mock server 本身也還無法啟動。
 4. **`stt_engine` 綁死特定環境**：麥克風裝置名稱、Windows 路徑（`C:\temp`）、`ffmpeg.exe` 路徑都寫死在腳本裡，僅適用於作者自己的 WSL + Windows 錄音裝置設定。
-5. **`current_cwd` 預設值寫死為 `/home/david`**：`SkillAgent.__init__` 裡硬編碼，換一台機器或給別人使用時需要手動調整或改成動態偵測。
-6. **小型本地模型的工具呼叫可靠度**：實測過 `gemma4:e4b` 在需要判斷、選技能的情境下，偶爾會不輸出 `EXECUTE:` 指令、直接「腦補」一份假的執行結果（例如編造一份不存在的目錄列表）。這是模型能力限制，不是架構問題，但值得在後續設計中納入考量（例如偵測回應裡有沒有實際呼叫工具、要求時偵測到可疑輸出就要求重答）。1.6 節的 Plan 模式是針對這個限制的其中一種緩解方式——執行前的確認關卡是靠程式碼路徑保證的（規劃階段不呼叫 `run_tool()`），不依賴模型本身是否守規矩。
-7. **CLI 與 Web Console 功能不完全對等**：CLI 的 `objective set` 是互動式多行輸入（輸入到 `objective end` 為止），Web Console 為了適應單次 HTTP 請求，簡化成單行的 `/objective set <內容>`。
-8. **沒有自動化測試**：目前所有驗證都是開發過程中手動寫的一次性腳本（stub `ollama.chat`、模擬多輪對話），沒有留在專案裡形成正式的測試套件。
+5. **小型本地模型的工具呼叫可靠度**：實測過 `gemma4:e4b` 在需要判斷、選技能的情境下，偶爾會不輸出 `EXECUTE:` 指令、直接「腦補」一份假的執行結果（例如編造一份不存在的目錄列表）。這是模型能力限制，不是架構問題，但值得在後續設計中納入考量（例如偵測回應裡有沒有實際呼叫工具、要求時偵測到可疑輸出就要求重答）。1.6 節的 Plan 模式是針對這個限制的其中一種緩解方式——執行前的確認關卡是靠程式碼路徑保證的（規劃階段不呼叫 `run_tool()`），不依賴模型本身是否守規矩。
+6. **CLI 與 Web Console 功能不完全對等**：CLI 的 `objective set` 是互動式多行輸入（輸入到 `objective end` 為止），Web Console 為了適應單次 HTTP 請求，簡化成單行的 `/objective set <內容>`。
+7. **沒有自動化測試**：目前所有驗證都是開發過程中手動寫的一次性腳本（stub `ollama.chat`、模擬多輪對話），沒有留在專案裡形成正式的測試套件。
 
 ---
 
