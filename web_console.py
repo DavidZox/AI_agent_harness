@@ -80,9 +80,11 @@ MENU_TEXT = """可用指令：
 精簡的成功／失敗摘要（避免大量原始輸出干擾推理）。開啟 /summarize on 後，
 超過門檻的結果會改由一個獨立、乾淨的 session 做語意摘要（不會混進主對話
 的上下文），主 session 拿到的會是摘要後的重點而不只是成功/失敗；若摘要
-session 失敗會自動退回原本的成功/失敗摘要，不影響主流程。完整原始內容
-永遠都會顯示在「系統 / 工具回傳」面板並標記 ⚠️ 待確認，需自行點
-「✅ 我已確認」。""".format(
+session 失敗會自動退回原本的成功/失敗摘要，不影響主流程。這個獨立 session
+會拿到「使用者原始問題敘述」當聚焦依據（優先用 Objective，其次是目前核准
+中的 plan 執行到哪一步，都沒有就用這一輪任務原始輸入的文字），避免摘要
+時因為不知道重點是什麼而漏掉關鍵資訊。完整原始內容永遠都會顯示在
+「系統 / 工具回傳」面板並標記 ⚠️ 待確認，需自行點「✅ 我已確認」。""".format(
     threshold=TOOL_RESULT_TOKEN_THRESHOLD
 )
 
@@ -709,6 +711,11 @@ class ConsoleHandler(BaseHTTPRequestHandler):
         user_tokens = agent.count_tokens(message)
         agent.total_user_tokens += user_tokens
         events.append({"channel": "chat", "role": "user", "text": message, "tokens": user_tokens})
+
+        # 記錄這一輪任務最原始的使用者敘述，跟 CLI 版（Agent_Runner.main）
+        # 行為一致，供獨立摘要 session 在沒有 objective／plan 可用時，
+        # 當作「原始問題」聚焦摘要內容（見 SkillAgent._build_task_anchor_text）
+        agent.current_task = message
 
         if state["plan_mode"]:
             start_plan_flow(message, events)

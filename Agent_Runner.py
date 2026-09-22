@@ -46,6 +46,14 @@ class SkillAgent:
         # =========================
         self.current_plan = None
 
+        # =========================
+        # 📌 這一輪任務最原始的使用者敘述
+        # 給獨立摘要 session（summarize_tool_result）在沒有 sticky_objective
+        # 或 current_plan 可用時，當作「原始問題」聚焦摘要內容用，見
+        # _build_task_anchor_text。每次使用者送出新任務時更新，/clear 時清空。
+        # =========================
+        self.current_task = None
+
     def count_tokens(self, text: str) -> int:
         """
         Ollama Native tokenizer (Gemma 4 e4b)
@@ -138,18 +146,30 @@ class SkillAgent:
 
         這樣主 session 拿到的是「有意義的摘要」而不是單純的成功／失敗判定，
         同時不會因為把原始大量輸出直接塞進主上下文而干擾主 session 的推理。
+
+        這個獨立 session 看不到主對話，因此另外附上 _build_task_anchor_text()
+        取得的「使用者原始問題敘述」錨點，讓摘要聚焦在使用者真正在意的地方，
+        避免因為不知道任務重點是什麼，而摘掉其實關鍵的資訊。
         """
+        anchor = self._build_task_anchor_text()
+
         system_prompt = """你是一位專業的資料摘要助手。
 你的任務是把一段指令執行後的原始輸出，摘要成精簡但保留關鍵資訊的版本，
 交給另一個負責決策的 AI 使用，那個 AI 不會看到原始內容，只會看到你的摘要。
 
+你會同時收到「使用者原始的任務／問題敘述」，這是你摘要時的聚焦依據：
+跟這個任務有關、會影響下一步決策的資訊要優先保留。
+
 規則：
 - 必須保留：成功或失敗、關鍵數值、錯誤訊息、檔案／路徑名稱、數量等會影響下一步決策的資訊
-- 可以捨棄：重複的樣板文字、無關的排版細節
+- 可以捨棄：跟使用者任務無關的重複樣板文字、無關的排版細節
 - 直接輸出摘要內容，不要加上「以下是摘要」之類的前言，也不要加你自己的建議
 - 盡量控制在 200 字以內
 """
-        user_prompt = f"以下是需要摘要的原始工具輸出（原始約 {tool_tokens} tokens）：\n\n{result}"
+        user_prompt = (
+            f"使用者原始的任務／問題敘述：\n{anchor}\n\n"
+            f"以下是需要摘要的原始工具輸出（原始約 {tool_tokens} tokens）：\n\n{result}"
+        )
 
         res = ollama.chat(
             model=self.model,
@@ -258,6 +278,44 @@ class SkillAgent:
               這裡仍會持續出現，直到使用者輸入 /plan done 手動清除為止
             """
 
+    def _build_task_anchor_text(self):
+        """決定要交給獨立摘要 session（summarize_tool_result）當作「使用者
+        原始問題敘述」的錨點文字，讓摘要能聚焦在使用者真正在意的事情上，
+        而不是對原始輸出做通用、不知道重點是什麼的精簡（容易先丟掉其實
+        關鍵的資訊）。
+
+        優先序：
+        - sticky_objective：使用者主動設定、最高優先的任務錨點，本來就
+          持續保留在 system prompt 裡，直接拿來用即可
+        - current_plan：已核准的計畫本身就是原始任務拆解出的步驟清單；
+          額外附上目前最新一則 assistant 回應（此回應是 AI 依計畫產生的，
+          內容自然反映了目前執行到哪一步），讓摘要 session 能聚焦在「這
+          一步」，而不是整份計畫
+        - 兩者都沒有：退回這一輪任務使用者最原始輸入的文字（current_task）
+        - 兩者都有：兩段一起給，不需要互斥判斷
+        """
+        parts = []
+        if self.sticky_objective:
+            parts.append(f"【使用者設定的最高優先 Objective】\n{self.sticky_objective}")
+
+        if self.current_plan:
+            last_assistant = next(
+                (m['content'] for m in reversed(self.messages) if m['role'] == 'assistant'),
+                None,
+            )
+            plan_section = f"【使用者已核准的任務計畫（依步驟拆解逐步執行）】\n{self.current_plan}"
+            if last_assistant:
+                plan_section += (
+                    "\n\n【AI 剛才針對目前這一步的回應，可看出目前執行到哪一步】\n"
+                    f"{last_assistant}"
+                )
+            parts.append(plan_section)
+
+        if parts:
+            return "\n\n".join(parts)
+
+        return self.current_task or "(未取得使用者原始任務敘述)"
+
     def get_system_prompt(self):
 
         objective_prompt = self._build_objective_prompt()
@@ -291,6 +349,7 @@ class SkillAgent:
 
     def reset_conversation(self):
         self.current_plan = None  # /clear 時一併清掉進行中的計畫，避免舊計畫殘留誤導新任務
+        self.current_task = None  # 同上，避免舊任務敘述殘留誤導下一次的摘要 session
         self.messages = [{'role': 'system', 'content': self.get_system_prompt()}]
 
     def _truncate_memory(self):
@@ -623,6 +682,11 @@ def main():
             user_tokens = agent.count_tokens(user_msg)
             agent.total_user_tokens += user_tokens
             print(f"📥 User Tokens: {user_tokens}")
+
+            # 記錄這一輪任務最原始的使用者敘述，供獨立摘要 session 在沒有
+            # objective／plan 可用時，當作「原始問題」聚焦摘要內容
+            # （見 _build_task_anchor_text）
+            agent.current_task = user_msg
 
             # --- 📝 PLAN 模式：先規劃、經使用者核准才進入下面的執行迴圈 ---
             if plan_mode:
