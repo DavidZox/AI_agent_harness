@@ -71,13 +71,13 @@ def explain_error(stderr, container=None):
     if "permission denied" in s and "docker.sock" in s:
         return "沒有存取 docker socket 的權限（需 root 或加入 docker 群組）"
     if "no such container" in s:
-        return f"找不到容器 '{container}'（名稱錯誤或尚未建立；可用 docker_open 以模糊比對確認名稱）"
+        return f"找不到容器 '{container}'（名稱錯誤或尚未建立；請先用 docker_containers 查看現有容器的完整名稱）"
     if "is not running" in s:
         return f"容器 '{container}' 存在但未在運行中，請先啟動它"
     if "invalid container name" in s:
         return "映像檔名稱含有容器名稱不允許的字元（如 : 或 /），因為本工具以映像檔名稱作為容器名稱，請改用不含 tag／registry 前綴的映像檔"
     if "unable to find image" in s or "pull access denied" in s or "repository does not exist" in s:
-        return "本機沒有這個映像檔，且無法從 registry 拉取（名稱／tag 錯誤、未登入或沒有網路）"
+        return "本機沒有這個映像檔，且無法從 registry 拉取（名稱／tag 錯誤、未登入或沒有網路；請先用 docker_images 確認本機有哪些映像檔）"
     if "is already in use by container" in s:
         return "同名容器已存在；請直接用 docker_open 進入，或先移除舊容器"
     if "ros2: command not found" in s:

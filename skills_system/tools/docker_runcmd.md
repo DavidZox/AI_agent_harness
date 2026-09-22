@@ -13,7 +13,7 @@ dependencies: ["docker"]
 
 # 語法 / 參數規範
 * `--timeout <秒數>` (int, optional): 必須放在最前面。預設 120 秒，範圍 1～570 秒（上限低於系統總逾時 600 秒）。長時間建置／安裝請明確加大。
-* `container_name` (string, required): 目標容器名稱（需完整名稱；不確定時先用 `docker_open` 模糊比對）。
+* `container_name` (string, required): 目標容器名稱（需完整名稱；不確定時先用 `docker_containers` 查看）。
 * `command` (string, required): 欲在容器內執行的指令，建議用引號包成一個參數；多個指令請用 `&&` 串接（被逾時終止的指令回傳非零，後面的指令就不會繼續執行）。
 * 核心腳本：`scripts/docker_runcmd_cmd.py`
 

@@ -12,6 +12,8 @@
 - [view_file](tools/view_file.md) — 查看診斷報告或腳本內容（技能規格文件會由 EXECUTE 自動載入，不用這個）
 
 ## 容器化環境
+- [docker_containers](tools/docker_containers.md) — 列出目前所有容器（名稱、狀態、映像檔），可只看運行中或以關鍵字過濾；要進入容器前先用這個確認完整名稱
+- [docker_images](tools/docker_images.md) — 列出本機所有映像檔（名稱、tag、大小），可用關鍵字過濾；建立容器前先用這個確認映像檔存在
 - [docker_est](tools/docker_est.md) — 創造指定映像檔的 container
 - [docker_open](tools/docker_open.md) — 進入指定名稱的 container 中
 - [docker_runcmd](tools/docker_runcmd.md) — 若要在容器內使用指令時使用
