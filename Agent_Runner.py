@@ -469,7 +469,7 @@ class SkillAgent:
             skill_doc = self._load_skill_doc(raw_token)
             if skill_doc is not None:
                 print(f"📖 Agent 選擇技能索引: {raw_token}（載入規格文件，尚未執行）")
-                return f"📘 已載入技能 '{raw_token}' 的規格文件（依此內容才可執行，請使用其中標明的實際腳本路徑）：\n{skill_doc}"
+                return f"{SKILL_DOC_PREFIX} '{raw_token}' 的規格文件（依此內容才可執行，請使用其中標明的實際腳本路徑）：\n{skill_doc}"
 
             script_name = self._normalize_script_name(raw_token)
             script_path = os.path.join(self.base_path, "scripts", script_name)
@@ -577,6 +577,17 @@ TOKEN_THRESHOLD = 8000
 # 仍會顯示給使用者（CLI 印出、或 web_console 的系統/工具回傳面板）。
 TOOL_RESULT_TOKEN_THRESHOLD = 250
 
+# run_tool 載入技能規格文件時回傳字串的固定開頭。規格文件是「按需載入」機制的核心，
+# 內容（尤其是實際腳本路徑與參數格式）必須完整進入上下文，因此 _content_for_context
+# 對這類結果一律放行、不套用 TOOL_RESULT_TOKEN_THRESHOLD，Web Console 也不標記 ⚠️。
+# 規格書本身仍應維持精簡（以 200 tokens 以內為原則），節省每次載入的上下文成本。
+SKILL_DOC_PREFIX = "📘 已載入技能"
+
+
+def is_skill_doc_result(result):
+    """result 是否為 run_tool 載入規格文件的回傳（而非腳本執行結果）。"""
+    return bool(result) and result.lstrip().startswith(SKILL_DOC_PREFIX)
+
 # 單一工具腳本的總逾時（秒）：harness 的最後防線。各腳本自身應設定更短的逾時
 # （容器類腳本可調的上限 570 秒就是為了低於這個值），這裡只處理腳本本身卡死
 # （例如程序內無法中斷的重運算、讀取無回應的裝置）的情況，避免整個 Agent
@@ -594,7 +605,7 @@ def _content_for_context(result, tool_tokens, agent=None, use_summary=False):
       還有內容重點。此為可選功能，摘要 session 若失敗會自動退回成功/失敗
       判定，不會讓主 session 的推理流程中斷。
     """
-    if tool_tokens <= TOOL_RESULT_TOKEN_THRESHOLD:
+    if tool_tokens <= TOOL_RESULT_TOKEN_THRESHOLD or is_skill_doc_result(result):
         return result
 
     if use_summary and agent is not None:
@@ -737,7 +748,7 @@ def main():
                     agent.total_tool_tokens += tool_tokens
                     print(f"\n🚀 系統回傳:\n{'-'*30}\n{result}\n{'-'*30}")
                     print(f"🧰 Tool Tokens: {tool_tokens}")
-                    if tool_tokens > TOOL_RESULT_TOKEN_THRESHOLD:
+                    if tool_tokens > TOOL_RESULT_TOKEN_THRESHOLD and not is_skill_doc_result(result):
                         print(f"⚠️ 此工具回傳約 {tool_tokens} tokens，超過門檻 {TOOL_RESULT_TOKEN_THRESHOLD}，"
                               f"加入上下文時將改用精簡摘要。")
                 else:

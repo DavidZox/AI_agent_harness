@@ -37,7 +37,7 @@
 | 常數 | 目前值 | 作用 |
 | :--- | :--- | :--- |
 | `TOKEN_THRESHOLD` | 8000 | 整體對話上下文超過此 token 數，自動觸發 `compress_context_to_file()`：用 LLM 把舊對話摘要成結構化 Markdown 存到 `logs/`，只保留最近幾筆對話 + 摘要繼續。 |
-| `TOOL_RESULT_TOKEN_THRESHOLD` | 250 | 單一工具回傳超過此 token 數時，**不會**把完整原始輸出塞進 AI 的上下文，預設改用 `_content_for_context()` 產生的精簡摘要（依內容是否以 `[ERROR]` 開頭，回報「成功」或「失敗」），避免一次大量的搜尋/列目錄結果打斷模型的推理節奏。完整內容仍會顯示給使用者（CLI 印出、或 Web Console 的「系統 / 工具回傳」面板並標記 ⚠️ 待確認）。 |
+| `TOOL_RESULT_TOKEN_THRESHOLD` | 250 | 單一工具回傳超過此 token 數時，**不會**把完整原始輸出塞進 AI 的上下文，預設改用 `_content_for_context()` 產生的精簡摘要（依內容是否以 `[ERROR]` 開頭，回報「成功」或「失敗」），避免一次大量的搜尋/列目錄結果打斷模型的推理節奏。完整內容仍會顯示給使用者（CLI 印出、或 Web Console 的「系統 / 工具回傳」面板並標記 ⚠️ 待確認）。**技能規格文件例外**：`run_tool` 載入規格文件的回傳（以 `SKILL_DOC_PREFIX` 開頭）一律完整進入上下文、不標 ⚠️——它是按需載入機制的核心，被精簡掉 AI 就拿不到腳本路徑；規格書本身以 200 tokens 以內為原則。 |
 
 Web Console 另外加了 `MAX_AUTO_ITERATIONS = 25`：Auto 模式下連續執行工具超過此輪數會強制中止本回合，避免模型陷入迴圈時把伺服器卡死（CLI 版本因為有人在終端機前，可以直接 Ctrl+C，暫無此限制）。
 
@@ -79,7 +79,7 @@ CLI 與 Web Console 都支援 `/plan on|off`（狀態各自是 `main()` 的區�
 - `vision/session.py`：`VisionSession`，Web Console 與 sniper 共用的「螢幕選單 → 擷取 → 框選裁切 → 影像清單」工作階段。
 - `vision/web/`：前端共用的框選覆蓋層與螢幕選單（`snip.js` / `snip.css`），兩個頁面都以 `/static/vision/...` 載入。
 
-**附圖如何進入主對話**：採「獨立視覺 sub-session」，而不是把影像直接塞進主對話的 messages。使用者送出帶影像的訊息時，後端先把影像 + 使用者訊息交給 `analyze()`（system prompt 要求它直接回答問題，並逐字抄錄影像中與問題相關的文字、數值、錯誤訊息），得到的文字以 `[vision result]` 區塊附在使用者訊息後面，再進入原本的 `run_turn()`（plan 模式則進入規劃）。主對話因此永遠是純文字，`compress_context_to_file`、`count_tokens`、`_truncate_memory` 都不需要知道影像的存在；代價是主 Agent 看到的是描述而非原圖，追問時需重新附圖。這跟 1.3 節的獨立摘要 session 是同一種設計。影像只在送出一次新任務時消費，slash 指令與 plan 的核准／修改意見不會用掉附件。
+**附圖如何進入主對話**：採「獨立視覺 sub-session」，而不是把影像直接塞進主對話的 messages。使用者送出帶影像的訊息時，後端先把影像 + 使用者訊息交給 `analyze()`（system prompt 要求它直接回答問題，並逐字抄錄影像中與問題相關的文字、數值、錯誤訊息），得到的文字以 `[vision result]` 區塊附在使用者訊息後面，再進入原本的 `run_turn()`（plan 模式則進入規劃）。主對話因此永遠是純文字，`compress_context_to_file`、`count_tokens`、`_truncate_memory` 都不需要知道影像的存在；代價是主 Agent 看到的是描述而非原圖，追問時需重新附圖。這跟 1.3 節的獨立摘要 session 是同一種設計。視覺分析結果不套用 `TOOL_RESULT_TOKEN_THRESHOLD` 的精簡（它是影像唯一的文字表示），sub-session 的 system prompt 要求一般控制在 300 字以內，超過門檻時右欄卡片會標 ⚠️ 待確認。影像只在送出一次新任務時消費，slash 指令與 plan 的核准／修改意見不會用掉附件。
 
 **新增影像來源**：只要能產出 `PIL.Image` 或檔案路徑，呼叫 `vision.analyze([img], prompt)` 即可；要讓 Agent 自己使用，比照 `scripts/image_inspect_cmd.py` 寫一支腳本並登錄到 `SKILLS.md`。
 
@@ -151,6 +151,7 @@ python3 web_console.py
 5. **小型本地模型的工具呼叫可靠度**：實測過 `gemma4:e4b` 在需要判斷、選技能的情境下，偶爾會不輸出 `EXECUTE:` 指令、直接「腦補」一份假的執行結果（例如編造一份不存在的目錄列表）。這是模型能力限制，不是架構問題，但值得在後續設計中納入考量（例如偵測回應裡有沒有實際呼叫工具、要求時偵測到可疑輸出就要求重答）。1.6 節的 Plan 模式是針對這個限制的其中一種緩解方式——執行前的確認關卡是靠程式碼路徑保證的（規劃階段不呼叫 `run_tool()`），不依賴模型本身是否守規矩。
 6. **CLI 與 Web Console 功能不完全對等**：CLI 的 `objective set` 是互動式多行輸入（輸入到 `objective end` 為止），Web Console 為了適應單次 HTTP 請求，簡化成單行的 `/objective set <內容>`。
 7. **沒有自動化測試**：目前所有驗證都是開發過程中手動寫的一次性腳本（stub `ollama.chat`、模擬多輪對話），沒有留在專案裡形成正式的測試套件。
+8. **`count_tokens` 實際上永遠走 `len(text)//4` 的 fallback**：目前的 ollama Python 套件沒有 `tokenize()`，伺服器也沒有 `/api/tokenize`，因此畫面上所有 token 數字都是「字元數 ÷ 4」的估計；中文實際 token 數約為顯示值的 2～3 倍。`TOKEN_THRESHOLD`、`TOOL_RESULT_TOKEN_THRESHOLD` 與規格書「200 tokens 以內」都是以這個估計尺度校準的，若日後換成真正的 tokenizer 需一併重新校準。
 
 ---
 

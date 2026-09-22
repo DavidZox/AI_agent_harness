@@ -39,6 +39,7 @@ from Agent_Runner import (
     _content_for_context,
     TOKEN_THRESHOLD,
     TOOL_RESULT_TOKEN_THRESHOLD,
+    is_skill_doc_result,
 )
 
 # 📷 多模態影像：附圖走 vision library 的獨立視覺 sub-session（見 _run_vision_subsession），
@@ -112,7 +113,8 @@ session 失敗會自動退回原本的成功/失敗摘要，不影響主流程�
 web_console 那台機器的螢幕。送出訊息時，附加的影像先由獨立的視覺 sub-session（模型
 {vision_model}）依你的訊息內容做分析，分析結果以文字連同你的訊息一起交給
 主 Agent（右欄會多一張「🖼️ 視覺分析」卡片），主對話本身維持純文字，不影響
-壓縮與 token 統計。影像只在送出一次新任務時使用，送出後即清空；slash 指令
+壓縮與 token 統計。視覺分析結果不套用工具回傳的精簡門檻（它是影像唯一的文字
+表示），超過門檻時卡片會標 ⚠️ 待確認提醒你留意長度。影像只在送出一次新任務時使用，送出後即清空；slash 指令
 與計畫核准／修改意見不會消耗附加的影像。只附圖不打字送出時，會用預設的
 「請描述這些影像的內容」當作提示詞。""".format(
     threshold=TOOL_RESULT_TOKEN_THRESHOLD, vision_model=VISION_MODEL
@@ -181,7 +183,18 @@ def _run_vision_subsession(message, images, events):
         result = f"[ERROR] 視覺分析失敗：{e}"
     tokens = agent.count_tokens(result)
     agent.total_tool_tokens += tokens
-    events.append({"channel": "vision", "text": result, "tokens": tokens, "count": n})
+    # 不套用 TOOL_RESULT_TOKEN_THRESHOLD 的精簡：這段文字是影像唯一的表示，砍成成功／失敗
+    # 就沒有資訊了。超過門檻只標 ⚠️ 提醒使用者留意長度（sub-session prompt 已要求精簡）。
+    oversized = tokens > TOOL_RESULT_TOKEN_THRESHOLD
+    events.append({"channel": "vision", "text": result, "tokens": tokens, "count": n, "oversized": oversized})
+    if oversized:
+        events.append({
+            "channel": "system",
+            "text": (
+                f"⚠️ 視覺分析結果約 {tokens} tokens，超過門檻 {TOOL_RESULT_TOKEN_THRESHOLD}，已標記待人工確認；"
+                f"因為它是影像唯一的文字表示，內容仍會完整交給主 Agent。"
+            ),
+        })
     return (
         f"{message}\n\n"
         f"[vision result]\n"
@@ -263,7 +276,8 @@ def run_turn(events):
         if result:
             tool_tokens = agent.count_tokens(result)
             agent.total_tool_tokens += tool_tokens
-            oversized = tool_tokens > TOOL_RESULT_TOKEN_THRESHOLD
+            # 規格文件載入不受門檻限制（_content_for_context 會完整放行），不標 ⚠️
+            oversized = tool_tokens > TOOL_RESULT_TOKEN_THRESHOLD and not is_skill_doc_result(result)
             events.append({
                 "channel": "tool",
                 "text": result,
@@ -483,6 +497,9 @@ HTML_PAGE = r"""<!DOCTYPE html>
   /* ===== 📷 影像附件 ===== */
   .entry.vision { background: #1f2b33; border: 1px solid #3d6b80; color: #cfe6f0; }
   .entry.vision .tag { color: #7fc8e8; opacity: 1; }
+  .entry.vision.oversized { border-color: #b0873f; box-shadow: 0 0 0 1px #b0873f inset; }
+  .entry.vision.oversized .tag { color: #e6b95c; }
+  .entry.vision.oversized.reviewed { border-color: #3d6b80; box-shadow: none; opacity: 0.75; }
   .entry.user .attach-note { font-size: 11px; color: #9fc3e6; margin-top: 4px; }
   #attach-strip { display: none; gap: 8px; flex-wrap: wrap; margin-bottom: 8px; align-items: center; }
   #attach-strip.show { display: flex; }
@@ -598,7 +615,7 @@ function renderEvents(events) {
       const note = (ev.role === 'user' && ev.attachments) ? `\n📎 附加了 ${ev.attachments} 張影像` : '';
       renderEntry(chatLog, ev.role, ev.role === 'user' ? '你' : 'AI', ev.text + note);
     } else if (ev.channel === 'vision') {
-      renderEntry(toolLog, 'vision', `🖼️ 視覺分析（獨立 session，${ev.count} 張影像）`, ev.text);
+      renderEntry(toolLog, 'vision', `🖼️ 視覺分析（獨立 session，${ev.count} 張影像）`, ev.text, ev.oversized);
     } else if (ev.channel === 'tool') {
       renderEntry(toolLog, 'tool', '系統回傳', ev.text, ev.oversized);
     } else if (ev.channel === 'summary') {
