@@ -2,7 +2,7 @@
 type: Tool
 title: 查看檔案內容
 description: 查看診斷報告、腳本或技能規格文件內容。
-version: 1.0.0
+version: 1.1.0
 dependencies: []
 ---
 
@@ -22,5 +22,10 @@ dependencies: []
 # 範例 (Examples)
 * 查看設定檔：`EXECUTE: scripts/cat_cmd.py config.yaml`
 
+# 回傳格式
+* 成功：`[PASS] 檔案內容 (<path>):` 後接完整文字內容。
+* 失敗：`[ERROR] ...`。
+
 # 異常處理 (Edge Cases)
 * 檔案不存在、是目錄、或超過 1MB 時回傳 `[ERROR]`。
+* 目標不是一般檔案（裝置、socket、FIFO 等，例如 `/dev/zero`）時回傳 `[ERROR]` 並拒絕讀取，避免無限等待。

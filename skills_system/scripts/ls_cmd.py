@@ -3,6 +3,8 @@ import os
 import subprocess
 import shlex
 
+TIMEOUT_SECONDS = 5  # 列目錄很快；超過代表目錄過大或掛載裝置無回應
+
 def execute(args_str):
     # 預設的基礎指令組合
     base_cmd = ["ls", "-laF"]
@@ -37,7 +39,7 @@ def execute(args_str):
             stdout=subprocess.PIPE, 
             stderr=subprocess.PIPE, 
             text=True, 
-            timeout=5
+            timeout=TIMEOUT_SECONDS
         )
         
         # 取得目前顯示的相對或絕對路徑名稱
@@ -48,6 +50,9 @@ def execute(args_str):
         else:
             return f"[ERROR] 無法讀取目錄: {result.stderr.strip()}"
             
+    except subprocess.TimeoutExpired:
+        return (f"[ERROR] 目錄列表逾時（超過 {TIMEOUT_SECONDS} 秒），"
+                f"目標目錄可能過大，或位於無回應的網路／掛載裝置上，請改指定較小的子目錄。")
     except Exception as e:
         return f"[ERROR] 執行異常: {str(e)}"
     # -------------------------

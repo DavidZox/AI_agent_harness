@@ -485,15 +485,30 @@ class SkillAgent:
             env = os.environ.copy()
             env["CONTAINER_CWD"] = self.container_cwd
 
-            res = subprocess.run(
-                [sys.executable, script_path] + clean_args,
-                capture_output=True,
-                text=True,
-                cwd=self.current_cwd,
-                env=env
-            )
+            try:
+                res = subprocess.run(
+                    [sys.executable, script_path] + clean_args,
+                    capture_output=True,
+                    text=True,
+                    cwd=self.current_cwd,
+                    env=env,
+                    timeout=TOOL_EXEC_TIMEOUT,
+                )
+            except subprocess.TimeoutExpired:
+                return (
+                    f"[ERROR] 工具 {script_name} 執行逾時（超過 {TOOL_EXEC_TIMEOUT} 秒），已被系統強制終止。"
+                    f"這是 harness 的最後防線，各腳本自身應有更短的逾時；若經常觸發請檢查該腳本。"
+                )
 
-            output_text = res.stdout.strip() if res.returncode == 0 else res.stderr
+            if res.returncode == 0:
+                output_text = res.stdout.strip()
+            else:
+                # 腳本異常結束：優先用 stderr，沒有就用 stdout；兩者皆空也要給 AI 一個
+                # 明確的失敗訊息，否則空字串會被誤判成「沒有工具需要執行」。
+                # 統一補上 [ERROR] 前綴，讓 _content_for_context 能正確判定為失敗。
+                output_text = res.stderr.strip() or res.stdout.strip() or "（沒有任何輸出）"
+                if not output_text.startswith("[ERROR]"):
+                    output_text = f"[ERROR] 腳本 {script_name} 異常結束（exit code {res.returncode}）:\n{output_text}"
             self._sync_state_from_tool_output(output_text)
             return output_text
 
@@ -561,6 +576,12 @@ TOKEN_THRESHOLD = 8000
 # 改用精簡的「成功／失敗」摘要餵給 AI，讓它的推理流程保持穩定；完整內容
 # 仍會顯示給使用者（CLI 印出、或 web_console 的系統/工具回傳面板）。
 TOOL_RESULT_TOKEN_THRESHOLD = 250
+
+# 單一工具腳本的總逾時（秒）：harness 的最後防線。各腳本自身應設定更短的逾時
+# （容器類腳本可調的上限 570 秒就是為了低於這個值），這裡只處理腳本本身卡死
+# （例如程序內無法中斷的重運算、讀取無回應的裝置）的情況，避免整個 Agent
+# （CLI 與 Web Console 都在同一條執行緒上等待工具）被無限期卡住。
+TOOL_EXEC_TIMEOUT = 600
 
 def _content_for_context(result, tool_tokens, agent=None, use_summary=False):
     """決定要餵給 AI 上下文的內容：正常大小就原封不動放進去。超過

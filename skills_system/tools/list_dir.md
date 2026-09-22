@@ -2,7 +2,7 @@
 type: Tool
 title: 查看目錄清單
 description: 查看指定環境語義單元（目錄）下的檔案清單。
-version: 1.0.0
+version: 1.1.0
 dependencies: []
 ---
 
@@ -23,6 +23,10 @@ dependencies: []
 * 查看 ROS 套件目錄：`EXECUTE: scripts/ls_cmd.py -la /opt/ros`
 * 查看當前目錄：`EXECUTE: scripts/ls_cmd.py`
 
+# 回傳格式
+* 成功：`[PASS] 目錄列表 (<path>):` 後接 `ls -laF` 的輸出。
+* 失敗：`[ERROR] ...`。
+
 # 異常處理 (Edge Cases)
-* 路徑不存在或無權限時回傳 `[ERROR]` 與 stderr 訊息。
-* 指令執行逾時 5 秒會中斷。
+* 路徑不存在或無權限時回傳 `[ERROR] 無法讀取目錄: <stderr>`。
+* 超過 5 秒回傳 `[ERROR] 目錄列表逾時（超過 5 秒）...`，通常是目錄過大或位於無回應的網路／掛載裝置，請改指定較小的子目錄。

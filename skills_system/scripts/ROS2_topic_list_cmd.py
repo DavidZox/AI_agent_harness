@@ -1,35 +1,31 @@
+import os
 import sys
-import subprocess
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from _docker_common import ros2_exec, pass_or_empty
+
+# ROS2 探索（discovery）通常幾秒內完成；daemon 冷啟動時會慢一點
+TIMEOUT_SECONDS = 30
+
 
 def run_ros2_topic_list(container_name):
-    """
-    在指定的 Docker 容器內執行 'ros2 topic list'。
-    透過 bash -ic 確保載入 ROS2 環境變數 (source /opt/ros/<distro>/setup.bash)。
-    """
-    # 使用 bash -ic 可以確保執行時會載入容器內的 .bashrc 或環境設定
-    # 這樣才能找到 ros2 指令
-    command = "ros2 topic list"
-    
-    # 組合 docker exec 指令
-    # -i: interactive, -t: tty (雖然這裡輸出是字串，但互動式環境對 ROS2 指令較友善)
-    cmd = ["docker", "exec", container_name, "bash", "-ic", command]
-    
-    try:
-        result = subprocess.run(cmd, capture_output=True, text=True)
-        if result.returncode == 0:
-            return result.stdout.strip()
-        else:
-            return f"[ERROR] 執行失敗: {result.stderr.strip()}"
-    except Exception as e:
-        return f"[ERROR] 異常: {str(e)}"
+    """在指定的 Docker 容器內執行 `ros2 topic list`（bash -ic + ROS2 環境 fallback）。"""
+    container_name = (container_name or "").strip()
+    if not container_name:
+        return "[ERROR] 請提供容器名稱。用法: scripts/ROS2_topic_list_cmd.py <container_name>"
+
+    ok, out, err = ros2_exec(
+        container_name, "ros2 topic list", TIMEOUT_SECONDS,
+        timeout_hint="ros2 discovery 無回應，請確認容器內 ROS2 daemon 與網路（DDS）設定是否正常。",
+    )
+    if not ok:
+        return err
+    return pass_or_empty(out, "目前沒有任何 topic 被發布")
+
 
 if __name__ == "__main__":
-    if len(sys.argv) < 2:
-        print("用法: python3 scripts/ROS2_topic_list_cmd.py <container_name>")
+    try:
+        print(run_ros2_topic_list(sys.argv[1] if len(sys.argv) > 1 else ""))
+    except Exception as e:
+        print(f"[ERROR] ROS2_topic_list 未預期的例外: {e}", file=sys.stderr)
         sys.exit(1)
-        
-    container_name = sys.argv[1]
-    
-    # 執行並輸出結果
-    output = run_ros2_topic_list(container_name)
-    print(output)
