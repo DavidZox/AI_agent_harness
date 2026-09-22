@@ -2,19 +2,25 @@
 Gemma4 Vision Web Sniper
 
 screen_gemma4.py 的網頁版：一樣是「WSL 呼叫 PowerShell 截全螢幕 → 框選裁切
-→ 丟給 Gemma4 vision 模型推論」的流程，但把原本 Tkinter 的裁切視窗換成
-瀏覽器裡的 <canvas> 拖曳框選，不需要 WSL 的 X11/Wayland 環境（WSLg 或額外
-裝 X server）就能用。
+→ 丟給 Gemma4 vision 模型推論」的流程。screen_gemma4.py 原本是用 Tkinter
+開一個無邊框、置頂、鋪滿整個螢幕的 Toplevel 視窗顯示截圖，製造出「直接在
+當下螢幕上拖曳選取」的錯覺；這個網頁版改用瀏覽器的 Fullscreen API +
+<canvas> 重現同樣的效果，不需要 WSL 的 X11/Wayland 環境（WSLg 或額外裝
+X server）就能用。
 
 跟 screen_gemma4.py 的差異：
-- 截圖仍然是同一套 WSL → PowerShell 的做法（capture_via_wsl_hybrid），
-  這段完全沒有改動，一樣只能在 WSL 底下執行。
-- 按下「擷取畫面」時，除了把截圖顯示在 canvas 上，也會直接把整張畫面
-  存成一張圖片加入右側清單，不強制要求一定要先拖曳裁切才能取得可用的
-  圖片。
-- 裁切互動從 Tkinter canvas 換成瀏覽器 <canvas> + 滑鼠拖曳，可以連續
-  框選多次，每次放開滑鼠就自動裁切、「額外」加入右側清單，不需要每次
-  都按「Add Crop」重新進入裁切模式；沒有裁切需求時可以完全略過這步。
+- 截圖的核心做法仍然是同一套 WSL → PowerShell（capture_via_wsl_hybrid），
+  只是多接受一個 bounds 參數指定只截哪一塊區域，一樣只能在 WSL 底下執行。
+- 按下「擷取畫面」時，如果偵測到多台螢幕（例如接了外接螢幕），會先跳出
+  一個小選單讓你挑要擷取哪一台（list_screens，靠 PowerShell 的
+  Screen.AllScreens 列出來）；只有單一螢幕時直接跳過選單、照舊一鍵擷取，
+  筆電單獨帶出門、外接雙螢幕兩種情境都不需要另外設定。
+- 選好螢幕（或只有一台不用選）後立刻進入全螢幕框選模式（盡量用瀏覽器的
+  Fullscreen API 進去，若瀏覽器不支援則退回鋪滿視窗的固定覆蓋層），畫面
+  上顯示的就是剛才擷取到的那台螢幕內容，感覺就像直接在自己當下的螢幕上
+  拖曳選取，而不是在頁面裡一個縮小的預覽圖上操作。
+- 可以連續拖曳框選多次，每次放開滑鼠就自動裁切、加入清單，不需要每次
+  都重新點擊「擷取畫面」；按 Esc 或畫面上的「結束擷取」離開框選模式。
 - 純標準庫 http.server，沿用 web_console.py 同一套模式，不需要額外安裝
   Flask / FastAPI。
 
@@ -38,8 +44,7 @@ from PIL import Image
 MODEL_NAME = os.environ.get("SCREEN_GEMMA_WEB_MODEL", "gemma4:e4b")
 TEMP_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "fullscreen_capture.png")
 
-# 傳給瀏覽器顯示用的縮圖上限（裁切仍然基於原始解析度的截圖，只有顯示縮小）
-PREVIEW_MAX_DIM = 1600
+# 縮圖上限（裁切仍以原始解析度的截圖為準，這裡只是右側清單的顯示縮小）
 THUMBNAIL_MAX_DIM = 240
 
 # =========================================================
@@ -59,7 +64,58 @@ state = {
 # 而不是印在伺服器的終端機上看不到）
 # =========================================================
 
-def capture_via_wsl_hybrid():
+def list_screens():
+    """透過 PowerShell 的 Screen.AllScreens 列出目前所有螢幕，讓使用者
+    擷取畫面前可以挑要哪一台（筆電單獨帶出門是單螢幕、接了外接螢幕變成
+    雙螢幕，兩種情境都要能用）。回傳 (screens, error_message)，screens
+    是 list[dict]：index/name/x/y/width/height/primary；失敗時
+    screens 為 None。"""
+    ps_command = (
+        "[Reflection.Assembly]::LoadWithPartialName('System.Windows.Forms') | Out-Null; "
+        "$i = 0; "
+        "foreach ($s in [System.Windows.Forms.Screen]::AllScreens) { "
+        "Write-Output \"$i|$($s.DeviceName)|$($s.Bounds.X)|$($s.Bounds.Y)|$($s.Bounds.Width)|$($s.Bounds.Height)|$($s.Primary)\"; "
+        "$i++; "
+        "}"
+    )
+    try:
+        result = subprocess.run(
+            ["powershell.exe", "-Command", ps_command],
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+    except Exception as e:
+        return None, str(e)
+
+    screens = []
+    for line in result.stdout.splitlines():
+        parts = line.strip().split("|")
+        if len(parts) != 7:
+            continue
+        idx, name, x, y, w, h, primary = parts
+        try:
+            screens.append({
+                "index": int(idx),
+                "name": name,
+                "x": int(x),
+                "y": int(y),
+                "width": int(w),
+                "height": int(h),
+                "primary": primary.strip().lower() == "true",
+            })
+        except ValueError:
+            continue
+
+    if not screens:
+        return None, "找不到任何螢幕（PowerShell 輸出無法解析）"
+    return screens, None
+
+
+def capture_via_wsl_hybrid(bounds=None):
+    """bounds 給定時是 (x, y, width, height)，只擷取該範圍（單一螢幕，
+    座標來自 list_screens()，可能是負數——次要螢幕擺在主螢幕左邊/上面時
+    很常見）；不給時退回舊行為，擷取整個虛擬桌面（所有螢幕拼在一起）。"""
     linux_file_path = TEMP_FILE
 
     if os.path.exists(linux_file_path):
@@ -82,15 +138,28 @@ def capture_via_wsl_hybrid():
             f"\\\\wsl.localhost\\{wsl_distro}{linux_file_path}"
         ).replace('/', '\\')
 
+    # 用四個獨立變數（賦值語法）而不是建構 Rectangle 物件並依位置傳入
+    # 座標，是為了避免 PowerShell 把負數的 X/Y（次要螢幕在主螢幕左邊或
+    # 上面時很常見）誤判成參數旗標。
+    if bounds:
+        x, y, w, h = bounds
+        screen_vars = f"$captureX = {x}; $captureY = {y}; $captureW = {w}; $captureH = {h}; "
+    else:
+        screen_vars = (
+            "$__vs = [System.Windows.Forms.SystemInformation]::VirtualScreen; "
+            "$captureX = $__vs.Left; $captureY = $__vs.Top; "
+            "$captureW = $__vs.Width; $captureH = $__vs.Height; "
+        )
+
     ps_command = (
         "[Reflection.Assembly]::LoadWithPartialName('System.Drawing') | Out-Null; "
         "[Reflection.Assembly]::LoadWithPartialName('System.Windows.Forms') | Out-Null; "
         "$type = Add-Type -MemberDefinition '[DllImport(\"user32.dll\")] public static extern bool SetProcessDPIAware();' -Name 'User32' -Namespace 'Win32' -PassThru; "
         "[Win32.User32]::SetProcessDPIAware() | Out-Null; "
-        "$screen = [System.Windows.Forms.SystemInformation]::VirtualScreen; "
-        "$bmp = New-Object System.Drawing.Bitmap $screen.Width, $screen.Height; "
+        f"{screen_vars}"
+        "$bmp = New-Object System.Drawing.Bitmap $captureW, $captureH; "
         "$graphics = [System.Drawing.Graphics]::FromImage($bmp); "
-        "$graphics.CopyFromScreen($screen.Left, $screen.Top, 0, 0, $bmp.Size); "
+        "$graphics.CopyFromScreen($captureX, $captureY, 0, 0, $bmp.Size); "
         f"$bmp.Save('{win_temp_path}', [System.Drawing.Imaging.ImageFormat]::Png); "
         "$graphics.Dispose(); $bmp.Dispose();"
     )
@@ -112,8 +181,9 @@ def capture_via_wsl_hybrid():
 
 def _img_to_data_url(img, max_dim=None):
     """把 PIL.Image 編碼成瀏覽器可直接顯示的 base64 PNG data URL。
-    max_dim 給定時會等比例縮小（裁切仍以傳入的原圖尺寸為準，這裡只是
-    降低傳輸量與瀏覽器渲染負擔），回傳 (實際輸出寬, 高, data_url)。"""
+    max_dim 給定時會等比例縮小，回傳 (實際輸出寬, 高, data_url)。不給
+    max_dim 時原始解析度直接輸出——全螢幕框選畫面需要盡量清晰，且僅在
+    本機（127.0.0.1）傳輸，不必為了省頻寬犧牲清晰度。"""
     out = img
     if max_dim is not None and max(img.size) > max_dim:
         ratio = max_dim / max(img.size)
@@ -149,11 +219,9 @@ HTML_PAGE = r"""<!DOCTYPE html>
   }
   header h1 { font-size: 16px; margin: 0; }
   #status { font-size: 12px; color: #9aa0a6; display: flex; gap: 14px; flex-wrap: wrap; }
-  main { flex: 1; display: flex; min-height: 0; overflow: hidden; }
-  .panel { display: flex; flex-direction: column; min-width: 0; }
-  #left-panel { flex: 2; border-right: 1px solid #3a3c40; padding: 12px; overflow: auto; }
-  #right-panel { flex: 1; padding: 12px; overflow: auto; display: flex; flex-direction: column; gap: 10px; min-width: 280px; }
-  .toolbar { display: flex; gap: 8px; margin-bottom: 10px; flex-wrap: wrap; }
+  main { flex: 1; display: flex; min-height: 0; overflow: auto; justify-content: center; }
+  #panel { flex: 1; max-width: 720px; padding: 16px; display: flex; flex-direction: column; gap: 12px; min-width: 0; }
+  .toolbar { display: flex; gap: 8px; flex-wrap: wrap; }
   button {
     background: #3a6df0; color: white; border: none; border-radius: 6px; padding: 8px 14px;
     font-size: 13px; cursor: pointer;
@@ -162,13 +230,11 @@ HTML_PAGE = r"""<!DOCTYPE html>
   button.secondary { background: #4a4c50; }
   button.danger { background: #b0473f; }
   button.success { background: #28a745; }
-  #canvas-wrap { display: inline-block; }
-  #shot-canvas { border: 1px solid #3a3c40; cursor: crosshair; max-width: 100%; background: #101113; }
-  #hint { font-size: 12px; color: #9aa0a6; margin-bottom: 8px; }
+  #hint { font-size: 12px; color: #9aa0a6; }
   h2 { font-size: 13px; margin: 0 0 8px 0; color: #c7c9cc; }
   #thumbs { display: flex; flex-wrap: wrap; gap: 8px; }
   #thumbs img {
-    width: 72px; height: 54px; object-fit: cover; border-radius: 4px; border: 1px solid #3a3c40;
+    width: 96px; height: 72px; object-fit: cover; border-radius: 4px; border: 1px solid #3a3c40;
   }
   textarea#prompt {
     width: 100%; height: 90px; resize: vertical; background: #1e1f22; color: #e3e3e3;
@@ -176,7 +242,43 @@ HTML_PAGE = r"""<!DOCTYPE html>
   }
   #result {
     flex: 1; background: #26282c; border: 1px solid #3a3c40; border-radius: 6px;
-    padding: 10px; font-size: 13px; white-space: pre-wrap; overflow-y: auto; min-height: 120px;
+    padding: 10px; font-size: 13px; white-space: pre-wrap; overflow-y: auto; min-height: 160px;
+  }
+
+  /* ===== 選擇螢幕的小視窗：偵測到多台螢幕時，擷取前先讓使用者挑 ===== */
+  #screen-picker-backdrop {
+    display: none;
+    position: fixed; inset: 0; z-index: 8000;
+    background: rgba(0,0,0,0.6);
+    align-items: center; justify-content: center;
+  }
+  #screen-picker-backdrop.active { display: flex; }
+  #screen-picker {
+    background: #26282c; border: 1px solid #3a3c40; border-radius: 10px;
+    padding: 20px; min-width: 280px; display: flex; flex-direction: column; gap: 10px;
+  }
+  #screen-picker h2 { margin: 0 0 4px 0; font-size: 14px; }
+  #screen-picker-list { display: flex; flex-direction: column; gap: 8px; }
+  #screen-picker-list button { text-align: left; background: #34363b; }
+  #screen-picker-list button:hover { background: #3a6df0; }
+
+  /* ===== 全螢幕框選覆蓋層：製造「直接在當下螢幕上拖曳」的錯覺 ===== */
+  #snip-overlay {
+    display: none;
+    position: fixed; inset: 0; z-index: 9999;
+    background: #000; user-select: none;
+  }
+  #snip-overlay.active { display: block; }
+  #snip-canvas { display: block; width: 100vw; height: 100vh; cursor: crosshair; }
+  #snip-loading {
+    position: fixed; inset: 0; display: flex; align-items: center; justify-content: center;
+    color: #9aa0a6; font-size: 16px; pointer-events: none;
+  }
+  #snip-bar {
+    position: fixed; top: 16px; left: 50%; transform: translateX(-50%);
+    background: rgba(30,31,34,0.92); color: #e3e3e3; padding: 8px 16px;
+    border-radius: 8px; font-size: 13px; display: flex; gap: 12px; align-items: center;
+    box-shadow: 0 2px 10px rgba(0,0,0,0.4);
   }
 </style>
 </head>
@@ -191,20 +293,15 @@ HTML_PAGE = r"""<!DOCTYPE html>
 </header>
 
 <main>
-  <section id="left-panel" class="panel">
+  <section id="panel">
     <div class="toolbar">
       <button onclick="capture()">📸 擷取畫面</button>
       <button class="danger" onclick="clearImages()">🗑 清空已加入的圖片</button>
     </div>
-    <div id="hint">按下「📸 擷取畫面」就會直接把整張畫面存成一張圖片，加入右側清單，不需要再拖曳裁切才能使用。如果還想額外擷取畫面中的某個小區域，一樣可以直接在下方圖片上拖曳滑鼠框選，放開滑鼠就會自動裁切並「額外」加入右側清單，可以重複框選多次。</div>
-    <div id="canvas-wrap">
-      <canvas id="shot-canvas"></canvas>
-    </div>
-  </section>
+    <div id="hint">按下「📸 擷取畫面」時，如果偵測到多台螢幕會先讓你選要擷取哪一台（單螢幕時直接略過這步）；選好後立刻進入全螢幕框選模式：直接在畫面上拖曳滑鼠選取要加入的區域，放開滑鼠就會自動裁切並加入下面的清單，可以連續框選多次。選完後按 Esc 或畫面上方的「結束擷取」離開。</div>
 
-  <section id="right-panel" class="panel">
     <div>
-      <h2>已加入的裁切圖片</h2>
+      <h2>已加入的圖片</h2>
       <div id="thumbs"></div>
     </div>
     <div>
@@ -212,25 +309,50 @@ HTML_PAGE = r"""<!DOCTYPE html>
       <textarea id="prompt">解釋一下這張圖</textarea>
     </div>
     <button class="success" id="run-btn" onclick="runInference()">🤖 開始推論</button>
-    <div style="flex:1; display:flex; flex-direction:column; min-height:0;">
+    <div style="display:flex; flex-direction:column; min-height:0;">
       <h2>Gemma Result</h2>
       <div id="result">[ 尚無結果 ]</div>
     </div>
   </section>
 </main>
 
+<div id="screen-picker-backdrop">
+  <div id="screen-picker">
+    <h2>選擇要擷取的螢幕</h2>
+    <div id="screen-picker-list"></div>
+    <button class="secondary" onclick="closeScreenPicker()">取消</button>
+  </div>
+</div>
+
+<div id="snip-overlay">
+  <div id="snip-loading">擷取中...</div>
+  <canvas id="snip-canvas"></canvas>
+  <div id="snip-bar">
+    <span id="snip-count-label">拖曳滑鼠選取要加入的區域</span>
+    <button class="secondary" onclick="exitSnipMode()">✕ 結束擷取（Esc）</button>
+  </div>
+</div>
+
 <script>
-const canvas = document.getElementById('shot-canvas');
-const ctx = canvas.getContext('2d');
 const thumbs = document.getElementById('thumbs');
 const resultBox = document.getElementById('result');
 const runBtn = document.getElementById('run-btn');
 const statShot = document.getElementById('stat-shot');
 const statCount = document.getElementById('stat-count');
 
-let baseImage = null;   // 目前顯示在 canvas 上的 Image 物件（畫面截圖縮圖）
-let dragging = false;
-let startX = 0, startY = 0;
+const snipOverlay = document.getElementById('snip-overlay');
+const snipCanvas = document.getElementById('snip-canvas');
+const snipCtx = snipCanvas.getContext('2d');
+const snipLoading = document.getElementById('snip-loading');
+const snipCountLabel = document.getElementById('snip-count-label');
+
+const screenPickerBackdrop = document.getElementById('screen-picker-backdrop');
+const screenPickerList = document.getElementById('screen-picker-list');
+
+let snipBaseImage = null;   // 全螢幕覆蓋層上顯示的截圖
+let snipDragging = false;
+let snipStartX = 0, snipStartY = 0;
+let addedThisSession = 0;
 
 async function postJSON(url, body) {
   const res = await fetch(url, {
@@ -241,90 +363,184 @@ async function postJSON(url, body) {
   return res.json();
 }
 
+async function capture() {
+  statShot.textContent = '偵測螢幕中...';
+  let screens = [];
+  try {
+    const data = await postJSON('/api/screens', {});
+    screens = data.screens || [];
+  } catch (e) {
+    screens = [];
+  }
+
+  if (screens.length > 1) {
+    // 有多台螢幕（例如接了外接螢幕）才需要問，單螢幕直接略過這步
+    openScreenPicker(screens);
+    return;
+  }
+
+  startCapture(screens.length === 1 ? screens[0].index : null);
+}
+
+function openScreenPicker(screens) {
+  screenPickerList.innerHTML = '';
+  screens.forEach(s => {
+    const btn = document.createElement('button');
+    const label = (s.primary ? '⭐ 主要螢幕' : '🖥️ 螢幕 ' + (s.index + 1)) + ` ${s.width}x${s.height}`;
+    btn.textContent = label;
+    btn.onclick = () => {
+      closeScreenPicker();
+      startCapture(s.index);
+    };
+    screenPickerList.appendChild(btn);
+  });
+  const allBtn = document.createElement('button');
+  allBtn.textContent = '🖼️ 全部螢幕（整個虛擬桌面拼在一起）';
+  allBtn.onclick = () => {
+    closeScreenPicker();
+    startCapture(null);
+  };
+  screenPickerList.appendChild(allBtn);
+  statShot.textContent = '請選擇要擷取的螢幕';
+  screenPickerBackdrop.classList.add('active');
+}
+
+function closeScreenPicker() {
+  screenPickerBackdrop.classList.remove('active');
+}
+
+async function startCapture(screenIndex) {
+  statShot.textContent = '擷取中...';
+  // 先進全螢幕覆蓋層，再等 API 回應：Fullscreen API 只有在使用者操作的
+  // 呼叫堆疊內才保證可用，等 fetch 回應太久可能會被瀏覽器判定不是使用者
+  // 手勢觸發而擋掉 requestFullscreen()，所以要在 await 之前先呼叫。
+  enterSnipOverlay();
+  try {
+    const data = await postJSON('/api/capture', { screen_index: screenIndex });
+    if (data.error) {
+      alert(data.error);
+      exitSnipMode();
+      statShot.textContent = '擷取失敗';
+      return;
+    }
+    const img = new Image();
+    img.onload = () => {
+      snipBaseImage = img;
+      snipLoading.style.display = 'none';
+      resizeSnipCanvas();
+    };
+    img.src = data.image;
+    statShot.textContent = `畫面：已擷取（原始 ${data.orig_width}x${data.orig_height}）`;
+  } catch (e) {
+    alert('擷取失敗：' + e);
+    exitSnipMode();
+    statShot.textContent = '擷取失敗';
+  }
+}
+
+function enterSnipOverlay() {
+  addedThisSession = 0;
+  snipCountLabel.textContent = '拖曳滑鼠選取要加入的區域';
+  snipLoading.style.display = 'flex';
+  snipOverlay.classList.add('active');
+  if (snipOverlay.requestFullscreen) {
+    snipOverlay.requestFullscreen().catch(() => {});
+  }
+  resizeSnipCanvas();
+}
+
+function exitSnipMode() {
+  snipOverlay.classList.remove('active');
+  snipBaseImage = null;
+  if (document.fullscreenElement) {
+    document.exitFullscreen().catch(() => {});
+  }
+}
+
+function resizeSnipCanvas() {
+  snipCanvas.width = window.innerWidth;
+  snipCanvas.height = window.innerHeight;
+  redrawSnip();
+}
+
+function redrawSnip() {
+  if (snipBaseImage) {
+    snipCtx.drawImage(snipBaseImage, 0, 0, snipCanvas.width, snipCanvas.height);
+  }
+}
+
 // canvas 的內部像素尺寸（canvas.width/height）跟它在畫面上實際顯示的
-// CSS 尺寸可能不同（例如螢幕解析度太高、被 max-width:100% 縮小），
-// 這裡把滑鼠的 clientX/Y 換算成 canvas 內部像素座標，裁切座標才會準確。
-function toCanvasCoords(e) {
-  const rect = canvas.getBoundingClientRect();
-  const scaleX = canvas.width / rect.width;
-  const scaleY = canvas.height / rect.height;
+// CSS 尺寸可能不同，這裡把滑鼠的 clientX/Y 換算成 canvas 內部像素座標，
+// 裁切座標才會準確。
+function toSnipCoords(e) {
+  const rect = snipCanvas.getBoundingClientRect();
+  const scaleX = snipCanvas.width / rect.width;
+  const scaleY = snipCanvas.height / rect.height;
   return {
     x: (e.clientX - rect.left) * scaleX,
     y: (e.clientY - rect.top) * scaleY,
   };
 }
 
-async function capture() {
-  statShot.textContent = '畫面：擷取中...';
-  try {
-    const data = await postJSON('/api/capture', {});
-    if (data.error) {
-      alert(data.error);
-      statShot.textContent = '畫面：未擷取';
-      return;
-    }
-    const img = new Image();
-    img.onload = () => {
-      canvas.width = data.preview_width;
-      canvas.height = data.preview_height;
-      baseImage = img;
-      redraw();
-      statShot.textContent = `畫面：已擷取（原始 ${data.orig_width}x${data.orig_height}）`;
-    };
-    img.src = data.image;
-    // 擷取當下整張畫面就已經直接存成一張圖片加入清單了，不用等拖曳裁切
-    addThumb(data.thumbnail);
-    statCount.textContent = `已加入圖片：${data.count}`;
-  } catch (e) {
-    alert('擷取失敗：' + e);
-    statShot.textContent = '畫面：未擷取';
-  }
-}
-
-function redraw() {
-  if (baseImage) {
-    ctx.drawImage(baseImage, 0, 0, canvas.width, canvas.height);
-  }
-}
-
-canvas.addEventListener('mousedown', (e) => {
-  if (!baseImage) return;
-  const p = toCanvasCoords(e);
-  startX = p.x;
-  startY = p.y;
-  dragging = true;
+snipCanvas.addEventListener('mousedown', (e) => {
+  if (!snipBaseImage) return;
+  const p = toSnipCoords(e);
+  snipStartX = p.x;
+  snipStartY = p.y;
+  snipDragging = true;
 });
 
-canvas.addEventListener('mousemove', (e) => {
-  if (!dragging) return;
-  const p = toCanvasCoords(e);
-  redraw();
-  ctx.strokeStyle = '#ff4d4f';
-  ctx.lineWidth = 2;
-  ctx.strokeRect(startX, startY, p.x - startX, p.y - startY);
+snipCanvas.addEventListener('mousemove', (e) => {
+  if (!snipDragging) return;
+  const p = toSnipCoords(e);
+  redrawSnip();
+  snipCtx.strokeStyle = '#ff4d4f';
+  snipCtx.lineWidth = 2;
+  snipCtx.strokeRect(snipStartX, snipStartY, p.x - snipStartX, p.y - snipStartY);
 });
 
 window.addEventListener('mouseup', async (e) => {
-  if (!dragging) return;
-  dragging = false;
-  const p = toCanvasCoords(e);
-  redraw();
+  if (!snipDragging) return;
+  snipDragging = false;
+  if (!snipOverlay.classList.contains('active')) return;
+  const p = toSnipCoords(e);
+  redrawSnip();
 
-  if (Math.abs(p.x - startX) < 5 || Math.abs(p.y - startY) < 5) return;
+  if (Math.abs(p.x - snipStartX) < 5 || Math.abs(p.y - snipStartY) < 5) return;
 
   try {
     const data = await postJSON('/api/crop', {
-      x1: startX, y1: startY, x2: p.x, y2: p.y,
-      preview_width: canvas.width, preview_height: canvas.height,
+      x1: snipStartX, y1: snipStartY, x2: p.x, y2: p.y,
+      preview_width: snipCanvas.width, preview_height: snipCanvas.height,
     });
     if (data.error) {
       alert(data.error);
       return;
     }
     addThumb(data.thumbnail);
+    addedThisSession++;
     statCount.textContent = `已加入圖片：${data.count}`;
+    snipCountLabel.textContent = `已加入 ${addedThisSession} 張，可繼續框選`;
   } catch (err) {
     alert('裁切失敗：' + err);
+  }
+});
+
+window.addEventListener('resize', () => {
+  if (!snipOverlay.classList.contains('active')) return;
+  resizeSnipCanvas();
+});
+
+document.addEventListener('keydown', (e) => {
+  if (e.key === 'Escape' && snipOverlay.classList.contains('active')) {
+    exitSnipMode();
+  }
+});
+
+// 使用者用瀏覽器原生方式（例如 F11）離開全螢幕時，也要同步關閉覆蓋層
+document.addEventListener('fullscreenchange', () => {
+  if (!document.fullscreenElement && snipOverlay.classList.contains('active')) {
+    exitSnipMode();
   }
 });
 
@@ -406,6 +622,8 @@ class SniperHandler(BaseHTTPRequestHandler):
     def do_POST(self):
         if self.path == "/api/capture":
             self._handle_capture()
+        elif self.path == "/api/screens":
+            self._handle_screens()
         elif self.path == "/api/crop":
             self._handle_crop()
         elif self.path == "/api/clear":
@@ -415,30 +633,49 @@ class SniperHandler(BaseHTTPRequestHandler):
         else:
             self.send_error(404)
 
+    def _handle_screens(self):
+        """列出目前所有螢幕，給前端在擷取前顯示選單用（見 list_screens）。
+        偵測失敗時不當成 HTTP 錯誤擋住流程，回傳空清單就好，前端會自動
+        退回「不選、直接擷取整個虛擬桌面」的行為。"""
+        screens, error = list_screens()
+        if screens is None:
+            self._send_json({"screens": [], "error": error})
+            return
+        self._send_json({"screens": screens})
+
     def _handle_capture(self):
-        img, error = capture_via_wsl_hybrid()
+        """擷取畫面，回傳原始解析度的圖片給前端顯示成全螢幕框選畫面。
+        不會自動加入清單——使用者在全螢幕畫面上拖曳框選出來的區域，才會
+        透過 /api/crop 加入清單（見 _handle_crop）。
+
+        body 可帶 screen_index（來自 /api/screens 回傳的 index）指定只
+        擷取哪一台螢幕；不帶、或找不到對應螢幕時，退回擷取整個虛擬桌面
+        （所有螢幕拼在一起，維持單螢幕環境下的舊行為）。這裡重新查一次
+        list_screens() 取得座標，而不是直接信任前端傳回來的座標，避免
+        選單開著時螢幕排列剛好被使用者調整過而拿到過期座標。"""
+        data = self._read_json()
+        screen_index = data.get("screen_index")
+
+        bounds = None
+        if screen_index is not None:
+            screens, _ = list_screens()
+            match = next((s for s in (screens or []) if s["index"] == screen_index), None)
+            if match:
+                bounds = (match["x"], match["y"], match["width"], match["height"])
+
+        img, error = capture_via_wsl_hybrid(bounds=bounds)
         if img is None:
             self._send_json({"error": f"無法擷取畫面：{error}"}, status=500)
             return
 
         with state_lock:
             state["full_screen_img"] = img
-            # 擷取當下就直接把整張畫面存成一張圖片加入清單，不強制要求
-            # 使用者一定要先拖曳裁切才能取得可用的圖片；full_screen_img
-            # 仍會保留給後續「額外」裁切子區域用（見 _handle_crop）。
-            state["snipped_images"].append(img.copy())
-            count = len(state["snipped_images"])
 
-        pw, ph, preview_url = _img_to_data_url(img, max_dim=PREVIEW_MAX_DIM)
-        _, _, thumb_url = _img_to_data_url(img, max_dim=THUMBNAIL_MAX_DIM)
+        _, _, image_url = _img_to_data_url(img)
         self._send_json({
-            "image": preview_url,
-            "preview_width": pw,
-            "preview_height": ph,
+            "image": image_url,
             "orig_width": img.width,
             "orig_height": img.height,
-            "thumbnail": thumb_url,
-            "count": count,
         })
 
     def _handle_crop(self):
@@ -469,7 +706,9 @@ class SniperHandler(BaseHTTPRequestHandler):
             self._send_json({"error": "選取範圍太小"}, status=400)
             return
 
-        # 瀏覽器顯示的是縮圖（preview_width/height），裁切要換算回原始解析度
+        # 瀏覽器全螢幕覆蓋層的 canvas 尺寸（preview_width/height）不一定
+        # 等於原始截圖解析度（例如瀏覽器縮放、多螢幕虛擬桌面），裁切前要
+        # 換算回原始解析度的座標。
         scale_x = img.width / preview_w
         scale_y = img.height / preview_h
         box = (
