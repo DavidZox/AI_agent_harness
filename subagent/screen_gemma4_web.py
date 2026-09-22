@@ -9,9 +9,12 @@ screen_gemma4.py 的網頁版：一樣是「WSL 呼叫 PowerShell 截全螢幕 �
 跟 screen_gemma4.py 的差異：
 - 截圖仍然是同一套 WSL → PowerShell 的做法（capture_via_wsl_hybrid），
   這段完全沒有改動，一樣只能在 WSL 底下執行。
+- 按下「擷取畫面」時，除了把截圖顯示在 canvas 上，也會直接把整張畫面
+  存成一張圖片加入右側清單，不強制要求一定要先拖曳裁切才能取得可用的
+  圖片。
 - 裁切互動從 Tkinter canvas 換成瀏覽器 <canvas> + 滑鼠拖曳，可以連續
-  框選多次，每次放開滑鼠就自動裁切、加入右側清單，不需要每次都按
-  「Add Crop」重新進入裁切模式。
+  框選多次，每次放開滑鼠就自動裁切、「額外」加入右側清單，不需要每次
+  都按「Add Crop」重新進入裁切模式；沒有裁切需求時可以完全略過這步。
 - 純標準庫 http.server，沿用 web_console.py 同一套模式，不需要額外安裝
   Flask / FastAPI。
 
@@ -193,7 +196,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
       <button onclick="capture()">📸 擷取畫面</button>
       <button class="danger" onclick="clearImages()">🗑 清空已加入的圖片</button>
     </div>
-    <div id="hint">擷取畫面後，直接在下方圖片上拖曳滑鼠選取要加入的區域，放開滑鼠就會自動裁切並加入右側清單，可以重複框選多次。</div>
+    <div id="hint">按下「📸 擷取畫面」就會直接把整張畫面存成一張圖片，加入右側清單，不需要再拖曳裁切才能使用。如果還想額外擷取畫面中的某個小區域，一樣可以直接在下方圖片上拖曳滑鼠框選，放開滑鼠就會自動裁切並「額外」加入右側清單，可以重複框選多次。</div>
     <div id="canvas-wrap">
       <canvas id="shot-canvas"></canvas>
     </div>
@@ -269,6 +272,9 @@ async function capture() {
       statShot.textContent = `畫面：已擷取（原始 ${data.orig_width}x${data.orig_height}）`;
     };
     img.src = data.image;
+    // 擷取當下整張畫面就已經直接存成一張圖片加入清單了，不用等拖曳裁切
+    addThumb(data.thumbnail);
+    statCount.textContent = `已加入圖片：${data.count}`;
   } catch (e) {
     alert('擷取失敗：' + e);
     statShot.textContent = '畫面：未擷取';
@@ -417,14 +423,22 @@ class SniperHandler(BaseHTTPRequestHandler):
 
         with state_lock:
             state["full_screen_img"] = img
+            # 擷取當下就直接把整張畫面存成一張圖片加入清單，不強制要求
+            # 使用者一定要先拖曳裁切才能取得可用的圖片；full_screen_img
+            # 仍會保留給後續「額外」裁切子區域用（見 _handle_crop）。
+            state["snipped_images"].append(img.copy())
+            count = len(state["snipped_images"])
 
-        pw, ph, data_url = _img_to_data_url(img, max_dim=PREVIEW_MAX_DIM)
+        pw, ph, preview_url = _img_to_data_url(img, max_dim=PREVIEW_MAX_DIM)
+        _, _, thumb_url = _img_to_data_url(img, max_dim=THUMBNAIL_MAX_DIM)
         self._send_json({
-            "image": data_url,
+            "image": preview_url,
             "preview_width": pw,
             "preview_height": ph,
             "orig_width": img.width,
             "orig_height": img.height,
+            "thumbnail": thumb_url,
+            "count": count,
         })
 
     def _handle_crop(self):
