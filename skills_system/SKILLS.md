@@ -29,9 +29,3 @@
 ## 記憶修改
 - [modify_memory](tools/modify_memory.md) — 寫入經驗記憶
 
-## 專用運維
-- [robot_ping](tools/robot_ping.md) — 檢查 V4.9 機器人核心與語義層狀態
-- [eval_speed](tools/eval_speed.md) — 評估指定速度是否超出物理邊界限制
-- [monitor_motor](tools/monitor_motor.md) — 監測動力組件溫度，評估運作狀態
-- [check_batch](tools/check_batch.md) — 接收逗號分隔的數值字串，檢查是否有數值超過限制 100
-
