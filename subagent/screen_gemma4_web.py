@@ -69,9 +69,20 @@ def list_screens():
     擷取畫面前可以挑要哪一台（筆電單獨帶出門是單螢幕、接了外接螢幕變成
     雙螢幕，兩種情境都要能用）。回傳 (screens, error_message)，screens
     是 list[dict]：index/name/x/y/width/height/primary；失敗時
-    screens 為 None。"""
+    screens 為 None。
+
+    這裡也要呼叫 SetProcessDPIAware()，理由跟 capture_via_wsl_hybrid 裡
+    的那次呼叫一樣：沒有宣告 DPI-aware 的 process，Screen.Bounds 會回傳
+    被 Windows 依顯示縮放比例（例如 125%/150%）縮小過的「邏輯座標」，
+    而不是實際的物理像素座標。這裡跟實際擷取畫面是兩個分開呼叫的
+    PowerShell process，兩邊各自的 DPI-aware 宣告互不影響，如果只有
+    擷取那邊宣告、這裡沒有，選單挑出來的座標／尺寸就會是縮小過的，
+    傳給擷取那邊（它是用物理像素在算）就會只截到左上角一小塊，而不是
+    整個螢幕。"""
     ps_command = (
         "[Reflection.Assembly]::LoadWithPartialName('System.Windows.Forms') | Out-Null; "
+        "$type = Add-Type -MemberDefinition '[DllImport(\"user32.dll\")] public static extern bool SetProcessDPIAware();' -Name 'User32' -Namespace 'Win32' -PassThru; "
+        "[Win32.User32]::SetProcessDPIAware() | Out-Null; "
         "$i = 0; "
         "foreach ($s in [System.Windows.Forms.Screen]::AllScreens) { "
         "Write-Output \"$i|$($s.DeviceName)|$($s.Bounds.X)|$($s.Bounds.Y)|$($s.Bounds.Width)|$($s.Bounds.Height)|$($s.Primary)\"; "
