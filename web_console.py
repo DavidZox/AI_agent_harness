@@ -12,6 +12,11 @@ Web Console for SkillAgent
     右邊「系統 / 工具回傳」：EXECUTE 指令觸發的規格書載入或腳本執行結果。
 - CLI 版本原本用 /auto on、/compress 這類指令切換模式；這裡沿用同樣的
   指令字串，並新增 /menu 可以查詢目前支援哪些指令。
+- 即時串流：後端每完成一次推論或工具執行，就立刻把該筆事件以 NDJSON
+  （一行一個 JSON）寫回 HTTP 回應並 flush，前端邊收邊渲染，不必等整個
+  回合（可能是多輪 ask_ai -> run_tool）跑完才一次看到全部結果。
+  實作上把原本累積用的 events list 換成 EventStream 物件，append 即送出，
+  所以 run_turn / apply_decision / handle_plan_response 等流程函式完全不用改。
 
 執行方式：
     python3 web_console.py
@@ -21,6 +26,7 @@ Web Console for SkillAgent
 import json
 import os
 import threading
+import traceback
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 # TOKEN_THRESHOLD（整體上下文自動壓縮門檻）、TOOL_RESULT_TOKEN_THRESHOLD
@@ -91,7 +97,9 @@ session 失敗會自動退回原本的成功/失敗摘要，不影響主流程�
 
 # =========================================================
 # 核心流程：重用 Agent_Runner.SkillAgent 的方法，改寫成
-# 「每次呼叫处理一小段、把過程記錄成 events 回傳給前端」的形式
+# 「每次呼叫處理一小段、把過程逐筆推給前端」的形式。
+# 下面各函式的 events 參數實際上是 EventStream（見 HTTP Server 區塊），
+# 只用到 .append()，每 append 一筆就立刻串流送到瀏覽器。
 # =========================================================
 
 def current_mode_label():
@@ -543,13 +551,55 @@ function hidePlanBar() {
   planBar.classList.remove('show');
 }
 
-async function postJSON(url, body) {
+function handleStreamMessage(msg) {
+  if (msg.type === 'event') {
+    renderEvents([msg.event]);
+  } else if (msg.type === 'stats') {
+    updateStatus(msg.stats);
+  } else if (msg.type === 'error') {
+    renderEntry(toolLog, 'system', '錯誤', msg.error);
+  }
+}
+
+// 後端以 NDJSON（一行一個 JSON）串流回傳：每完成一次推論或工具執行就推一行，
+// 這裡邊收邊解析、立刻渲染，不用等整回合結束。最後一行 type === 'done'
+// 帶有 awaiting_decision / awaiting_plan / pending_mode / stats 等收尾資訊。
+async function streamPost(url, body) {
   const res = await fetch(url, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(body || {})
   });
-  return res.json();
+  const reader = res.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = '';
+  let done = null;
+  const consume = (line) => {
+    line = line.trim();
+    if (!line) return;
+    let msg;
+    try { msg = JSON.parse(line); } catch (e) { return; }
+    if (msg.type === 'done') done = msg; else handleStreamMessage(msg);
+  };
+  while (true) {
+    const { value, done: finished } = await reader.read();
+    if (finished) break;
+    buffer += decoder.decode(value, { stream: true });
+    let idx;
+    while ((idx = buffer.indexOf('\n')) >= 0) {
+      consume(buffer.slice(0, idx));
+      buffer = buffer.slice(idx + 1);
+    }
+  }
+  buffer += decoder.decode();
+  consume(buffer);
+  return done || {};
+}
+
+function applyDone(data) {
+  if (data.stats) updateStatus(data.stats);
+  if (data.awaiting_decision) showDecisionBar(data.pending_mode);
+  if (data.awaiting_plan) showPlanBar();
 }
 
 async function sendMessage() {
@@ -560,15 +610,9 @@ async function sendMessage() {
   hidePlanBar();
   msgBox.value = '';
   try {
-    const data = await postJSON('/api/send', { message: text });
-    if (data.error) {
-      renderEntry(toolLog, 'system', '錯誤', data.error);
-      return;
-    }
-    renderEvents(data.events);
-    updateStatus(data.stats);
-    if (data.awaiting_decision) showDecisionBar(data.pending_mode);
-    if (data.awaiting_plan) showPlanBar();
+    applyDone(await streamPost('/api/send', { message: text }));
+  } catch (e) {
+    renderEntry(toolLog, 'system', '錯誤', '與伺服器的連線中斷：' + e);
   } finally {
     setBusy(false);
     msgBox.focus();
@@ -579,14 +623,9 @@ async function sendDecision(action) {
   setBusy(true);
   hideDecisionBar();
   try {
-    const data = await postJSON('/api/decision', { action });
-    if (data.error) {
-      renderEntry(toolLog, 'system', '錯誤', data.error);
-      return;
-    }
-    renderEvents(data.events);
-    updateStatus(data.stats);
-    if (data.awaiting_decision) showDecisionBar(data.pending_mode);
+    applyDone(await streamPost('/api/decision', { action }));
+  } catch (e) {
+    renderEntry(toolLog, 'system', '錯誤', '與伺服器的連線中斷：' + e);
   } finally {
     setBusy(false);
     msgBox.focus();
@@ -597,15 +636,9 @@ async function sendPlanDecision(action) {
   setBusy(true);
   hidePlanBar();
   try {
-    const data = await postJSON('/api/send', { message: action });
-    if (data.error) {
-      renderEntry(toolLog, 'system', '錯誤', data.error);
-      return;
-    }
-    renderEvents(data.events);
-    updateStatus(data.stats);
-    if (data.awaiting_plan) showPlanBar();
-    if (data.awaiting_decision) showDecisionBar(data.pending_mode);
+    applyDone(await streamPost('/api/send', { message: action }));
+  } catch (e) {
+    renderEntry(toolLog, 'system', '錯誤', '與伺服器的連線中斷：' + e);
   } finally {
     setBusy(false);
     msgBox.focus();
@@ -632,6 +665,44 @@ fetch('/api/status').then(r => r.json()).then(updateStatus);
 # HTTP Server（純標準庫，無外部依賴）
 # =========================================================
 
+class EventStream:
+    """取代原本累積用的 events list：介面同樣只有 append()，但每 append
+    一筆就立刻以 NDJSON（一行一個 JSON）寫回 HTTP 回應並 flush，讓瀏覽器
+    在每次推論／工具執行完成的當下就看到結果，而不是等整回合結束。
+
+    每筆事件後面會順帶推一筆最新 stats，讓 header 的 token 計數也即時更新。
+
+    若使用者中途關掉分頁導致寫入失敗，不往外拋例外，只標記 client_gone
+    並靜默略過之後的寫入——讓 run_turn 等流程照原本的方式跑完，Agent 的
+    狀態（messages、pending、token 計數）才不會停在半途，跟改成串流前
+    「請求一送出，後端一定跑完整回合」的行為一致。
+    """
+
+    def __init__(self, handler):
+        self._handler = handler
+        self.client_gone = False
+
+    def _write(self, payload):
+        if self.client_gone:
+            return
+        try:
+            line = json.dumps(payload, ensure_ascii=False) + "\n"
+            self._handler.wfile.write(line.encode("utf-8"))
+            self._handler.wfile.flush()
+        except (BrokenPipeError, ConnectionResetError, OSError):
+            self.client_gone = True
+
+    def append(self, event):
+        self._write({"type": "event", "event": event})
+        self._write({"type": "stats", "stats": build_stats()})
+
+    def error(self, text):
+        self._write({"type": "error", "error": text})
+
+    def done(self, **fields):
+        self._write({"type": "done", "stats": build_stats(), **fields})
+
+
 class ConsoleHandler(BaseHTTPRequestHandler):
     def log_message(self, format, *args):
         pass  # 安靜一點，避免洗版終端機
@@ -649,6 +720,25 @@ class ConsoleHandler(BaseHTTPRequestHandler):
         raw = self.rfile.read(length) if length else b"{}"
         return json.loads(raw or b"{}")
 
+    def _begin_stream(self):
+        """送出串流回應的 header 並回傳 EventStream。不帶 Content-Length，
+        以 HTTP/1.0 的「連線關閉」作為回應結尾，瀏覽器的 fetch 會邊收邊給。"""
+        self.send_response(200)
+        self.send_header("Content-Type", "application/x-ndjson; charset=utf-8")
+        self.send_header("Cache-Control", "no-cache")
+        self.send_header("X-Accel-Buffering", "no")
+        self.send_header("Connection", "close")
+        self.end_headers()
+        return EventStream(self)
+
+    def _finish(self, stream, awaiting_decision):
+        """推出最後一行 done：帶前端收尾要用的旗標與最新 stats。"""
+        stream.done(
+            awaiting_decision=awaiting_decision,
+            awaiting_plan=plan_pending["active"],
+            pending_mode=pending["mode"] if awaiting_decision else None,
+        )
+
     def do_GET(self):
         if self.path == "/":
             body = HTML_PAGE.encode("utf-8")
@@ -664,53 +754,54 @@ class ConsoleHandler(BaseHTTPRequestHandler):
         self.send_error(404)
 
     def do_POST(self):
-        with lock:
-            if self.path == "/api/send":
-                self._handle_send()
-            elif self.path == "/api/decision":
-                self._handle_decision()
-            else:
-                self.send_error(404)
-
-    def _handle_send(self):
+        if self.path not in ("/api/send", "/api/decision"):
+            self.send_error(404)
+            return
         data = self._read_json()
+        with lock:
+            stream = self._begin_stream()
+            try:
+                if self.path == "/api/send":
+                    self._handle_send(data, stream)
+                else:
+                    self._handle_decision(data, stream)
+            except Exception as e:
+                # 串流 header 已送出，無法再改 HTTP 狀態碼，改以 error 訊息
+                # 告知前端；同時把 traceback 印在伺服器端方便除錯。
+                traceback.print_exc()
+                stream.error(f"伺服器處理時發生錯誤：{e}")
+                self._finish(stream, bool(pending["mode"]))
+
+    def _handle_send(self, data, stream):
         message = (data.get("message") or "").strip()
-        events = []
 
         if pending["mode"]:
-            self._send_json({"error": "尚有待決策的工具結果，請先回應決策再繼續。"}, status=409)
+            stream.error("尚有待決策的工具結果，請先回應決策再繼續。")
+            self._finish(stream, True)
             return
 
         # 有計畫待核准時，輸入框的內容一律視為對計畫的回應（y／n／修改意見），
         # 不當作新指令或 slash command 處理——跟 CLI 版 _run_plan_flow 的
         # input() 迴圈行為一致。
         if plan_pending["active"]:
-            outcome = handle_plan_response(message, events)
+            outcome = handle_plan_response(message, stream)
             awaiting_decision = False
             if outcome == "approved":
-                awaiting_decision = run_turn(events)
-            resp = {
-                "events": events,
-                "awaiting_decision": awaiting_decision,
-                "awaiting_plan": plan_pending["active"],
-                "stats": build_stats(),
-            }
-            if awaiting_decision:
-                resp["pending_mode"] = pending["mode"]
-            self._send_json(resp)
+                awaiting_decision = run_turn(stream)
+            self._finish(stream, awaiting_decision)
             return
 
         if not message:
-            self._send_json({"events": [], "awaiting_decision": False, "stats": build_stats()})
+            self._finish(stream, False)
             return
 
-        if handle_slash_command(message, events):
-            self._send_json({"events": events, "awaiting_decision": False, "stats": build_stats()})
+        if handle_slash_command(message, stream):
+            self._finish(stream, False)
             return
 
         user_tokens = agent.count_tokens(message)
         agent.total_user_tokens += user_tokens
-        events.append({"channel": "chat", "role": "user", "text": message, "tokens": user_tokens})
+        stream.append({"channel": "chat", "role": "user", "text": message, "tokens": user_tokens})
 
         # 記錄這一輪任務最原始的使用者敘述，跟 CLI 版（Agent_Runner.main）
         # 行為一致，供獨立摘要 session 在沒有 objective／plan 可用時，
@@ -718,37 +809,24 @@ class ConsoleHandler(BaseHTTPRequestHandler):
         agent.current_task = message
 
         if state["plan_mode"]:
-            start_plan_flow(message, events)
-            self._send_json({
-                "events": events,
-                "awaiting_decision": False,
-                "awaiting_plan": True,
-                "stats": build_stats(),
-            })
+            start_plan_flow(message, stream)
+            self._finish(stream, False)
             return
 
         agent.messages.append({'role': 'user', 'content': message})
-        awaiting = run_turn(events)
-        resp = {"events": events, "awaiting_decision": awaiting, "stats": build_stats()}
-        if awaiting:
-            resp["pending_mode"] = pending["mode"]
-        self._send_json(resp)
+        self._finish(stream, run_turn(stream))
 
-    def _handle_decision(self):
-        data = self._read_json()
+    def _handle_decision(self, data, stream):
         action = (data.get("action") or "").strip().lower()
-        events = []
 
         if not pending["mode"]:
-            self._send_json({"error": "目前沒有待決策的工具結果。"}, status=409)
+            stream.error("目前沒有待決策的工具結果。")
+            self._finish(stream, False)
             return
 
-        should_continue = apply_decision(action, events)
-        awaiting = run_turn(events) if should_continue else False
-        resp = {"events": events, "awaiting_decision": awaiting, "stats": build_stats()}
-        if awaiting:
-            resp["pending_mode"] = pending["mode"]
-        self._send_json(resp)
+        should_continue = apply_decision(action, stream)
+        awaiting = run_turn(stream) if should_continue else False
+        self._finish(stream, awaiting)
 
 
 def main():

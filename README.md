@@ -11,7 +11,7 @@
 ### 1.1 兩種操作介面，共用同一顆大腦
 
 - **`Agent_Runner.py`**：終端機互動介面（`SkillAgent` 類別 + `main()` REPL 迴圈）。所有核心邏輯（對話狀態、技能載入、腳本執行、記憶壓縮、token 門檻）都定義在這裡，是整個專案的**唯一核心來源**。
-- **`web_console.py`**：純標準庫（無 Flask / FastAPI 依賴）打造的網頁版介面，`import` `Agent_Runner` 裡的 `SkillAgent` 類別與共用函式（`_append_discarded_tool_result`、`_content_for_context`、`TOKEN_THRESHOLD`、`TOOL_RESULT_TOKEN_THRESHOLD`），把同一套推理迴圈改寫成「每次 HTTP 請求處理一小段、回傳事件列表」的形式，本身**不重新定義任何核心規則**。
+- **`web_console.py`**：純標準庫（無 Flask / FastAPI 依賴）打造的網頁版介面，`import` `Agent_Runner` 裡的 `SkillAgent` 類別與共用函式（`_append_discarded_tool_result`、`_content_for_context`、`TOKEN_THRESHOLD`、`TOOL_RESULT_TOKEN_THRESHOLD`），把同一套推理迴圈改寫成「每次 HTTP 請求處理一小段、以 NDJSON 串流逐筆回傳事件」的形式：後端每完成一次推論或工具執行就立刻推一筆到瀏覽器，前端邊收邊渲染，不必等整回合結束；本身**不重新定義任何核心規則**。
 
 兩者的差異只在「怎麼跟使用者互動」（終端機輸入 vs. 網頁請求／兩欄式面板），推理與工具執行邏輯完全一致。
 
