@@ -1,0 +1,6 @@
+# Python bytecode
+__pycache__/
+*.pyc
+
+# 自動壓縮產生的摘要歸檔（logs/summary_*.md / .json），機器產生、會依 AGENT_SUMMARY_KEEP 自動輪替
+logs/

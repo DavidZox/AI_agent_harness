@@ -43,6 +43,7 @@ from Agent_Runner import (
     SOFT_TOKEN_THRESHOLD,
     KEEP_RECENT_TOKENS,
     TOOL_RESULT_TOKEN_THRESHOLD,
+    MIN_COMPRESS_TOKENS,
     PARALLEL_CAL_DEFAULT,
     is_skill_doc_result,
 )
@@ -87,8 +88,8 @@ MENU_TEXT = """可用指令：
 /hybrid on / /hybrid off 切換 Hybrid 模式（每次工具結果都詢問是否加入上下文）
 /summarize on / /summarize off 切換工具回傳摘要模式（見下方說明，預設關閉）
 /parallel_cal on / /parallel_cal off 切換平行壓縮（回合結束後的軟水位壓縮改在背景執行緒做，預設關閉）
-/plan on / /plan off    切換 Plan 模式（新任務會先規劃步驟，經你核准後才會執行，預設關閉）
-/plan done              手動清除目前已核准、正在執行中的計畫（見下方說明）
+/plan on / /plan off    開啟 Plan 模式：下一個新任務會先規劃步驟、經你核准後才執行；核准後自動退出（預設關閉）
+/plan done              提早清除目前已核准的計畫（正常情況下會在你送出下一個新任務時自動清除）
 /objective set <內容>   設定 Sticky Objective（最高優先任務，會持續提醒 AI）
 /objective show         查看目前的 Objective
 /objective clear        清除 Objective
@@ -102,10 +103,10 @@ MENU_TEXT = """可用指令：
 規劃階段完全不會呼叫任何工具，即使 AI 不小心在計畫裡夾帶了 EXECUTE 指令
 也不會被執行——確認關卡是靠系統不執行工具保證的，不是單純提醒 AI 而已。
 
-計畫一旦核准，會存進系統提示詞（跟 Sticky Objective 同一種做法），確保
-即使後續執行很多輪工具、甚至觸發了自動壓縮，AI 都不會忘記這個計畫。
-系統不會自動判斷「所有步驟都做完了」而清掉它，需要你在任務結束後手動
-輸入 /plan done 清除，避免舊計畫殘留干擾之後的新任務。
+按下核准後會自動退出 Plan 模式（取消或送修改意見則維持在 Plan 模式，方便重新
+規劃）。核准的計畫會存進系統提示詞（跟 Sticky Objective 同一種做法），這個任務
+執行期間，不論經過多少輪工具決策、甚至觸發自動壓縮，AI 都不會忘記它；等你送出
+下一個新任務時會自動清除，不會殘留干擾新任務。若想提早清除可輸入 /plan done。
 
 單一工具回傳若超過 {threshold} tokens，不論目前是什麼模式，預設 AI 只會收到
 精簡的成功／失敗摘要（避免大量原始輸出干擾推理）。開啟 /summarize on 後，
@@ -134,9 +135,10 @@ Token 計量：AI 回覆與整體上下文大小以 Ollama 回報的精確值為
 prompt_eval_count），使用者輸入與工具回傳以每次呼叫後校準的字元比估算，所有
 數字都是真實 token 尺度。標題列的 ctx 會顯示目前大小（≈ 代表估算值）與兩道水位。
 
-上下文壓縮採雙水位線：軟水位 {soft_threshold} tokens（num_ctx {num_ctx} 的 50%）只在
+上下文壓縮採雙水位線：軟水位 {soft_threshold} tokens（num_ctx {num_ctx} 的 {soft_pct}%）只在
 「回合結束後」檢查，此時答案已經送到你眼前、模型閒著，順手壓縮不會拉長任何一次回覆；
-硬水位 {token_threshold}（70%）是呼叫模型前的最後防線，超過一定同步壓縮。壓縮時保留
+可壓的舊內容不到 {min_compress} tokens 時不會為了一點空間多花一次模型呼叫。
+硬水位 {token_threshold}（{hard_pct}%）是呼叫模型前的最後防線，超過一定同步壓縮。壓縮時保留
 最新約 {keep_recent} tokens 的原文（在訊息邊界切、不拆開指令與其結果），其餘與上一份
 摘要融合成新的一份結構化摘要（總體情境／關鍵進度／執行結果與錯誤／使用者偏好／未完成
 事項），存到 logs/ 並注入系統提示詞；系統提示詞只帶最新一份，不會越滾越長。
@@ -147,7 +149,8 @@ prompt_eval_count），使用者輸入與工具回傳以每次呼叫後校準的
 算力弱的設備建議維持關閉（序列處理）。""".format(
     threshold=TOOL_RESULT_TOKEN_THRESHOLD, vision_model=VISION_MODEL,
     token_threshold=TOKEN_THRESHOLD, soft_threshold=SOFT_TOKEN_THRESHOLD,
-    keep_recent=KEEP_RECENT_TOKENS, num_ctx=NUM_CTX,
+    keep_recent=KEEP_RECENT_TOKENS, num_ctx=NUM_CTX, min_compress=MIN_COMPRESS_TOKENS,
+    soft_pct=round(SOFT_TOKEN_THRESHOLD / NUM_CTX * 100), hard_pct=round(TOKEN_THRESHOLD / NUM_CTX * 100),
 )
 
 
@@ -239,11 +242,14 @@ def _run_vision_subsession(message, images, events):
                 f"因為它是影像唯一的文字表示，內容仍會完整交給主 Agent。"
             ),
         })
+    # 這段接在使用者訊息尾端、以 user 角色送進主對話，模型容易把它當成「使用者寫的」而回覆
+    # 「你提供的視覺分析」。這裡明確標示來源是系統的視覺模型；AGENT.md「Harness Messages」也有對應說明。
     return (
         f"{message}\n\n"
         f"[vision result]\n"
-        f"（使用者附上了 {n} 張影像；以下是獨立視覺模型針對上述訊息對影像的分析結果。"
-        f"你看不到原圖，請以這份分析為依據回應或決定下一步。）\n{result}"
+        f"【系統影像分析】使用者只提供了 {n} 張影像，沒有寫下面這段文字；以下由系統的視覺模型（{VISION_MODEL}）"
+        f"針對上述訊息自動產生。你看不到原圖，請把它當作系統回傳的分析結果來回應或決定下一步，"
+        f"回覆時稱「影像分析結果」，不要說成使用者提供的分析。\n{result}"
     )
 
 
@@ -286,6 +292,15 @@ def handle_plan_response(text, events):
         })
         plan_pending["active"] = False
         plan_pending["text"] = None
+        # 核准即退出 Plan 模式：Plan 模式的意義是「下一個新任務先規劃」，規劃階段到此結束；
+        # 這個任務接著依 current_plan 執行，下一個新任務會直接執行（要再規劃請重新 /plan on）。
+        # 取消（n）或送修改意見則維持 Plan 模式，方便重新描述任務再規劃。
+        if state["plan_mode"]:
+            state["plan_mode"] = False
+            events.append({"channel": "system", "text": (
+                "📝 計畫已核准，已自動退出 Plan 模式：這個任務會依計畫執行；"
+                "下一個新任務將直接執行（要再規劃請重新 /plan on）。"
+            )})
         return "approved"
 
     if choice == "" or choice.lower() in ("n", "no"):
@@ -407,6 +422,18 @@ def apply_decision(action, events):
     return False
 
 
+def clear_plan_for_new_task(events):
+    """新任務送出時，把上一個已核准的計畫從 system prompt 清掉。
+
+    計畫的生命週期 = 核准後那個任務的執行期間：期間所有工具決策（manual／hybrid 的 y/n）、
+    auto 迴圈、自動壓縮都不會清掉它；使用者再打字送出一句新訊息（非 slash 指令、非計畫回應、
+    非工具決策）就視為新任務。舊版要求手動 /plan done，實際上容易忘記，舊計畫會殘留在
+    system prompt 干擾之後的每個任務。要提早清除仍可用 /plan done。"""
+    if agent.current_plan:
+        agent.current_plan = None
+        events.append({"channel": "system", "text": "🧹 上一個已核准的計畫已隨新任務自動清除（system prompt 不再要求依舊計畫執行）。"})
+
+
 def handle_slash_command(message, events):
     """處理 /指令。回傳 True 代表已被當作指令處理，不需再送去給 AI。"""
     text = message.strip()
@@ -462,7 +489,7 @@ def handle_slash_command(message, events):
         return True
     if lower == "/plan on":
         state["plan_mode"] = True
-        events.append({"channel": "system", "text": "📝 已開啟 Plan 模式（新任務會先規劃步驟，經你核准後才會執行）"})
+        events.append({"channel": "system", "text": "📝 已開啟 Plan 模式（下一個新任務會先規劃步驟，經你核准後才執行；核准後自動退出）"})
         return True
     if lower == "/plan off":
         state["plan_mode"] = False
@@ -471,7 +498,7 @@ def handle_slash_command(message, events):
     if lower == "/plan done":
         if agent.current_plan:
             agent.current_plan = None
-            events.append({"channel": "system", "text": "✅ 已清除目前進行中的計畫（system prompt 不再提醒 AI 依計畫執行）"})
+            events.append({"channel": "system", "text": "✅ 已提早清除目前的計畫（system prompt 不再提醒 AI 依計畫執行；平常會在下一個新任務送出時自動清除）"})
         else:
             events.append({"channel": "system", "text": "ℹ️ 目前沒有進行中的計畫"})
         return True
@@ -1117,6 +1144,9 @@ class ConsoleHandler(BaseHTTPRequestHandler):
             "channel": "chat", "role": "user", "text": message,
             "tokens": user_tokens, "attachments": len(attachments),
         })
+
+        # 新任務開始：上一個已核准的計畫到此結束（見 clear_plan_for_new_task）
+        clear_plan_for_new_task(stream)
 
         # 記錄這一輪任務最原始的使用者敘述，跟 CLI 版（Agent_Runner.main）
         # 行為一致，供獨立摘要 session 在沒有 objective／plan 可用時，

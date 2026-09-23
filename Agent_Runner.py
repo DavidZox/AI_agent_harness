@@ -185,9 +185,20 @@ class SkillAgent:
 
     @staticmethod
     def _render_messages_for_summary(msgs):
-        """渲染成給摘要模型看的純文字：[user]／[assistant] 標頭 + 原文。
+        """渲染成給摘要模型看的純文字：[user]／[assistant]／[harness <標記>] 標頭 + 原文。
+        以 HARNESS_MARKERS 開頭的 user 訊息是框架插入的系統訊息（工具回傳、規劃流程），標成 harness，
+        摘要模型才不會把框架的規則記成「使用者偏好」。
         舊版直接把 list 的 repr 塞進 prompt，夾帶 {'role': ...} 與 \\n 轉義，浪費 token 又難讀。"""
-        return "\n\n".join(f"[{m['role']}]\n{m['content'].strip()}" for m in msgs)
+        parts = []
+        for m in msgs:
+            content = m['content'].strip()
+            role = m['role']
+            if role == 'user':
+                marker = next((mk for mk in HARNESS_MARKERS if content.startswith(mk)), None)
+                if marker:
+                    role = f"harness {marker}"
+            parts.append(f"[{role}]\n{content}")
+        return "\n\n".join(parts)
 
     def _summary_prompts(self, to_compress):
         prev = self.rolling_summary or "（沒有，這是第一次壓縮）"
@@ -202,7 +213,10 @@ class SkillAgent:
 5. 只輸出 JSON，欄位：overview（總體情境概述，一段話）、key_progress（關鍵進度與目標，條列）、
    results_and_errors（執行結果與錯誤，每項含 category／description／detail）、
    user_preferences（使用者偏好與約束）、open_items（未完成事項與下一步）。沒有內容的欄位給空陣列。
-6. 使用繁體中文。"""
+6. 使用繁體中文。
+7. 標頭為 [harness ...] 的訊息（工具回傳、規劃流程）與 [user] 訊息中 [vision result] 之後的段落，
+   都是框架自動插入的系統內容，不是使用者說的話：其中的格式要求、流程規則不要記成使用者偏好；
+   只有 [user] 自己寫的文字才算使用者的偏好與指示。"""
         user_prompt = (
             f"【上一份摘要】\n{prev}\n\n"
             f"【這次要併入的新對話片段（共 {len(to_compress)} 則）】\n"
@@ -263,14 +277,18 @@ class SkillAgent:
         )
         raw = res['message']['content'].strip()
         structured = True
+        data = None
         try:
-            markdown = self._render_summary_markdown(json.loads(raw))
+            data = json.loads(raw)
+            markdown = self._render_summary_markdown(data)
         except (ValueError, TypeError):
             structured = False
+            data = None
             markdown = raw
         get = getattr(res, "get", None)
         meta = {
             'structured': structured,
+            'data': data,  # 排版前的 JSON，歸檔成 .json 供日後反思機制讀取
             'eval_count': get('eval_count') if get else None,
             'prompt_eval_count': get('prompt_eval_count') if get else None,
         }
@@ -294,7 +312,45 @@ class SkillAgent:
         )
         with open(file_path, "w", encoding="utf-8") as f:
             f.write(f"{header}\n\n{markdown}\n")
+        # 同名 .json：排版前的結構化資料 + 這次壓縮的統計，給日後的反思機制讀（比 parse Markdown 容易）
+        try:
+            with open(file_path[:-3] + ".json", "w", encoding="utf-8") as f:
+                json.dump({
+                    'timestamp': timestamp,
+                    'model': self.summary_model,
+                    'messages_compressed': n_messages,
+                    'structured': bool(meta.get('structured')),
+                    'prompt_eval_count': meta.get('prompt_eval_count'),
+                    'eval_count': meta.get('eval_count'),
+                    'summary': meta.get('data'),
+                    'markdown': markdown,
+                }, f, ensure_ascii=False, indent=2)
+        except (OSError, TypeError, ValueError) as e:
+            print(f"⚠️ 摘要 JSON 歸檔失敗（不影響主流程）：{e}")
+        self._prune_summary_archive(log_dir)
         return file_path
+
+    @staticmethod
+    def _prune_summary_archive(log_dir, keep=None):
+        """只保留最近 keep 份 summary_*.md（連同同名 .json），其餘刪除。"""
+        keep = SUMMARY_ARCHIVE_KEEP if keep is None else keep
+        if keep <= 0:
+            return 0
+        try:
+            files = sorted(f for f in os.listdir(log_dir) if f.startswith("summary_") and f.endswith(".md"))
+        except OSError:
+            return 0
+        removed = 0
+        for name in files[:-keep] if len(files) > keep else []:
+            for path in (os.path.join(log_dir, name), os.path.join(log_dir, name[:-3] + ".json")):
+                try:
+                    os.remove(path)
+                    removed += 1
+                except FileNotFoundError:
+                    pass
+                except OSError as e:
+                    print(f"⚠️ 刪除舊摘要歸檔失敗：{path}：{e}")
+        return removed
 
     def _load_latest_summary(self):
         """啟動時載入 logs/ 裡最新一份摘要的內文（去掉標頭行），作為跨 session 延續的滾動摘要。"""
@@ -357,6 +413,12 @@ class SkillAgent:
         self._apply_compression(to_compress, markdown, meta)
         print(f"💾 [系統] 歷史已壓縮並存入: {os.path.basename(self.last_compression['file'])}")
         return True
+
+    def compressible_tokens(self, keep_tokens=None):
+        """保留區以外可壓的舊訊息共多少 token（估算）。after_turn_compression 用它判斷值不值得壓。"""
+        with self.messages_lock:
+            to_compress, _ = self._split_for_compression(keep_tokens=keep_tokens)
+        return sum(self.count_tokens(m['content']) for m in to_compress)
 
     def has_compressible_history(self, keep_tokens=None):
         """保留區以外是否還有可壓的舊訊息。上下文超過水位但全部訊息都在保留預算內時（例如
@@ -495,7 +557,8 @@ class SkillAgent:
         """/plan 模式用：把使用者的原始任務包裝成「先規劃、別執行」的請求。
         不需要另外把技能索引塞進來，因為 SKILLS.md 已經在系統提示詞裡，
         AI 本來就看得到，這裡只需要下達規劃指令即可。"""
-        return f"""請先不要執行任何指令。請依照你目前看到的 SKILLS.md 技能索引，
+        return f"""[PLAN_REQUEST]
+請先不要執行任何指令。請依照你目前看到的 SKILLS.md 技能索引，
 針對下面的任務規劃出所需的步驟清單，列出來讓使用者確認後才會開始執行。
 
 規則：
@@ -510,7 +573,8 @@ class SkillAgent:
 
     def build_plan_revision_request(self, feedback):
         """/plan 模式用：使用者對計畫不滿意時，帶著回饋重新規劃一次。規則同上。"""
-        return f"""使用者對你剛才列出的計畫有以下修改意見，請依照意見重新規劃一份新的步驟清單。
+        return f"""[PLAN_REVISION]
+使用者對你剛才列出的計畫有以下修改意見，請依照意見重新規劃一份新的步驟清單。
 規則同上：只列出計畫、不要輸出 EXECUTE: 指令，等待使用者確認。
 
 修改意見：
@@ -548,8 +612,8 @@ class SkillAgent:
             規則:
             - 依計畫逐步執行，一次只做一步，等系統回傳這一步的結果後再進行下一步
             - 除非使用者明確要求變更，否則不可自行更改或遺忘此計畫
-            - 不會自動判斷「計畫已完成」而清除這個區塊；即使所有步驟都做完了，
-              這裡仍會持續出現，直到使用者輸入 /plan done 手動清除為止
+            - 這個區塊會持續到使用者送出下一個新任務（或輸入 /plan done）才清除；
+              所有步驟都做完後，向使用者回報結果並等待新指示即可
             """
 
     def _build_task_anchor_text(self):
@@ -790,7 +854,20 @@ class SkillAgent:
 
             print(f"🛠️  Agent 啟動工具: {script_name}")
             if not os.path.exists(script_path):
-                return f"錯誤：找不到腳本 {script_path}"
+                # 幾乎都是模型跳過「先載入規格」直接猜腳本檔名（例如 list_dir_cmd.py，實際是 ls_cmd.py）。
+                # 給可直接行動的指引：猜的名稱裡若含有某個技能名稱，就建議先 EXECUTE 那個技能取得規格。
+                stem = script_name[:-len("_cmd.py")] if script_name.endswith("_cmd.py") else script_name
+                candidates = [
+                    f[:-3] for f in sorted(os.listdir(self.tools_dir))
+                    if f.endswith(".md") and (f[:-3] in stem or stem in f[:-3])
+                ] if os.path.isdir(self.tools_dir) else []
+                hint = (
+                    f"這個名稱看起來是技能 {', '.join(candidates)}，請先 `EXECUTE: {candidates[0]}` 載入規格文件，"
+                    f"再依規格標明的實際腳本路徑執行。"
+                    if candidates else
+                    "腳本路徑只能從規格文件取得，不可自行推測：請先 `EXECUTE: [SKILLS.md 裡的技能名稱]` 載入規格。"
+                )
+                return f"[ERROR] 找不到腳本 {script_name}。{hint}"
 
             clean_args = self._parse_script_args(script_name, remainder)
 
@@ -895,23 +972,42 @@ def _run_plan_flow(agent, user_task):
 
 # Ollama 一次請求的 context 上限。模型本身支援更長（gemma4:e4b 為 131072），這裡是為了記憶體
 # 與速度自設的；主對話、壓縮摘要、工具摘要三種 session 共用同一個值。可用 AGENT_NUM_CTX 覆寫。
-NUM_CTX = int(os.environ.get("AGENT_NUM_CTX", "12288"))
+# 預設從 12288 提高到 32768：system prompt（AGENT.md + SKILLS.md + Memory.md + 滾動摘要）本身約
+# 3000～4000 tokens，在 12288 下佔了三成，各水位之間只剩幾百 tokens 給對話，實測兩分鐘內連壓四次、
+# 每次 10～15 秒，使用上明顯遲滯。記憶體較小的設備請用環境變數設回 12288 或更低。
+NUM_CTX = int(os.environ.get("AGENT_NUM_CTX", "32768"))
 
-# 整體上下文超過此 token 數時自動壓縮並歸檔（見 compress_context_to_file）。取 NUM_CTX 的 70%，
-# 保留約 30% 給模型輸出與下一則使用者／工具訊息，確保壓縮一定發生在 Ollama 靜默截斷之前。
-# （舊版寫死 8000 且以「字元÷4」計量，換算成真實 token 約 17000，早已超過 num_ctx，壓縮永遠來不及觸發。）
-TOKEN_THRESHOLD = int(NUM_CTX * 0.70)
-
-# 🌊 雙水位線（dual watermark）。硬水位 = 上面的 TOKEN_THRESHOLD（呼叫模型前的最後防線，同步）。
-# 軟水位：回合結束後（最終答案已經送給使用者、模型閒著）若上下文超過此值就順手壓縮，
-# 切點落在任務邊界，不會把一個任務切成兩半，也不擋在下一次回覆前面（見 after_turn_compression）。
-# /parallel_cal on 時改在背景執行緒做（start_background_compression）。
-SOFT_TOKEN_THRESHOLD = int(NUM_CTX * 0.50)
+# 🌊 雙水位線（dual watermark）比例，皆可用環境變數覆寫。
+# 硬水位（TOKEN_THRESHOLD）：呼叫模型前的最後防線，超過一定同步壓縮（ensure_context_budget），
+#   確保壓縮先於 Ollama 在 num_ctx 處的靜默截斷；剩下 25% 留給模型輸出與下一則訊息。
+#   （更早的版本寫死 8000 且以「字元÷4」計量，換算真實 token 約 17000，早已超過 num_ctx，永遠來不及觸發。）
+# 軟水位（SOFT_TOKEN_THRESHOLD）：回合結束後（最終答案已送出、模型閒著）若超過就順手壓縮，切點落在
+#   任務邊界、不擋在下一次回覆前面（after_turn_compression）；/parallel_cal on 時改在背景執行緒做。
+HARD_RATIO = float(os.environ.get("AGENT_HARD_RATIO", "0.75"))
+SOFT_RATIO = float(os.environ.get("AGENT_SOFT_RATIO", "0.60"))
+TOKEN_THRESHOLD = int(NUM_CTX * HARD_RATIO)
+SOFT_TOKEN_THRESHOLD = int(NUM_CTX * SOFT_RATIO)
 
 # low watermark：壓縮時保留最新這麼多 token 的原文（在訊息邊界切、不拆開 EXECUTE／tool result
 # 這一組），其餘與上一份滾動摘要融合成新摘要。舊版固定「保留最新 2 則」，兩則可能只有 50 tokens
 # 也可能 1500 tokens，銜接感不穩定。
-KEEP_RECENT_TOKENS = int(NUM_CTX * 0.15)
+KEEP_RATIO = 0.15
+KEEP_RECENT_TOKENS = int(NUM_CTX * KEEP_RATIO)
+
+# 軟水位的「值不值得」門檻：保留區以外可壓的舊內容少於此數時，回合結束後不壓縮——一次摘要要花
+# 一次模型呼叫（10～15 秒），只為了騰出幾百 tokens 不划算；硬水位不受此限。
+MIN_COMPRESS_TOKENS = max(1000, NUM_CTX // 20)
+
+# logs/ 歸檔保留份數（summary_*.md 與同名 .json 一起計算、一起刪除）。融合摘要相鄰兩份高度重複，
+# 舊檔的價值主要是被融合淘汰的歷史細節，留最近 N 份給日後的反思機制當語料即可。可用 AGENT_SUMMARY_KEEP 覆寫。
+SUMMARY_ARCHIVE_KEEP = int(os.environ.get("AGENT_SUMMARY_KEEP", "30"))
+
+# 框架自動插入、但以 user 角色送進對話的系統訊息標記（AGENT.md「Harness Messages」有對應說明）。
+# 摘要模型渲染對話時用它把這些訊息標成 [harness ...] 而不是 [user]，避免把框架的規則記成使用者偏好。
+HARNESS_MARKERS = (
+    "[tool result]", "【系統執行結果】", "[vision result]",
+    "[PLAN_REQUEST]", "[PLAN_REVISION]", "[PLAN_CONFIRMED]", "[PLAN_REJECTED]",
+)
 
 # 融合摘要的長度目標（字，寫進摘要 prompt）與模型輸出硬上限（token，num_predict），
 # 讓滾動摘要不會越滾越長；輸出被硬上限截斷時 JSON 會解析失敗、退回原文，因此上限要留得夠寬。
@@ -1021,7 +1117,10 @@ def after_turn_compression(agent, parallel, notify):
     否則同步做完再回到等待輸入。notify 是輸出通知的函式（CLI 用 print，Web 推 system 事件）。
     回傳 None（未觸發）／'sync'／'background'。"""
     ctx_before = agent.context_tokens()
-    if ctx_before <= SOFT_TOKEN_THRESHOLD or not agent.has_compressible_history():
+    if ctx_before <= SOFT_TOKEN_THRESHOLD:
+        return None
+    # 可壓的內容太少就不值得一次模型呼叫（system prompt 本身很大時，超過水位卻沒什麼可壓是常態）
+    if agent.compressible_tokens() < MIN_COMPRESS_TOKENS:
         return None
     if parallel:
         if agent.start_background_compression():
@@ -1051,7 +1150,7 @@ def main():
     hybrid_mode = False  # 👈 新增狀態
     tool_summary_mode = False  # 👈 工具回傳超過門檻時，是否改用獨立 session 做語意摘要
     parallel_cal = PARALLEL_CAL_DEFAULT  # 👈 軟水位壓縮改在背景執行緒做（需 Ollama 有 ≥2 個 parallel slot 才真的平行）
-    plan_mode = False  # 👈 開啟後，每個新任務都要先規劃、經使用者核准才會執行
+    plan_mode = False  # 👈 開啟後，下一個新任務先規劃、經使用者核准後才執行；核准即自動退出
 
     print("\n" + "="*50)
     print("V6 Robot Agent + Token Tracker 已啟動")
@@ -1119,7 +1218,7 @@ def main():
                 continue
             if user_msg.lower() == '/plan on':
                 plan_mode = True
-                print("📝 已開啟 Plan 模式（新任務會先規劃步驟，經你核准後才會執行）")
+                print("📝 已開啟 Plan 模式（下一個新任務會先規劃步驟，經你核准後才執行；核准後自動退出）")
                 continue
             if user_msg.lower() == '/plan off':
                 plan_mode = False
@@ -1128,7 +1227,7 @@ def main():
             if user_msg.lower() == '/plan done':
                 if agent.current_plan:
                     agent.current_plan = None
-                    print("✅ 已清除目前進行中的計畫（system prompt 不再提醒 AI 依計畫執行）")
+                    print("✅ 已提早清除目前的計畫（system prompt 不再提醒 AI 依計畫執行；平常會在下一個新任務送出時自動清除）")
                 else:
                     print("ℹ️ 目前沒有進行中的計畫")
                 continue
@@ -1156,6 +1255,13 @@ def main():
             agent.total_user_tokens += user_tokens
             print(f"📥 User Tokens: {user_tokens}")
 
+            # 新任務開始：上一個已核准的計畫到此結束，自動清除。計畫的生命週期 = 核准後那個任務的
+            # 執行期間（期間的工具決策、auto 迴圈、自動壓縮都不會清掉它）；再打一句新訊息就是新任務。
+            # 舊版要求手動 /plan done，容易忘記而讓舊計畫殘留在 system prompt 干擾之後的每個任務。
+            if agent.current_plan:
+                agent.current_plan = None
+                print("🧹 上一個已核准的計畫已隨新任務自動清除（system prompt 不再要求依舊計畫執行）")
+
             # 記錄這一輪任務最原始的使用者敘述，供獨立摘要 session 在沒有
             # objective／plan 可用時，當作「原始問題」聚焦摘要內容
             # （見 _build_task_anchor_text）
@@ -1165,7 +1271,10 @@ def main():
             if plan_mode:
                 if not _run_plan_flow(agent, user_msg):
                     after_turn_compression(agent, parallel_cal, print)  # 取消也算回合結束
-                    continue  # 使用者取消了計畫，回到最上層等待新的輸入
+                    continue  # 使用者取消了計畫，維持 Plan 模式，回到最上層等待新的輸入
+                # 核准即退出 Plan 模式：規劃階段結束，這個任務依 current_plan 執行，下一個新任務直接執行
+                plan_mode = False
+                print("📝 計畫已核准，已自動退出 Plan 模式（要再規劃下一個任務請重新 /plan on）")
             else:
                 agent.messages.append({'role': 'user', 'content': user_msg})
 

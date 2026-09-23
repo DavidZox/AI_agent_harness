@@ -39,19 +39,23 @@
 
 | 常數 | 目前值 | 作用 |
 | :--- | :--- | :--- |
-| `NUM_CTX` | 12288（環境變數 `AGENT_NUM_CTX`） | 一次請求給 Ollama 的 context 上限，主對話、壓縮摘要、工具摘要三種 session 共用。模型本身支援 131072，這是為記憶體與速度自設的。 |
-| `TOKEN_THRESHOLD`（硬水位） | `NUM_CTX × 70%`（預設 8601） | 呼叫模型前的最後防線：`ask_ai()` 送出前若上下文超過此值，一定**同步**壓縮（`ensure_context_budget()`），確保壓縮先於 Ollama 在 `num_ctx` 處的靜默截斷；若剛好有背景壓縮在跑，先等它完成、仍超標才自己壓，不會兩份摘要同時跑。這是唯一的硬水位檢查點——舊版在每輪工具執行後還有一處，且壓縮後 `continue` 會跳過「把工具結果加入上下文」那一步、直接再問一次 AI，AI 拿不到剛執行的結果而重複下同一個指令，已移除。 |
-| `SOFT_TOKEN_THRESHOLD`（軟水位） | `NUM_CTX × 50%`（預設 6144） | 只在**回合結束後**檢查（`after_turn_compression()`：CLI 印完最終回覆、Web Console 串流送出最終 chat 事件之後）。此時使用者正在讀答案、模型閒著，壓縮不會拉長任何一次回覆的等待時間，切點也剛好落在任務邊界，不會把一個任務切成兩半。`/parallel_cal on` 時改在背景執行緒做（見下方）。若超過水位但所有訊息都在保留預算內（例如 system prompt 本身就很大），不會宣告也不會動作。 |
-| `KEEP_RECENT_TOKENS`（low watermark） | `NUM_CTX × 15%`（預設 1843） | 壓縮時保留最新這麼多 token 的**原文**：從最新往回累加、在訊息邊界切、至少保留最新一則、不拆開 assistant 的 `EXECUTE:` 與它的 `[tool result]`（`_split_for_compression()`）。其餘交給摘要。舊版固定「保留最新 2 則」，兩則可能只有 50 tokens 也可能 1500 tokens，銜接感不穩定。 |
+| `NUM_CTX` | 32768（環境變數 `AGENT_NUM_CTX`） | 一次請求給 Ollama 的 context 上限，主對話、壓縮摘要、工具摘要三種 session 共用。模型本身支援 131072。預設從 12288 提高：system prompt 約 3000～4000 tokens 在 12288 下佔三成，水位之間只剩幾百 tokens 給對話，實測兩分鐘內壓縮四次、每次 10～15 秒。gemma4:e4b 在 32768 下 `ollama ps` 顯示的佔用量與 12288 相同（3.4 GB），記憶體不是問題；較小的設備可設回 12288 或更低。 |
+| `TOKEN_THRESHOLD`（硬水位） | `NUM_CTX × 75%`（預設 24576；比例可用 `AGENT_HARD_RATIO` 覆寫） | 呼叫模型前的最後防線：`ask_ai()` 送出前若上下文超過此值，一定**同步**壓縮（`ensure_context_budget()`），確保壓縮先於 Ollama 在 `num_ctx` 處的靜默截斷；若剛好有背景壓縮在跑，先等它完成、仍超標才自己壓，不會兩份摘要同時跑。這是唯一的硬水位檢查點——舊版在每輪工具執行後還有一處，且壓縮後 `continue` 會跳過「把工具結果加入上下文」那一步、直接再問一次 AI，AI 拿不到剛執行的結果而重複下同一個指令，已移除。 |
+| `SOFT_TOKEN_THRESHOLD`（軟水位） | `NUM_CTX × 60%`（預設 19660；比例可用 `AGENT_SOFT_RATIO` 覆寫） | 只在**回合結束後**檢查（`after_turn_compression()`：CLI 印完最終回覆、Web Console 串流送出最終 chat 事件之後）。此時使用者正在讀答案、模型閒著，壓縮不會拉長任何一次回覆的等待時間，切點也剛好落在任務邊界，不會把一個任務切成兩半。`/parallel_cal on` 時改在背景執行緒做（見下方）。可壓的舊內容少於 `MIN_COMPRESS_TOKENS` 時不會宣告也不會動作。 |
+| `MIN_COMPRESS_TOKENS` | `max(1000, NUM_CTX ÷ 20)`（預設 1638） | 軟水位的「值不值得」門檻：一次摘要要花一次模型呼叫，只為騰出幾百 tokens 不划算。system prompt 佔比高時「超過水位卻沒什麼可壓」是常態，舊版會在這種狀態下每回合都壓一次。硬水位不受此限。 |
+| `KEEP_RECENT_TOKENS`（low watermark） | `NUM_CTX × 15%`（預設 4915） | 壓縮時保留最新這麼多 token 的**原文**：從最新往回累加、在訊息邊界切、至少保留最新一則、不拆開 assistant 的 `EXECUTE:` 與它的 `[tool result]`（`_split_for_compression()`）。其餘交給摘要。舊版固定「保留最新 2 則」，兩則可能只有 50 tokens 也可能 1500 tokens，銜接感不穩定。 |
 | `SUMMARY_MAX_CHARS` / `SUMMARY_MAX_PREDICT` | 600 字 / 2000 tokens | 融合摘要的長度目標（寫進摘要 prompt；實測 gemma4:e4b 會超過目標約三成，實際落在 450～600 tokens）與輸出硬上限（`num_predict`，防止失控；被截斷時 JSON 會解析失敗退回原文，所以留得夠寬）。 |
+| `SUMMARY_ARCHIVE_KEEP` | 30（環境變數 `AGENT_SUMMARY_KEEP`） | `logs/` 只保留最近 N 份 `summary_*.md` 與同名 `.json`，其餘在每次歸檔後自動刪除。 |
 | `SUMMARY_MODEL` | `None`（環境變數 `AGENT_SUMMARY_MODEL`） | 壓縮摘要與工具摘要兩種獨立 session 共用的模型，預設與主模型相同；與主模型不同時，`/parallel_cal on` 的背景摘要才會真的與主對話平行。取捨見下方「摘要模型」。 |
 | `TOOL_RESULT_TOKEN_THRESHOLD` | 500（約 1000 字元） | 單一工具回傳超過此 token 數時，**不會**把完整原始輸出塞進 AI 的上下文，預設改用 `_content_for_context()` 產生的精簡摘要（依內容是否以 `[ERROR]` 開頭，回報「成功」或「失敗」），避免一次大量的搜尋/列目錄結果打斷模型的推理節奏。完整內容仍會顯示給使用者（CLI 印出、或 Web Console 的「系統 / 工具回傳」面板並標記 ⚠️ 待確認）。**技能規格文件例外**：`run_tool` 載入規格文件的回傳（以 `SKILL_DOC_PREFIX` 開頭）一律完整進入上下文、不標 ⚠️——它是按需載入機制的核心，被精簡掉 AI 就拿不到腳本路徑；規格書本身以 400 tokens（約 800 字元）以內為原則。 |
 
 Web Console 另外加了 `MAX_AUTO_ITERATIONS = 25`：Auto 模式下連續執行工具超過此輪數會強制中止本回合，避免模型陷入迴圈時把伺服器卡死（CLI 版本因為有人在終端機前，可以直接 Ctrl+C，暫無此限制）。
 
-**`num_ctx` 與門檻的關係**：所有 `ollama.chat()` 呼叫都帶 `num_ctx=NUM_CTX`。若不指定，Ollama 會用內建預設值 4096，對話還沒到壓縮門檻就會在背後悄悄截斷最舊的內容並擠壓輸出空間，看起來就像模型的輸出被無故砍短。`TOKEN_THRESHOLD` 直接定義為 `NUM_CTX` 的 70%，兩者同一尺度，壓縮一定先於截斷發生。歷史教訓：舊版 `TOKEN_THRESHOLD = 8000` 是以「字元÷4」計量，換成真實 token 約 17000，早已超過 `num_ctx` 12288，壓縮實際上永遠來不及觸發。
+**`num_ctx` 與門檻的關係**：所有 `ollama.chat()` 呼叫都帶 `num_ctx=NUM_CTX`。若不指定，Ollama 會用內建預設值 4096，對話還沒到壓縮門檻就會在背後悄悄截斷最舊的內容並擠壓輸出空間，看起來就像模型的輸出被無故砍短。`TOKEN_THRESHOLD` 直接定義為 `NUM_CTX` 的 75%（`HARD_RATIO`），兩者同一尺度，壓縮一定先於截斷發生。歷史教訓：舊版 `TOKEN_THRESHOLD = 8000` 是以「字元÷4」計量，換成真實 token 約 17000，早已超過 `num_ctx` 12288，壓縮實際上永遠來不及觸發。
 
-**滾動融合摘要（rolling summary）**：`compress_context_to_file()` 先用 `_split_for_compression()` 切出保留區以外的舊訊息，交給 `summarize_messages()`：摘要模型同時收到「上一份 `rolling_summary`」與「這次要併入的新片段」（渲染成 `[user]` / `[assistant]` 標頭的純文字，舊版直接塞 Python list 的 repr，夾帶 `{'role': ...}` 與 `\n` 轉義，浪費 token 又難讀），輸出一份更新後的完整摘要**取代**上一份——延續舊內容、依新片段更新進度、淘汰已解決或過時的細節，但使用者明確表達的偏好與限制一律保留。結構由 Ollama 的 `format=` JSON schema（`SUMMARY_SCHEMA`：overview / key_progress / results_and_errors / user_preferences / open_items）強制，再由 `_render_summary_markdown()` 排成固定五段的 Markdown，不靠模型自己遵守範本；模型仍沒給合法 JSON 時退回原文，總比丟掉整段歷史好。每次壓縮都會寫一個 `logs/summary_<時間>.md` 供稽核，但 `get_system_prompt()` 的「Recent Compressed History Summary」**只注入最新一份**（舊版載入最近 5 個檔案，prompt 成本是單份摘要的 5 倍，且第 6 次壓縮起最舊的會無聲消失）。啟動時從 `logs/` 最新一份載入，因此摘要會跨 session 延續；`/clear` 不會清掉它（與舊版行為一致），要完全重來請刪除 `logs/` 下的檔案。
+**滾動融合摘要（rolling summary）**：`compress_context_to_file()` 先用 `_split_for_compression()` 切出保留區以外的舊訊息，交給 `summarize_messages()`：摘要模型同時收到「上一份 `rolling_summary`」與「這次要併入的新片段」（渲染成 `[user]` / `[assistant]` 標頭的純文字，舊版直接塞 Python list 的 repr，夾帶 `{'role': ...}` 與 `\n` 轉義，浪費 token 又難讀），輸出一份更新後的完整摘要**取代**上一份——延續舊內容、依新片段更新進度、淘汰已解決或過時的細節，但使用者明確表達的偏好與限制一律保留。結構由 Ollama 的 `format=` JSON schema（`SUMMARY_SCHEMA`：overview / key_progress / results_and_errors / user_preferences / open_items）強制，再由 `_render_summary_markdown()` 排成固定五段的 Markdown，不靠模型自己遵守範本；模型仍沒給合法 JSON 時退回原文，總比丟掉整段歷史好。每次壓縮都會寫一個 `logs/summary_<時間>.md` 供稽核，但 `get_system_prompt()` 的「Recent Compressed History Summary」**只注入最新一份**（舊版載入最近 5 個檔案，prompt 成本是單份摘要的 5 倍，且第 6 次壓縮起最舊的會無聲消失）。啟動時從 `logs/` 最新一份載入，因此摘要會跨 session 延續；`/clear` 不會清掉它（與舊版行為一致），要完全重來請刪除 `logs/` 下的檔案。每份歸檔同時寫一個同名 `.json`（排版前的結構化資料、壓縮則數、token 統計），給日後的反思機制讀取；`logs/` 依 `SUMMARY_ARCHIVE_KEEP` 只保留最近 30 份，並已加入 `.gitignore`。摘要模型看到的對話會把以 `HARNESS_MARKERS`（`[tool result]`、`[vision result]`、`[PLAN_REQUEST]`…）開頭的 user 訊息標成 `[harness …]`，並被明確告知這些是框架插入的系統訊息，不要把其中的規則記成使用者偏好——舊版曾把 `build_plan_request()` 的「規劃時不要輸出 EXECUTE」記成使用者偏好。
+
+**system prompt 的成本**：`AGENT.md` 約 1500、`SKILLS.md` 約 800、`Memory.md` 約 600、滾動摘要約 500 tokens，合計約 3400，每輪常駐；水位是對整體算的，所以 `NUM_CTX` 太小時對話可用的空間會被壓得很窄。`Memory.md` 已把三組講同一件事的條目各合併成一則、`SKILLS.md` 的說明段落已精簡。`AGENT.md` 曾試過把執行協議從約 1550 tokens 精簡到約 1000（重複的規則只留一次），但 A/B 實測（同一個「列出目前目錄」任務各跑多次）精簡版出現了猜腳本檔名、單一回覆塞多行 `EXECUTE:` 的失誤，原版 8 次全對，因此保留原版的詳細寫法——對 4B 級模型而言重複強調是有用的，省下的 450 tokens 在 32768 的上下文裡不值得換。另外補了一條「腳本路徑不可推測」規則，且 `run_tool` 找不到腳本時會回傳可行動的 `[ERROR]`（猜的檔名若包含某個技能名稱，直接提示先 `EXECUTE: <該技能>` 載入規格）。
 
 **`/parallel_cal on|off`（背景壓縮，預設關閉）**：CLI 與 Web Console 同名指令，預設值可用 `AGENT_PARALLEL_CAL=1` 改成開啟。開啟後軟水位的壓縮改由 `start_background_compression()` 在背景執行緒進行：先快照要壓的訊息、呼叫摘要模型（期間不持有任何鎖）、完成後 `_apply_compression()` 以**物件身分**把那幾則從 `messages` 原地移除（不重綁 list、不靠索引），所以壓縮期間主對話新加入的訊息不會遺失；主對話送給 Ollama 的也是快照，校準比以真正送出的那份計算。完成或失敗的通知放進 `pop_notices()`：CLI 在下一次輸入後印出，Web Console 隨每次 stats 推送、且背景進行中前端每 4 秒輪詢一次 `/api/status`，標題列會顯示「🗜️ 背景壓縮中」。同一時間只允許一個背景壓縮；硬水位遇到背景進行中會先等它完成。**前提（實測）**：摘要要真的與主對話同時推論，需要 Ollama 為模型配置 2 個以上 slot，**或**摘要模型與主模型不同（不同模型是不同 runner 程序，天然平行）。本機 `OLLAMA_NUM_PARALLEL=2`，但 Ollama 0.34 的新引擎對多模態模型（gemma4）強制單 slot：`/api/ps` 的 `context_length` 只有一份 `num_ctx`，並發送出一長一短兩個請求時，單獨只要 0.1 秒的短請求要等 3 秒的長請求結束才回來。因此**同模型**開 `/parallel_cal on`，背景摘要期間你的下一次對話會在 Ollama 內排隊，等待只是搬到下一次呼叫（UI 上 done 仍立即送出、通知照常到達、不會遺失訊息）。搭配 `AGENT_SUMMARY_MODEL` 指定另一個模型才有真正的平行：實測 `gemma4:26b` 生成長文期間，`gemma4:e4b` 的短請求 0.2 秒回來、不受影響；代價是第二個模型的記憶體與算力分攤（每多一個 slot 也多一份 `num_ctx` 的 KV cache）。API 查不到 slot 數，程式無法自動判斷，算力弱的設備建議維持關閉（序列處理：回合結束後同步壓完再等待輸入，答案仍然是先送出的）。
 
@@ -70,18 +74,18 @@ Web Console 另外加了 `MAX_AUTO_ITERATIONS = 25`：Auto 模式下連續執行
 ### 1.5 記憶
 
 - **長期記憶**：只有使用者明確要求（「記住這件事」等）才會透過 `modify_memory` 技能寫入，格式固定為 `[問題種類] | [問題描述] | [解決方法或結論]`（規則見 `AGENT.md`）。**兩種目標**：不加參數寫入全域 `Memory.md`，`load_long_term_memory()` 每輪把最近 30 行放進系統提示詞常駐；加 `--skill <技能名稱>` 則寫入 `skills_system/memory/<技能名稱>.md`，只在該技能規格文件被 `EXECUTE` 載入時，由 `_load_skill_doc()` 自動附在規格文件後面（「# 經驗記憶」區塊）一併進入上下文，平常不佔任何 token——跟規格文件同一套按需載入。判斷規則寫在 `AGENT.md` 的記憶寫入協議：關於某個技能的用法、參數、前置條件、曾發生的錯誤就綁技能；通用原則、技能之間的取捨、溝通風格、專案經驗寫全域。腳本會拒絕不存在的技能名稱與 `--skill modify_memory`（工具本身不是記憶主題，小模型常這樣誤填）、略過重複內容，全域寫入的內容若點名了單一技能會附上「下次可用 `--skill`」的提示（已寫入、不需重寫），單一技能條目超過 10 則或約 800 字時附上整併提醒。`modify_memory_cmd.py` 內的檔案路徑是根據腳本自身位置推算的絕對路徑，**不受 `current_cwd` 影響**——早期版本用相對路徑，若 AI 當下的虛擬工作目錄剛好在別的專案，會把記憶寫到那個專案底下，已修正。
-- **壓縮歷史**（`logs/summary_*.md`）：每次壓縮寫一個檔供稽核，但 `get_system_prompt()` 只注入記憶體中最新一份融合摘要（`rolling_summary`，啟動時從最新的檔案載入），詳見 1.3 的「滾動融合摘要」。
+- **壓縮歷史**（`logs/summary_*.md` + 同名 `.json`）：每次壓縮寫一組檔供稽核與日後反思，只保留最近 30 份（`SUMMARY_ARCHIVE_KEEP`），`get_system_prompt()` 只注入記憶體中最新一份融合摘要（`rolling_summary`，啟動時從最新的檔案載入），詳見 1.3 的「滾動融合摘要」。
 - **Sticky Objective**：使用者可設定一個最高優先任務，會持續出現在系統提示詞裡提醒模型，直到被清除。
 
 ### 1.6 Plan 模式：先規劃、經使用者核准才執行
 
-CLI 與 Web Console 都支援 `/plan on|off`（狀態各自是 `main()` 的區域變數 / `state["plan_mode"]`）。開啟後，輸入新任務不會直接進入執行迴圈，而是：
+CLI 與 Web Console 都支援 `/plan on|off`（狀態各自是 `main()` 的區域變數 / `state["plan_mode"]`）。開啟後，**下一個**新任務不會直接進入執行迴圈，而是：
 
-1. `SkillAgent.build_plan_request()` 把任務包裝成「請依 `SKILLS.md` 規劃步驟、這輪不要輸出 `EXECUTE:`」的請求，模型本來就看得到技能索引，不需要額外注入。
+1. `SkillAgent.build_plan_request()` 把任務包裝成「請依 `SKILLS.md` 規劃步驟、這輪不要輸出 `EXECUTE:`」的請求（以 `[PLAN_REQUEST]` 標記開頭，修改意見為 `[PLAN_REVISION]`，讓主模型與摘要模型知道這是框架訊息而不是使用者說的話），模型本來就看得到技能索引，不需要額外注入。
 2. 模型回傳條列式步驟計畫，顯示給使用者，並詢問「y＝核准 / n＝取消 / 其他文字＝修改意見重新規劃」（CLI 用 `input()` 迴圈 `_run_plan_flow()`；Web Console 用 `plan_pending` 狀態拆成非同步的 `start_plan_flow()` / `handle_plan_response()`，畫面上是一條「📝 有計畫待你核准」提示列 + 核准／取消按鈕，也可以直接在輸入框打字送出修改意見）。
 3. **安全設計**：規劃階段從頭到尾不會呼叫 `agent.run_tool()`——確認關卡是「這段程式碼路徑根本不執行工具」保證的，不是單純告訴模型「先別執行」。就算 `gemma4:e4b` 不聽話在計畫裡夾帶了 `EXECUTE:`，也不會被執行。
-4. 核准後，計畫文字會存進 `self.current_plan`，並跟 Sticky Objective 用同一種模式：由 `_build_plan_context_prompt()` 注入 `get_system_prompt()`，**每次組系統提示詞都會重新塞入**，因此不會被 1.3 節提到的滑動視窗或壓縮摘要沖掉，整個多步驟任務執行期間都能持續提醒模型「依計畫逐步執行」。
-5. 系統不會自動判斷「所有步驟都做完了」而清除計畫（對 `gemma4:e4b` 這種小模型的自我判斷能力不夠信任），需要使用者在任務結束後手動輸入 `/plan done` 清除；`/clear`（`reset_conversation()`）也會一併清空 `current_plan`，避免舊計畫殘留干擾下一個任務。
+4. 核准後，計畫文字會存進 `self.current_plan`，並跟 Sticky Objective 用同一種模式：由 `_build_plan_context_prompt()` 注入 `get_system_prompt()`，**每次組系統提示詞都會重新塞入**，因此不會被 1.3 節提到的滑動視窗或壓縮摘要沖掉，整個多步驟任務執行期間都能持續提醒模型「依計畫逐步執行」。**核准的同時自動退出 Plan 模式**（`plan_mode` 關閉）：Plan 模式的意義是「下一個新任務先規劃」，規劃階段到核准為止；取消（n）或送修改意見則維持 Plan 模式，方便重新描述任務再規劃。舊版核准後仍停留在 Plan 模式，之後每個新任務都會再被要求規劃一次，看起來像卡在這個模式，已修正。
+5. **計畫的生命週期 = 核准後那個任務的執行期間**：期間所有工具決策（manual／hybrid 的 y/n）、auto 迴圈、自動壓縮都不會清掉它；使用者**送出下一個新任務**（打字送出的新訊息，不含 slash 指令、計畫回應、工具決策）時由 `clear_plan_for_new_task()`（Web）／`main()` 開頭（CLI）自動清除，並顯示「🧹 上一個已核准的計畫已隨新任務自動清除」。要提早清除可 `/plan done`；`/clear`（`reset_conversation()`）也會一併清空。系統仍然不靠模型自己判斷「所有步驟都做完了」（對 `gemma4:e4b` 這種小模型的自我判斷不夠信任），而是用「新任務送出」這個確定的事件當邊界。取捨：若 AI 在計畫中途停下來問你問題、你打字回答，這句回答也會被視為新任務而清掉計畫——AI 仍能從對話歷史看到計畫內容，只是少了系統提示詞的持續提醒；相較之下舊版要求手動 `/plan done`，實際使用時容易忘記，舊計畫會殘留在系統提示詞干擾之後的每個任務。
 
 ### 1.7 多模態影像：`vision/` library 與 📷 附圖
 
@@ -93,7 +97,7 @@ CLI 與 Web Console 都支援 `/plan on|off`（狀態各自是 `main()` 的區�
 - `vision/session.py`：`VisionSession`，Web Console 與 sniper 共用的「螢幕選單 → 擷取 → 框選裁切 → 影像清單」工作階段。
 - `vision/web/`：前端共用的框選覆蓋層與螢幕選單（`snip.js` / `snip.css`），兩個頁面都以 `/static/vision/...` 載入。
 
-**附圖如何進入主對話**：採「獨立視覺 sub-session」，而不是把影像直接塞進主對話的 messages。使用者送出帶影像的訊息時，後端先把影像 + 使用者訊息交給 `analyze()`（system prompt 要求它直接回答問題，並逐字抄錄影像中與問題相關的文字、數值、錯誤訊息），得到的文字以 `[vision result]` 區塊附在使用者訊息後面，再進入原本的 `run_turn()`（plan 模式則進入規劃）。主對話因此永遠是純文字，`compress_context_to_file`、`count_tokens`、`_truncate_memory` 都不需要知道影像的存在；代價是主 Agent 看到的是描述而非原圖，追問時需重新附圖。這跟 1.3 節的獨立摘要 session 是同一種設計。視覺分析結果不套用 `TOOL_RESULT_TOKEN_THRESHOLD` 的精簡（它是影像唯一的文字表示），sub-session 的 system prompt 要求一般控制在 300 字以內，超過門檻時右欄卡片會標 ⚠️ 待確認。影像只在送出一次新任務時消費，slash 指令與 plan 的核准／修改意見不會用掉附件。
+**附圖如何進入主對話**：採「獨立視覺 sub-session」，而不是把影像直接塞進主對話的 messages。使用者送出帶影像的訊息時，後端先把影像 + 使用者訊息交給 `analyze()`（system prompt 要求它直接回答問題，並逐字抄錄影像中與問題相關的文字、數值、錯誤訊息），得到的文字以 `[vision result]` 區塊附在使用者訊息後面，再進入原本的 `run_turn()`（plan 模式則進入規劃）。主對話因此永遠是純文字，`compress_context_to_file`、`count_tokens`、`_truncate_memory` 都不需要知道影像的存在；代價是主 Agent 看到的是描述而非原圖，追問時需重新附圖。這段區塊以 user 角色進入對話，模型容易講成「你提供的視覺分析」；現在區塊開頭明確標示【系統影像分析】並說明使用者只提供了影像，`AGENT.md` 的「Harness Messages」也列出所有框架插入的標記，要求模型稱之為「影像分析結果」。這跟 1.3 節的獨立摘要 session 是同一種設計。視覺分析結果不套用 `TOOL_RESULT_TOKEN_THRESHOLD` 的精簡（它是影像唯一的文字表示），sub-session 的 system prompt 要求一般控制在 300 字以內，超過門檻時右欄卡片會標 ⚠️ 待確認。影像只在送出一次新任務時消費，slash 指令與 plan 的核准／修改意見不會用掉附件。
 
 **新增影像來源**：只要能產出 `PIL.Image` 或檔案路徑，呼叫 `vision.analyze([img], prompt)` 即可；要讓 Agent 自己使用，比照 `scripts/image_inspect_cmd.py` 寫一支腳本並登錄到 `SKILLS.md`。
 
@@ -107,7 +111,7 @@ AI_agent_harness/
 ├── web_console.py           # Web 版介面，重用 Agent_Runner 的邏輯，不重複定義規則
 ├── AGENT.md                 # 系統提示詞主體：角色設定、EXECUTE 協議、安全原則、記憶協議
 ├── Memory.md                # 全域長期記憶（modify_memory 不加 --skill 時寫入，每輪常駐）
-├── logs/                    # 壓縮歸檔：每次融合摘要一個檔；system prompt 只載入最新一份
+├── logs/                    # 壓縮歸檔（.md + .json），只留最近 30 份；system prompt 只載入最新一份；已 .gitignore
 ├── skills_system/
 │   ├── SKILLS.md             # 技能輕量索引
 │   ├── tools/<name>.md       # 各技能的 OKF 規格文件（按需載入）
@@ -150,7 +154,9 @@ python3 web_console.py
 | `WEB_CONSOLE_MODEL` | `gemma4:e4b` | 使用的 Ollama 模型 |
 | `WEB_CONSOLE_HOST` | `127.0.0.1` | 綁定位址，設 `0.0.0.0` 可開放區網存取 |
 | `WEB_CONSOLE_PORT` | `8765` | 監聽埠 |
-| `AGENT_NUM_CTX` | `12288` | Ollama context 上限，各水位都是它的比例（1.3 節；CLI 亦適用） |
+| `AGENT_NUM_CTX` | `32768` | Ollama context 上限，各水位都是它的比例（1.3 節；CLI 亦適用） |
+| `AGENT_HARD_RATIO` / `AGENT_SOFT_RATIO` | `0.75` / `0.60` | 硬／軟水位佔 `NUM_CTX` 的比例（1.3 節；CLI 亦適用） |
+| `AGENT_SUMMARY_KEEP` | `30` | `logs/` 保留的摘要歸檔份數（1.3 節；CLI 亦適用） |
 | `AGENT_SUMMARY_MODEL` | 同主模型 | 壓縮摘要／工具摘要用的模型（1.3 節；CLI 亦適用） |
 | `AGENT_PARALLEL_CAL` | 未設定＝關閉 | `/parallel_cal` 的啟動預設值（1.3 節；CLI 亦適用） |
 
@@ -214,7 +220,7 @@ python3 web_console.py
 
 ### 5.7 讓 `Memory.md` 的修正「內化」進規格書與 Plan 模式提示詞後即可刪除
 
-> **～技能部分已實作～**：`modify_memory` 現在支援 `--skill <技能名稱>`，把記憶寫進 `skills_system/memory/<技能名稱>.md`，載入該技能規格時由 `_load_skill_doc()` 自動附在後面（見 1.5）。實作上沒有直接改寫 `tools/<name>.md`，而是用獨立的 memory 檔：手寫的規格書維持精簡（200 tokens 預算）且不會被機器附加的內容弄亂，條目可以個別檢視、編輯、刪除，對模型而言載入的結果仍是「規格 + 經驗」一份完整文字。原本 `Memory.md` 裡三則明顯屬於特定技能的條目（view_file 查看前先確認、view_file／search_text 前先 change_dir、stt_engine 缺 faster-whisper）已搬過去並自 `Memory.md` 刪除，其餘屬於通用原則的條目維持全域常駐。**尚未做**：下面提到的第二種目標（Plan 模式規劃原則內化進 `build_plan_request()`），以及定期把全域條目重新分類、整併的機制。
+> **～技能部分已實作～**：`modify_memory` 現在支援 `--skill <技能名稱>`，把記憶寫進 `skills_system/memory/<技能名稱>.md`，載入該技能規格時由 `_load_skill_doc()` 自動附在後面（見 1.5）。實作上沒有直接改寫 `tools/<name>.md`，而是用獨立的 memory 檔：手寫的規格書維持精簡（200 tokens 預算）且不會被機器附加的內容弄亂，條目可以個別檢視、編輯、刪除，對模型而言載入的結果仍是「規格 + 經驗」一份完整文字。原本 `Memory.md` 裡三則明顯屬於特定技能的條目（view_file 查看前先確認、view_file／search_text 前先 change_dir、stt_engine 缺 faster-whisper）已搬過去並自 `Memory.md` 刪除，其餘屬於通用原則的條目維持全域常駐。**尚未做**：下面提到的第二種目標（Plan 模式規劃原則內化進 `build_plan_request()`），以及定期把全域條目重新分類、整併的機制。後者的語料已經備好：`logs/summary_*.json` 裡的 `results_and_errors`／`user_preferences`／`open_items` 欄位，反思機制可以定期讀最近幾份，提議寫進全域或 `--skill` 綁定的記憶。
 
 
 目前 `Memory.md` 用來記錄模型曾經犯過的錯誤、使用者要求的行為修正（例如「查看檔案前要先確認」），確實有效避免重蹈覆轍，但 `load_long_term_memory()` 每一輪都會把最近 30 行塞進系統提示詞——這是一個只會越長越大、永遠佔用上下文的清單，跟 1.2 節「按需載入」的設計精神相反（技能規格書只在被用到時才載入，但 `Memory.md` 是不管用不用得到都全部常駐）。未來可以設計一個機制（可以是定期執行，也可以是手動觸發的一個新技能）：
