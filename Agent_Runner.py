@@ -1,15 +1,20 @@
 import os
 import sys
+import json
 import subprocess
+import threading
 import ollama  # 導入官方庫
 import shlex
 import time
 
 class SkillAgent:
-    def __init__(self, model="gemma4:e4b", max_history=None):
+    def __init__(self, model="gemma4:e4b", max_history=None, summary_model=None):
         # max_history：訊息「則數」滑動視窗，預設停用（None）。上下文大小統一以 token 門檻
         # （TOKEN_THRESHOLD）觸發壓縮歸檔；這個參數只保留作為極端情境的保險絲，需要時再開。
+        # summary_model：壓縮摘要與工具摘要這兩種獨立 session 用的模型，預設與主模型相同；
+        # 可用環境變數 AGENT_SUMMARY_MODEL 指定（見檔尾 SUMMARY_MODEL 說明）。
         self.model = model
+        self.summary_model = summary_model or SUMMARY_MODEL or model
         self.script_dir = os.path.dirname(os.path.abspath(__file__))
         self.base_path = os.path.join(self.script_dir, "skills_system")
         self.index_file = os.path.join(self.base_path, "SKILLS.md")
@@ -63,6 +68,20 @@ class SkillAgent:
         # =========================
         self.current_task = None
 
+        # =========================
+        # 🗜️ 滾動摘要與背景壓縮（雙水位線，見檔尾 SOFT_TOKEN_THRESHOLD / KEEP_RECENT_TOKENS 說明）
+        # rolling_summary：最新一份「融合摘要」，get_system_prompt 每次注入；每次壓縮都是
+        #   「上一份摘要 + 這次要壓的訊息 → 新的一份」，system prompt 只帶一份而不是最近 5 個檔案。
+        #   啟動時從 logs/ 最新的 summary_*.md 載入，作為跨 session 的延續。
+        # messages_lock：保護 self.messages 的快照與整批替換（背景壓縮執行緒會用到）。
+        # =========================
+        self.rolling_summary = self._load_latest_summary()
+        self.messages_lock = threading.RLock()
+        self._compress_thread = None          # 進行中的背景壓縮執行緒（/parallel_cal on 時才會有）
+        self._compress_state_lock = threading.Lock()
+        self._notices = []                    # 背景壓縮完成／失敗的通知，下一次互動時顯示
+        self.last_compression = None          # 最近一次壓縮的統計（檔名、則數、摘要 token 數）
+
     def count_tokens(self, text: str) -> int:
         """估算一段文字的 token 數（真實 token 尺度）。
 
@@ -102,13 +121,18 @@ class SkillAgent:
 
     count_context_tokens = context_tokens  # 舊名稱相容
 
-    def _record_usage(self, response):
+    def _record_usage(self, response, sent_messages=None):
         """用 Ollama 回應的精確計量更新校準與狀態：
-        prompt_eval_count = 這次送出的完整 prompt token 數，eval_count = 這次產生的 token 數。"""
+        prompt_eval_count = 這次送出的完整 prompt token 數，eval_count = 這次產生的 token 數。
+        sent_messages 是這次實際送出的訊息快照；背景壓縮可能在呼叫期間改動 self.messages，
+        校準比必須用「真正送出的那份」的字元數來算。"""
         get = getattr(response, "get", None)
         prompt_tokens = get('prompt_eval_count') if get else None
         eval_tokens = get('eval_count') if get else None
-        chars = self._messages_chars()
+        if sent_messages is not None:
+            chars = sum(len(m['content']) for m in sent_messages)
+        else:
+            chars = self._messages_chars()
         if prompt_tokens and chars:
             self.last_prompt_tokens = int(prompt_tokens)
             self.last_prompt_chars = chars
@@ -121,76 +145,287 @@ class SkillAgent:
         """最近一次 ask_ai 產生內容的 token 數：優先用 Ollama 回報的 eval_count（精確），沒有才估算。"""
         return self.last_eval_tokens if self.last_eval_tokens is not None else self.count_tokens(text)
 
-    def compress_context_to_file(self, num_to_keep=2):
-        history_to_compress = self.messages[1:]
-        # 如果對話不足以壓縮，則直接返回
-        if len(history_to_compress) <= num_to_keep:
-            return
-        # 切分：前面是要壓縮的，後面是保留的
-        to_compress = history_to_compress[:-num_to_keep]
-        to_keep = history_to_compress[-num_to_keep:]
-        print(f"\n⏳ 正在壓縮 {len(to_compress)} 筆舊對話...")
-        print("\n⏳ 正在壓縮上下文並歸檔...")
+    # ------------------------------------------------------------------
+    # 🗜️ 上下文壓縮：雙水位線 + 滾動融合摘要（同步與背景兩種執行方式）
+    # ------------------------------------------------------------------
+    def _is_tool_result_message(self, m):
+        """使用者角色但內容其實是工具回傳（[tool result] / 【系統執行結果】）。
+        這種訊息要跟前一則 assistant 的 EXECUTE 綁在一起，壓縮切點不能落在兩者之間。"""
+        return m['role'] == 'user' and m['content'].lstrip().startswith(TOOL_RESULT_PREFIXES)
 
-        # 1. 系統提示詞：定義「身分」與「嚴格的輸出格式規則」
-        system_prompt = f"""你是一位專業的系統分析師。
-你的任務是將對話內容總結為結構化的 Markdown 報告。
-你必須嚴格遵守以下範本格式進行輸出，不得隨意增刪標題：
+    def _split_for_compression(self, keep_tokens=None, num_to_keep=None):
+        """把 self.messages[1:] 切成 (to_compress, to_keep)。
 
-# Summary at {time.strftime('%Y-%m-%d_%H-%M-%S')}
-這是一個 [簡短概述對話內容] 的流程對話。以下是報告：
+        low watermark 以 token 計：從最新的訊息往回累加，保留總量不超過 keep_tokens
+        （預設 KEEP_RECENT_TOKENS）的原文，在訊息邊界切；至少保留最新一則（即使它自己就超過
+        預算，最新的訊息不能丟）。若保留區最舊的一則是工具回傳，連同它前面那則 assistant 的
+        EXECUTE 一起保留，不把一組「指令／結果」拆成兩半。
+        num_to_keep 是舊版「保留最新 N 則」的相容介面，兩者擇一。"""
+        history = self.messages[1:]
+        if num_to_keep is not None:
+            n = max(0, min(num_to_keep, len(history)))
+            return history[:len(history) - n], history[len(history) - n:]
 
----
-### 💻 總體情境概述
-[總結使用者目標與系統行為，描述當前情境]
+        budget = KEEP_RECENT_TOKENS if keep_tokens is None else keep_tokens
+        cut = len(history)  # to_keep = history[cut:]
+        used = 0
+        for i in range(len(history) - 1, -1, -1):
+            t = self.count_tokens(history[i]['content'])
+            if used + t > budget and cut < len(history):
+                break
+            used += t
+            cut = i
+        if 0 < cut < len(history) and self._is_tool_result_message(history[cut]) \
+                and history[cut - 1]['role'] == 'assistant':
+            cut -= 1
+        return history[:cut], history[cut:]
 
-### 📝 關鍵進度與目標（Key Progress）
-1. [目標操作]
-2. [目標路徑/相關參數]
-3. [系統執行過的行動]
-4. [下一步建議或當前狀態]
+    @staticmethod
+    def _render_messages_for_summary(msgs):
+        """渲染成給摘要模型看的純文字：[user]／[assistant] 標頭 + 原文。
+        舊版直接把 list 的 repr 塞進 prompt，夾帶 {'role': ...} 與 \\n 轉義，浪費 token 又難讀。"""
+        return "\n\n".join(f"[{m['role']}]\n{m['content'].strip()}" for m in msgs)
 
-### ❌ 執行結果與錯誤（Execution Result & Errors）
-| 類別 | 內容描述 | 具體錯誤訊息/結果 |
-| :--- | :--- | :--- |
-| [類別] | [描述] | [訊息/結果] |
-"""
+    def _summary_prompts(self, to_compress):
+        prev = self.rolling_summary or "（沒有，這是第一次壓縮）"
+        system_prompt = f"""你是一位專業的系統分析師，負責維護一份「對話滾動摘要」，交給另一個負責決策的 AI 接續工作用（它看不到原始對話，只看得到你的摘要）。
+你會收到「上一份摘要」與「這次要併入的新對話片段」，請輸出一份更新後的完整摘要來取代上一份。
 
-        # 2. 使用者提示詞：只包含要處理的「具體數據」
-        user_prompt = f"""以下是需要總結的對話內容：
-{to_compress}
-"""
-        # 使用 Ollama 進行摘要
-        res = ollama.chat(model=self.model, 
-                        messages=[
-                            {'role': 'system', 'content': system_prompt},
-                            {'role': 'user', 'content': user_prompt},],
-                        options={'temperature': 0.2, 'num_ctx': NUM_CTX},
-                        think=False
+規則：
+1. 融合：延續上一份摘要的內容，並依新片段更新（進度推進、問題已解決、目標變更）。
+2. 淘汰：已解決、已過時、與目前任務無關的細節可以刪除；但使用者明確表達的偏好、限制、指示一律保留。
+3. 具體：保留具體的路徑、容器／節點／topic 名稱、參數、數值、錯誤訊息，這些是接續工作最需要的資訊。
+4. 精簡：全部文字合計控制在 {SUMMARY_MAX_CHARS} 字以內，寧可刪掉舊細節也不要超過；overview 不超過 120 字，每個條列項目不超過 60 字，不要把工具輸出（例如 topic 清單）整段照抄。
+5. 只輸出 JSON，欄位：overview（總體情境概述，一段話）、key_progress（關鍵進度與目標，條列）、
+   results_and_errors（執行結果與錯誤，每項含 category／description／detail）、
+   user_preferences（使用者偏好與約束）、open_items（未完成事項與下一步）。沒有內容的欄位給空陣列。
+6. 使用繁體中文。"""
+        user_prompt = (
+            f"【上一份摘要】\n{prev}\n\n"
+            f"【這次要併入的新對話片段（共 {len(to_compress)} 則）】\n"
+            f"{self._render_messages_for_summary(to_compress)}"
         )
-        summary_content = res['message']['content']
-        # 🔥 關鍵：重置對話時，保留 System Prompt + 我們想保留的最新對話
-        self.messages = [self.messages[0]] + to_keep
-        print(f"💾 [系統] 歷史已壓縮並存入。已保留最新的 {num_to_keep} 筆對話。")
+        return system_prompt, user_prompt
 
-        # 確保 logs 目錄存在
+    @staticmethod
+    def _render_summary_markdown(data):
+        """把摘要模型回傳的 JSON（SUMMARY_SCHEMA）排版成固定結構的 Markdown。
+        結構由程式保證，而不是靠模型自己遵守範本。"""
+        if not isinstance(data, dict):
+            raise TypeError("summary JSON 不是物件")
+
+        def items(key):
+            v = data.get(key) or []
+            if not isinstance(v, list):
+                v = [v]
+            return [str(x).strip() for x in v if str(x).strip()]
+
+        out = ["### 💻 總體情境概述", str(data.get("overview", "")).strip() or "（無）"]
+        progress = items("key_progress")
+        if progress:
+            out += ["", "### 📝 關鍵進度與目標"] + [f"{i}. {x}" for i, x in enumerate(progress, 1)]
+        rows = data.get("results_and_errors") or []
+        if isinstance(rows, list) and rows:
+            out += ["", "### ❌ 執行結果與錯誤", "| 類別 | 內容描述 | 具體錯誤訊息/結果 |", "| :--- | :--- | :--- |"]
+            for r in rows:
+                if isinstance(r, dict):
+                    cells = [str(r.get(k, "")) for k in ("category", "description", "detail")]
+                else:
+                    cells = ["", str(r), ""]
+                cells = [c.replace("|", "\\|").replace("\n", " ").strip() for c in cells]
+                out.append("| " + " | ".join(cells) + " |")
+        prefs = items("user_preferences")
+        if prefs:
+            out += ["", "### 👤 使用者偏好與約束"] + [f"- {x}" for x in prefs]
+        open_items = items("open_items")
+        if open_items:
+            out += ["", "### ⏭️ 未完成事項與下一步"] + [f"- {x}" for x in open_items]
+        return "\n".join(out).strip()
+
+    def summarize_messages(self, to_compress):
+        """呼叫摘要模型，把「上一份滾動摘要 + to_compress」融合成新的一份摘要（Markdown）。
+        不接觸 self.messages，可以在背景執行緒呼叫。回傳 (markdown, meta)。
+        以 Ollama 的 format=JSON schema 強制結構化輸出；模型仍沒給合法 JSON 時退回原文，
+        總比丟掉整段歷史好。"""
+        system_prompt, user_prompt = self._summary_prompts(to_compress)
+        res = ollama.chat(
+            model=self.summary_model,
+            messages=[
+                {'role': 'system', 'content': system_prompt},
+                {'role': 'user', 'content': user_prompt},
+            ],
+            format=SUMMARY_SCHEMA,
+            options={'temperature': 0.2, 'num_ctx': NUM_CTX, 'num_predict': SUMMARY_MAX_PREDICT},
+            think=False,
+        )
+        raw = res['message']['content'].strip()
+        structured = True
+        try:
+            markdown = self._render_summary_markdown(json.loads(raw))
+        except (ValueError, TypeError):
+            structured = False
+            markdown = raw
+        get = getattr(res, "get", None)
+        meta = {
+            'structured': structured,
+            'eval_count': get('eval_count') if get else None,
+            'prompt_eval_count': get('prompt_eval_count') if get else None,
+        }
+        return markdown, meta
+
+    def _archive_summary(self, markdown, n_messages, meta):
+        """把新的融合摘要寫成 logs/summary_<ts>.md。這是歷史稽核用的存檔：system prompt
+        只注入最新一份（rolling_summary），舊檔不再被載入。"""
         log_dir = os.path.join(self.script_dir, "logs")
         os.makedirs(log_dir, exist_ok=True)
-        
-        # 寫入獨立檔案
         timestamp = time.strftime('%Y-%m-%d_%H-%M-%S')
         file_path = os.path.join(log_dir, f"summary_{timestamp}.md")
+        suffix = 1
+        while os.path.exists(file_path):  # 同一秒內連續壓縮時不覆蓋
+            file_path = os.path.join(log_dir, f"summary_{timestamp}_{suffix}.md")
+            suffix += 1
+        header = (
+            f"# Summary at {timestamp}"
+            f"（融合上一份摘要 + {n_messages} 則訊息；model {self.summary_model}；"
+            f"structured={meta.get('structured')}）"
+        )
         with open(file_path, "w", encoding="utf-8") as f:
-            f.write(f"# Summary at {timestamp}\n\n{summary_content}")
+            f.write(f"{header}\n\n{markdown}\n")
+        return file_path
 
-        # 只刷新 system prompt，讓剛寫入的摘要檔透過 load_recent_summary_logs 進入上下文；
-        # 保留 to_keep、current_plan、current_task。舊版這裡呼叫 reset_conversation()，
-        # 會把號稱保留的最新幾筆對話、以及進行中的計畫與任務敘述一起清掉。
-        self.messages[0] = {'role': 'system', 'content': self.get_system_prompt()}
-        # Ollama 上次回報的精確 prompt 大小已失效，改用校準比估算直到下一次呼叫
-        self.last_prompt_tokens = None
-        self.last_prompt_chars = None
-        print(f"💾 [系統] 歷史已壓縮並存入: {os.path.basename(file_path)}")
+    def _load_latest_summary(self):
+        """啟動時載入 logs/ 裡最新一份摘要的內文（去掉標頭行），作為跨 session 延續的滾動摘要。"""
+        log_dir = os.path.join(self.script_dir, "logs")
+        if not os.path.isdir(log_dir):
+            return None
+        files = sorted(f for f in os.listdir(log_dir) if f.startswith("summary_") and f.endswith(".md"))
+        if not files:
+            return None
+        try:
+            with open(os.path.join(log_dir, files[-1]), "r", encoding="utf-8") as f:
+                lines = f.read().splitlines()
+        except OSError:
+            return None
+        # 舊版檔案的內文開頭還會有模型自己寫的第二個 "# Summary at" 標頭，一起去掉
+        while lines and (lines[0].startswith("# Summary at") or not lines[0].strip()):
+            lines.pop(0)
+        body = "\n".join(lines).strip()
+        return body or None
+
+    def _apply_compression(self, compressed, markdown, meta):
+        """把摘要結果套用到主對話。以「物件身分」把 compressed 那幾則從 self.messages 原地移除
+        （不重綁 list、不靠索引），所以背景壓縮期間主執行緒新 append 的訊息不會遺失；
+        然後更新滾動摘要、歸檔、刷新 system prompt。"""
+        file_path = self._archive_summary(markdown, len(compressed), meta)
+        ids = {id(m) for m in compressed}
+        with self.messages_lock:
+            self.rolling_summary = markdown
+            for i in range(len(self.messages) - 1, 0, -1):
+                if id(self.messages[i]) in ids:
+                    del self.messages[i]
+            # 只刷新 system prompt 讓新摘要進入上下文；保留 to_keep、current_plan、current_task、
+            # sticky_objective（更早的版本這裡誤呼叫 reset_conversation() 把它們全清掉）。
+            if self.messages and self.messages[0]['role'] == 'system':
+                self.messages[0] = {'role': 'system', 'content': self.get_system_prompt()}
+            # Ollama 上次回報的精確 prompt 大小已失效，改用校準比估算直到下一次呼叫
+            self.last_prompt_tokens = None
+            self.last_prompt_chars = None
+            self.last_compression = {
+                'file': file_path,
+                'messages': len(compressed),
+                'summary_tokens': self.count_tokens(markdown),
+                'structured': meta.get('structured'),
+                'time': time.time(),
+            }
+
+    def compress_context_to_file(self, num_to_keep=None, keep_tokens=None):
+        """同步壓縮（呼叫端等待）：保留區以外的舊訊息與上一份滾動摘要融合成新摘要、歸檔到 logs/，
+        並用摘要取代那些訊息。low watermark 預設以 token 計（KEEP_RECENT_TOKENS，見
+        _split_for_compression）；num_to_keep 是舊版「保留最新 N 則」的相容參數。
+        若有背景壓縮正在進行會先等它完成再切分，不會同時跑兩份摘要。
+        回傳 True 代表真的壓縮了；False 代表沒有可壓的內容。"""
+        self.wait_for_background_compression()
+        with self.messages_lock:
+            to_compress, to_keep = self._split_for_compression(keep_tokens=keep_tokens, num_to_keep=num_to_keep)
+        if not to_compress:
+            return False
+        print(f"\n⏳ 正在壓縮 {len(to_compress)} 則舊對話（保留最新 {len(to_keep)} 則原文）...")
+        markdown, meta = self.summarize_messages(to_compress)
+        self._apply_compression(to_compress, markdown, meta)
+        print(f"💾 [系統] 歷史已壓縮並存入: {os.path.basename(self.last_compression['file'])}")
+        return True
+
+    def has_compressible_history(self, keep_tokens=None):
+        """保留區以外是否還有可壓的舊訊息。上下文超過水位但全部訊息都在保留預算內時（例如
+        system prompt 本身就很大），壓縮什麼都做不了，呼叫端可據此不必宣告「壓縮中」。"""
+        with self.messages_lock:
+            return bool(self._split_for_compression(keep_tokens=keep_tokens)[0])
+
+    def compression_in_progress(self):
+        t = self._compress_thread
+        return bool(t and t.is_alive())
+
+    def wait_for_background_compression(self, timeout=None):
+        """若有背景壓縮進行中就等它結束。硬水位觸發同步壓縮前一定先呼叫，避免兩份摘要重疊。"""
+        t = self._compress_thread
+        if t and t.is_alive() and t is not threading.current_thread():
+            t.join(timeout)
+
+    def start_background_compression(self, keep_tokens=None):
+        """/parallel_cal on：在背景執行緒做壓縮，主對話不等待。
+        流程：快照要壓的訊息 → 呼叫摘要模型（不持有任何鎖）→ 完成後以物件身分原地替換。
+        同一時間只允許一個背景壓縮；回傳 True 代表已啟動。
+        注意：只有 Ollama 真的為這個模型配置 2 個以上 slot、或摘要模型與主模型不同（不同模型是
+        不同 runner 程序，天然平行）時，摘要才會跟主對話同時推論。實測 Ollama 0.34 的新引擎對多模態
+        模型（gemma4）強制單 slot，OLLAMA_NUM_PARALLEL=2 也一樣；此時同模型的背景摘要會讓下一次
+        主對話在 Ollama 內排隊，等待只是搬到下一次呼叫（訊息不會遺失、通知照常到達）。要真的平行
+        請用 AGENT_SUMMARY_MODEL 指定另一個模型。"""
+        with self._compress_state_lock:
+            if self.compression_in_progress():
+                return False
+            with self.messages_lock:
+                to_compress, _ = self._split_for_compression(keep_tokens=keep_tokens)
+            if not to_compress:
+                return False
+
+            def worker():
+                try:
+                    markdown, meta = self.summarize_messages(to_compress)
+                    self._apply_compression(to_compress, markdown, meta)
+                    info = self.last_compression
+                    self._add_notice(
+                        f"📦 [背景壓縮完成] 已將 {info['messages']} 則舊對話融合成摘要"
+                        f"（約 {info['summary_tokens']} tokens）並歸檔：{os.path.basename(info['file'])}；"
+                        f"目前上下文約 {self.context_tokens()} tokens。"
+                    )
+                except Exception as e:
+                    self._add_notice(f"⚠️ [背景壓縮失敗] {e}；主對話未變動，超過硬水位時會改以同步方式壓縮。")
+
+            self._compress_thread = threading.Thread(target=worker, name="context-compress", daemon=True)
+            self._compress_thread.start()
+            return True
+
+    def _add_notice(self, text):
+        with self._compress_state_lock:
+            self._notices.append(text)
+
+    def pop_notices(self):
+        """取出並清空背景壓縮的通知（CLI 在下一次輸入後印出；Web Console 在下一個請求或狀態輪詢時推送）。"""
+        with self._compress_state_lock:
+            out, self._notices = self._notices, []
+        return out
+
+    def ensure_context_budget(self):
+        """硬水位：上下文超過 TOKEN_THRESHOLD 就一定要在呼叫模型前壓下來，確保壓縮先於
+        Ollama 於 num_ctx 處的靜默截斷。有背景壓縮進行中就先等它（不重複跑），等完仍超標才同步壓縮。
+        回傳 True 代表這次確實有壓縮（同步、或剛等完的背景），供 UI 顯示。"""
+        if self.context_tokens() <= TOKEN_THRESHOLD:
+            return False
+        waited = self.compression_in_progress()
+        self.wait_for_background_compression()
+        if self.context_tokens() <= TOKEN_THRESHOLD:
+            return waited
+        return self.compress_context_to_file()
 
     def summarize_tool_result(self, result, tool_tokens):
         """比照 compress_context_to_file 的作法：開一個獨立、乾淨的一次性
@@ -225,7 +460,7 @@ class SkillAgent:
         )
 
         res = ollama.chat(
-            model=self.model,
+            model=self.summary_model,
             messages=[
                 {'role': 'system', 'content': system_prompt},
                 {'role': 'user', 'content': user_prompt},
@@ -238,23 +473,6 @@ class SkillAgent:
             f"[tool result - AI 摘要]\n{summary}\n\n"
             f"(原始輸出約 {tool_tokens} tokens，完整內容已顯示在剛才的系統回傳訊息中)"
         )
-
-    def load_recent_summary_logs(self, max_files=5):
-        """讀取 logs 目錄下最新的幾個壓縮紀錄檔案，作為 Agent 的近期歷史知識"""
-        log_dir = os.path.join(self.script_dir, "logs")
-        if not os.path.exists(log_dir):
-            return "No history logs found."
-
-        # 取得所有 .md 檔案並依時間排序（新到舊）
-        files = [os.path.join(log_dir, f) for f in os.listdir(log_dir) if f.endswith(".md")]
-        files.sort(reverse=True)
-
-        recent_files = files[:max_files]
-        content = ""
-        for f_path in recent_files:
-            with open(f_path, "r", encoding="utf-8") as f:
-                content += f"\n--- 紀錄檔: {os.path.basename(f_path)} ---\n{f.read()}\n"
-        return content
 
     def load_long_term_memory(self, max_lines=30):
         if not os.path.exists(self.memory_file):
@@ -383,7 +601,7 @@ class SkillAgent:
             skills = f.read()
 
         memory_content = self.load_long_term_memory()
-        history_summary = self.load_recent_summary_logs()
+        history_summary = self.rolling_summary or "No history summary yet."
 
         status_prompt = f"\n\n## Current Agent State\n- CURRENT_WORKING_DIRECTORY: {self.current_cwd}\nCURRENT_CONTAINER_DIRECTORY: {self.container_cwd}"
 
@@ -403,29 +621,35 @@ class SkillAgent:
     def reset_conversation(self):
         self.current_plan = None  # /clear 時一併清掉進行中的計畫，避免舊計畫殘留誤導新任務
         self.current_task = None  # 同上，避免舊任務敘述殘留誤導下一次的摘要 session
-        self.messages = [{'role': 'system', 'content': self.get_system_prompt()}]
+        # 原地替換而不重綁 list：背景壓縮執行緒若正在對舊 list 做原地刪除，不會操作到已被丟棄的物件
+        with self.messages_lock:
+            self.messages[:] = [{'role': 'system', 'content': self.get_system_prompt()}]
 
     def _truncate_memory(self):
         """訊息「則數」滑動視窗，預設停用（max_history=None）。啟用時超過則數會直接丟棄最舊訊息、
         不摘要不歸檔，與 token 觸發的 compress_context_to_file 是不同邏輯，只當保險絲用。"""
         if self.max_history and len(self.messages) > self.max_history + 1:
             print(f"⚠️  [記憶優化] 啟動滑動視窗（保留 {self.max_history} 筆）")
-            self.messages = [self.messages[0]] + self.messages[-self.max_history:]
+            with self.messages_lock:
+                self.messages[:] = [self.messages[0]] + self.messages[-self.max_history:]
 
     def ask_ai(self):
         try:
-            if self.messages and self.messages[0]['role'] == 'system':
-                self.messages[0]['content'] = self.get_system_prompt()
+            with self.messages_lock:
+                if self.messages and self.messages[0]['role'] == 'system':
+                    self.messages[0]['content'] = self.get_system_prompt()
 
             self._truncate_memory()
 
-            # 呼叫前先確認上下文預算：使用者若貼了一大段文字，加入 messages 之後不會先經過
-            # run_turn / main 的壓縮檢查就直接送模型，這裡補上最後一道檢查，確保壓縮一定發生在
-            # Ollama 於 num_ctx 處靜默截斷最舊內容之前。
-            self.auto_compressed = False
-            if self.context_tokens() > TOKEN_THRESHOLD:
-                self.compress_context_to_file(num_to_keep=2)
-                self.auto_compressed = True
+            # 硬水位：呼叫模型前的最後一道檢查（唯一的硬水位檢查點）。使用者貼了一大段文字或工具
+            # 回傳剛加入之後就直接送模型，這裡確保壓縮一定發生在 Ollama 於 num_ctx 處靜默截斷之前。
+            # 軟水位（回合結束後順手壓縮）在 after_turn_compression。
+            self.auto_compressed = self.ensure_context_budget()
+
+            # 送出的是快照：背景壓縮執行緒可能在這次呼叫期間原地修改 self.messages，
+            # 校準（_record_usage）也必須以真正送出的這份為準。
+            with self.messages_lock:
+                snapshot = list(self.messages)
 
             # 關閉 Ollama 的獨立 thinking 模式：此版本 Ollama 會把推理過程放進
             # message.thinking 欄位，而非像舊版把 <thought> 內嵌在 content 裡。
@@ -437,11 +661,11 @@ class SkillAgent:
             # 保留空間給模型輸出與下一則訊息。
             response = ollama.chat(
                 model=self.model,
-                messages=self.messages,
+                messages=snapshot,
                 options={'temperature': 0.2, 'num_ctx': NUM_CTX},
                 think=False
             )
-            self._record_usage(response)
+            self._record_usage(response, snapshot)
 
             raw_content = response['message']['content'].strip()
 
@@ -651,6 +875,61 @@ NUM_CTX = int(os.environ.get("AGENT_NUM_CTX", "12288"))
 # （舊版寫死 8000 且以「字元÷4」計量，換算成真實 token 約 17000，早已超過 num_ctx，壓縮永遠來不及觸發。）
 TOKEN_THRESHOLD = int(NUM_CTX * 0.70)
 
+# 🌊 雙水位線（dual watermark）。硬水位 = 上面的 TOKEN_THRESHOLD（呼叫模型前的最後防線，同步）。
+# 軟水位：回合結束後（最終答案已經送給使用者、模型閒著）若上下文超過此值就順手壓縮，
+# 切點落在任務邊界，不會把一個任務切成兩半，也不擋在下一次回覆前面（見 after_turn_compression）。
+# /parallel_cal on 時改在背景執行緒做（start_background_compression）。
+SOFT_TOKEN_THRESHOLD = int(NUM_CTX * 0.50)
+
+# low watermark：壓縮時保留最新這麼多 token 的原文（在訊息邊界切、不拆開 EXECUTE／tool result
+# 這一組），其餘與上一份滾動摘要融合成新摘要。舊版固定「保留最新 2 則」，兩則可能只有 50 tokens
+# 也可能 1500 tokens，銜接感不穩定。
+KEEP_RECENT_TOKENS = int(NUM_CTX * 0.15)
+
+# 融合摘要的長度目標（字，寫進摘要 prompt）與模型輸出硬上限（token，num_predict），
+# 讓滾動摘要不會越滾越長；輸出被硬上限截斷時 JSON 會解析失敗、退回原文，因此上限要留得夠寬。
+SUMMARY_MAX_CHARS = 600
+SUMMARY_MAX_PREDICT = 2000
+
+# 摘要模型（壓縮摘要與工具摘要兩種獨立 session 共用）。預設 None = 與主模型相同。
+# 可用 AGENT_SUMMARY_MODEL 指定同家族的小模型以減少摘要耗時（例如 gemma3:1b）；但注意：
+# (1) 統一記憶體的機器（Jetson／GB10）上 CPU 卸載省不到記憶體，只省算力；
+# (2) 多載一個模型可能把主模型擠出 Ollama，重載主模型的代價遠高於一次摘要；
+# (3) 摘要會進入之後每一輪的 system prompt，小模型的錯誤會累積。有足夠記憶體再考慮。
+# (4) 反過來說，與主模型不同的摘要模型跑在另一個 runner 程序，/parallel_cal on 的背景摘要才會真的
+#     與主對話同時推論——同一個多模態模型（gemma4）目前被 Ollama 強制單 slot，做不到。
+SUMMARY_MODEL = os.environ.get("AGENT_SUMMARY_MODEL", "").strip() or None
+
+# /parallel_cal 的預設值（CLI 與 Web Console 啟動時的初始狀態），可用 AGENT_PARALLEL_CAL=1 開啟。
+PARALLEL_CAL_DEFAULT = os.environ.get("AGENT_PARALLEL_CAL", "").strip().lower() in ("1", "on", "true", "yes")
+
+# 使用者角色但實為工具回傳的訊息前綴（見 _split_for_compression 的配對規則）
+TOOL_RESULT_PREFIXES = ("[tool result]", "【系統執行結果】")
+
+# 融合摘要的 JSON schema：交給 Ollama 的 format= 做結構化輸出，再由 _render_summary_markdown 排版。
+SUMMARY_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "overview": {"type": "string"},
+        "key_progress": {"type": "array", "items": {"type": "string"}},
+        "results_and_errors": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "category": {"type": "string"},
+                    "description": {"type": "string"},
+                    "detail": {"type": "string"},
+                },
+                "required": ["category", "description", "detail"],
+            },
+        },
+        "user_preferences": {"type": "array", "items": {"type": "string"}},
+        "open_items": {"type": "array", "items": {"type": "string"}},
+    },
+    "required": ["overview", "key_progress", "results_and_errors", "user_preferences", "open_items"],
+}
+
 # 字元→token 校準比的預設值與合理範圍。中文為主的內容實測約 1.8～1.9 字元/token。
 DEFAULT_CHARS_PER_TOKEN = 1.9
 MIN_CHARS_PER_TOKEN, MAX_CHARS_PER_TOKEN = 1.0, 6.0
@@ -707,6 +986,34 @@ def _content_for_context(result, tool_tokens, agent=None, use_summary=False):
         f"未直接加入上下文，以維持推理穩定。"
     )
 
+def after_turn_compression(agent, parallel, notify):
+    """回合結束後的軟水位檢查（CLI 與 Web Console 共用）。
+
+    這個時間點最終答案已經送出、模型閒著，壓縮不會拉長任何一次回覆的等待時間，切點也剛好
+    落在任務邊界。parallel=True（/parallel_cal on）時改在背景執行緒做，主對話可以立刻繼續；
+    否則同步做完再回到等待輸入。notify 是輸出通知的函式（CLI 用 print，Web 推 system 事件）。
+    回傳 None（未觸發）／'sync'／'background'。"""
+    ctx_before = agent.context_tokens()
+    if ctx_before <= SOFT_TOKEN_THRESHOLD or not agent.has_compressible_history():
+        return None
+    if parallel:
+        if agent.start_background_compression():
+            notify(
+                f"🗜️ 回合結束，上下文約 {ctx_before} tokens 超過軟水位 {SOFT_TOKEN_THRESHOLD}，"
+                f"已在背景開始壓縮（/parallel_cal on），完成後會通知。"
+            )
+            return 'background'
+        return None
+    notify(f"🗜️ 回合結束，上下文約 {ctx_before} tokens 超過軟水位 {SOFT_TOKEN_THRESHOLD}，壓縮中...")
+    if agent.compress_context_to_file():
+        info = agent.last_compression
+        notify(
+            f"📦 已將 {info['messages']} 則舊對話融合成摘要（約 {info['summary_tokens']} tokens）並歸檔："
+            f"{os.path.basename(info['file'])}；上下文約 {agent.context_tokens()} tokens。"
+        )
+        return 'sync'
+    return None
+
 def main():
     agent = SkillAgent(
         model="gemma4:e4b",
@@ -716,6 +1023,7 @@ def main():
     auto_mode = False
     hybrid_mode = False  # 👈 新增狀態
     tool_summary_mode = False  # 👈 工具回傳超過門檻時，是否改用獨立 session 做語意摘要
+    parallel_cal = PARALLEL_CAL_DEFAULT  # 👈 軟水位壓縮改在背景執行緒做（需 Ollama 有 ≥2 個 parallel slot 才真的平行）
     plan_mode = False  # 👈 開啟後，每個新任務都要先規劃、經使用者核准才會執行
 
     print("\n" + "="*50)
@@ -725,7 +1033,13 @@ def main():
     while True:
         try:
             user_msg = input("\n👤 使用者: ")
-            
+
+            # 背景壓縮（/parallel_cal on）完成或失敗的通知，在使用者下一次輸入後印出
+            for notice in agent.pop_notices():
+                print(notice)
+            if agent.compression_in_progress():
+                print("🗜️ 背景壓縮仍在進行中，超過硬水位時會先等它完成。")
+
             # --- 基礎指令 ---
             if user_msg.lower() in ['exit', 'quit']:
                 break
@@ -736,8 +1050,10 @@ def main():
 
             # --- 新增：手動壓縮指令 ---
             if user_msg.lower() == '/compress':
-                agent.compress_context_to_file(num_to_keep=2)
-                print("🗜️ 歷史已手動壓縮並歸檔。")
+                if agent.compress_context_to_file():
+                    print("🗜️ 歷史已手動壓縮並歸檔。")
+                else:
+                    print("ℹ️ 目前沒有需要壓縮的舊對話。")
                 continue
             
             # --- 模式切換指令 ---
@@ -764,6 +1080,15 @@ def main():
             if user_msg.lower() == '/summarize off':
                 tool_summary_mode = False
                 print("🧠 已關閉工具回傳摘要模式（超過門檻的結果改回精簡成功/失敗判定）")
+                continue
+            if user_msg.lower() == '/parallel_cal on':
+                parallel_cal = True
+                print("⚡ 已開啟平行壓縮：回合結束後超過軟水位時在背景執行緒壓縮，不擋下一次對話"
+                      "（要真的平行需 Ollama 給此模型多個 slot，或以 AGENT_SUMMARY_MODEL 指定不同的摘要模型；硬水位仍為同步）")
+                continue
+            if user_msg.lower() == '/parallel_cal off':
+                parallel_cal = False
+                print("🔁 已關閉平行壓縮：改回序列處理，回合結束後超過軟水位時同步壓縮完再等待輸入")
                 continue
             if user_msg.lower() == '/plan on':
                 plan_mode = True
@@ -812,6 +1137,7 @@ def main():
             # --- 📝 PLAN 模式：先規劃、經使用者核准才進入下面的執行迴圈 ---
             if plan_mode:
                 if not _run_plan_flow(agent, user_msg):
+                    after_turn_compression(agent, parallel_cal, print)  # 取消也算回合結束
                     continue  # 使用者取消了計畫，回到最上層等待新的輸入
             else:
                 agent.messages.append({'role': 'user', 'content': user_msg})
@@ -842,12 +1168,11 @@ def main():
                     print("✅ 無工具需要執行")
 
                 # --- 📊 TOKEN 統計顯示 ---
-                print(f"\n📦 Context Tokens: {agent.context_tokens()} / 門檻 {TOKEN_THRESHOLD}（num_ctx {NUM_CTX}）")
-                # --- 自動壓縮觸發器 ---
-                if agent.context_tokens() > TOKEN_THRESHOLD:
-                    agent.compress_context_to_file(num_to_keep=2)
-                    print(f"\n📦 Compressed Context Tokens: {agent.context_tokens()}")
-                    continue # 壓縮後重新循環，確保下一輪 Agent 讀取到更新後的 system prompt
+                print(f"\n📦 Context Tokens: {agent.context_tokens()} / 軟水位 {SOFT_TOKEN_THRESHOLD}"
+                      f" / 硬水位 {TOKEN_THRESHOLD}（num_ctx {NUM_CTX}）")
+                # 硬水位的壓縮檢查統一在 ask_ai() 呼叫前（ensure_context_budget），軟水位在回合結束後
+                # （after_turn_compression）。舊版這裡壓縮後 continue，會跳過「把工具結果加入上下文」
+                # 那一步，AI 拿不到剛執行的結果而重複下同一個指令，已移除。
                 print(f"📊 Stats | User: {agent.total_user_tokens} | AI: {agent.total_ai_tokens} | Tool: {agent.total_tool_tokens}")
 
                 # --- 模式判定流程 ---
@@ -882,6 +1207,9 @@ def main():
                     _append_discarded_tool_result(agent)
                     print("👀 已略過")
                     break
+
+            # --- 🗜️ 回合結束：軟水位檢查（答案已印出，這裡壓縮不影響回覆延遲） ---
+            after_turn_compression(agent, parallel_cal, print)
 
         except KeyboardInterrupt:
             print("\n👋 Bye")

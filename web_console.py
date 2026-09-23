@@ -37,9 +37,13 @@ from Agent_Runner import (
     SkillAgent,
     _append_discarded_tool_result,
     _content_for_context,
+    after_turn_compression,
     NUM_CTX,
     TOKEN_THRESHOLD,
+    SOFT_TOKEN_THRESHOLD,
+    KEEP_RECENT_TOKENS,
     TOOL_RESULT_TOKEN_THRESHOLD,
+    PARALLEL_CAL_DEFAULT,
     is_skill_doc_result,
 )
 
@@ -61,7 +65,13 @@ from vision.web import static_file as vision_static_file
 agent = SkillAgent(model=os.environ.get("WEB_CONSOLE_MODEL", "gemma4:e4b"), max_history=None)  # 則數視窗停用，統一以 token 門檻壓縮
 agent.reset_conversation()
 
-state = {"auto_mode": False, "hybrid_mode": False, "tool_summary_mode": False, "plan_mode": False}
+state = {
+    "auto_mode": False,
+    "hybrid_mode": False,
+    "tool_summary_mode": False,
+    "plan_mode": False,
+    "parallel_cal": PARALLEL_CAL_DEFAULT,  # 軟水位壓縮改在背景執行緒做（/parallel_cal on|off）
+}
 pending = {"result": None, "mode": None, "tokens": None}  # 等待使用者決策的工具結果（hybrid / manual 模式用）
 plan_pending = {"active": False, "text": None}  # 等待使用者核准／修改意見的任務計畫（/plan 模式用）
 vision_session = VisionSession()  # 📷 尚未送出的影像附件（框選截圖／上傳的檔案），送出新任務時一次消費
@@ -76,6 +86,7 @@ MENU_TEXT = """可用指令：
 /auto on / /auto off    切換 Auto Continue 模式（工具結果自動帶入下一輪，不需確認）
 /hybrid on / /hybrid off 切換 Hybrid 模式（每次工具結果都詢問是否加入上下文）
 /summarize on / /summarize off 切換工具回傳摘要模式（見下方說明，預設關閉）
+/parallel_cal on / /parallel_cal off 切換平行壓縮（回合結束後的軟水位壓縮改在背景執行緒做，預設關閉）
 /plan on / /plan off    切換 Plan 模式（新任務會先規劃步驟，經你核准後才會執行，預設關閉）
 /plan done              手動清除目前已核准、正在執行中的計畫（見下方說明）
 /objective set <內容>   設定 Sticky Objective（最高優先任務，會持續提醒 AI）
@@ -121,10 +132,22 @@ web_console 那台機器的螢幕。送出訊息時，附加的影像先由獨�
 
 Token 計量：AI 回覆與整體上下文大小以 Ollama 回報的精確值為準（eval_count／
 prompt_eval_count），使用者輸入與工具回傳以每次呼叫後校準的字元比估算，所有
-數字都是真實 token 尺度。整體上下文超過 {token_threshold}（num_ctx {num_ctx} 的
-70%）時會自動壓縮歸檔，標題列的 ctx 會顯示目前大小（≈ 代表估算值）。""".format(
+數字都是真實 token 尺度。標題列的 ctx 會顯示目前大小（≈ 代表估算值）與兩道水位。
+
+上下文壓縮採雙水位線：軟水位 {soft_threshold} tokens（num_ctx {num_ctx} 的 50%）只在
+「回合結束後」檢查，此時答案已經送到你眼前、模型閒著，順手壓縮不會拉長任何一次回覆；
+硬水位 {token_threshold}（70%）是呼叫模型前的最後防線，超過一定同步壓縮。壓縮時保留
+最新約 {keep_recent} tokens 的原文（在訊息邊界切、不拆開指令與其結果），其餘與上一份
+摘要融合成新的一份結構化摘要（總體情境／關鍵進度／執行結果與錯誤／使用者偏好／未完成
+事項），存到 logs/ 並注入系統提示詞；系統提示詞只帶最新一份，不會越滾越長。
+開啟 /parallel_cal on 後，軟水位壓縮改在背景執行緒進行，你可以馬上繼續對話，完成時右欄
+會出現通知。但要注意：只有 Ollama 真的為模型配置多個 slot、或摘要模型（AGENT_SUMMARY_MODEL）
+與主模型不同時，摘要才會與主對話同時推論；目前版本的 Ollama 對多模態模型（gemma4）強制
+單 slot，同模型的背景摘要會讓你的下一次對話在 Ollama 內排隊，等待只是搬到下一次呼叫。
+算力弱的設備建議維持關閉（序列處理）。""".format(
     threshold=TOOL_RESULT_TOKEN_THRESHOLD, vision_model=VISION_MODEL,
-    token_threshold=TOKEN_THRESHOLD, num_ctx=NUM_CTX,
+    token_threshold=TOKEN_THRESHOLD, soft_threshold=SOFT_TOKEN_THRESHOLD,
+    keep_recent=KEEP_RECENT_TOKENS, num_ctx=NUM_CTX,
 )
 
 
@@ -158,10 +181,19 @@ def build_stats():
         "context_tokens": agent.context_tokens(),
         "context_exact": agent.last_prompt_tokens is not None,
         "token_threshold": TOKEN_THRESHOLD,
+        "soft_threshold": SOFT_TOKEN_THRESHOLD,
+        "keep_recent_tokens": KEEP_RECENT_TOKENS,
         "num_ctx": NUM_CTX,
         "chars_per_token": round(agent.chars_per_token, 2),
         "attachments": vision_session.count(),
         "vision_model": VISION_MODEL,
+        "summary_model": agent.summary_model,
+        "parallel_cal": state["parallel_cal"],
+        "compressing": agent.compression_in_progress(),
+        "last_compression": agent.last_compression,
+        # 背景壓縮完成／失敗的通知：每次組 stats 時取走（stats 會隨每個事件與 /api/status 送到前端，
+        # 前端把它們渲染成系統訊息），同一則不會重複出現
+        "notices": agent.pop_notices(),
     }
 
 
@@ -312,10 +344,10 @@ def run_turn(events):
         else:
             events.append({"channel": "system", "text": "✅ 無工具需要執行"})
 
-        if agent.context_tokens() > TOKEN_THRESHOLD:
-            agent.compress_context_to_file(num_to_keep=2)
-            events.append({"channel": "system", "text": "📦 上下文超過門檻，已自動壓縮並歸檔。"})
-            continue
+        # 硬水位的壓縮檢查統一在 ask_ai() 呼叫前（ensure_context_budget，UI 會收到 📦 事件），
+        # 軟水位在回合結束後（after_turn_compression，見 ConsoleHandler._finish_turn）。
+        # 舊版這裡壓縮後 continue，會跳過下面「把工具結果加入上下文」的步驟直接再問一次 AI，
+        # AI 拿不到剛執行的結果而重複下同一個指令；result 為 None 時也會多問一輪而不是結束回合。已移除。
 
         if not result:
             return False
@@ -388,8 +420,21 @@ def handle_slash_command(message, events):
         events.append({"channel": "system", "text": "🧹 記憶已清空。"})
         return True
     if lower == "/compress":
-        agent.compress_context_to_file(num_to_keep=2)
-        events.append({"channel": "system", "text": "🗜️ 歷史已手動壓縮並歸檔。"})
+        if agent.compress_context_to_file():
+            events.append({"channel": "system", "text": "🗜️ 歷史已手動壓縮並歸檔。"})
+        else:
+            events.append({"channel": "system", "text": "ℹ️ 目前沒有需要壓縮的舊對話。"})
+        return True
+    if lower == "/parallel_cal on":
+        state["parallel_cal"] = True
+        events.append({"channel": "system", "text": (
+            "⚡ 已開啟平行壓縮：回合結束後超過軟水位時在背景執行緒壓縮，不擋下一次對話"
+            "（要真的平行需 Ollama 給此模型多個 slot，或以 AGENT_SUMMARY_MODEL 指定不同的摘要模型；硬水位仍為同步）"
+        )})
+        return True
+    if lower == "/parallel_cal off":
+        state["parallel_cal"] = False
+        events.append({"channel": "system", "text": "🔁 已關閉平行壓縮：改回序列處理，回合結束後超過軟水位時同步壓縮完才結束本回合"})
         return True
     if lower == "/auto on":
         state["auto_mode"] = True
@@ -641,12 +686,31 @@ function renderEvents(events) {
   });
 }
 
+let compressPoll = null;  // /parallel_cal on 背景壓縮進行中時，定期輪詢狀態以接收完成通知
+
 function updateStatus(stats) {
-  document.getElementById('stat-mode').textContent = 'mode: ' + stats.mode;
+  document.getElementById('stat-mode').textContent =
+    'mode: ' + stats.mode + (stats.parallel_cal ? ' · parallel_cal' : '');
   document.getElementById('stat-cwd').textContent = 'cwd: ' + stats.current_cwd;
-  document.getElementById('stat-tokens').textContent =
+  const tokensEl = document.getElementById('stat-tokens');
+  tokensEl.textContent =
     `tokens: user ${stats.total_user_tokens} / ai ${stats.total_ai_tokens} / tool ${stats.total_tool_tokens}` +
-    ` · ctx ${stats.context_exact ? '' : '≈'}${stats.context_tokens}/${stats.token_threshold}`;
+    ` · ctx ${stats.context_exact ? '' : '≈'}${stats.context_tokens} (軟 ${stats.soft_threshold} / 硬 ${stats.token_threshold})` +
+    (stats.compressing ? ' · 🗜️ 背景壓縮中' : '');
+  tokensEl.title = `num_ctx ${stats.num_ctx}；軟水位（回合結束後壓縮）${stats.soft_threshold}；` +
+    `硬水位（呼叫前必壓）${stats.token_threshold}；壓縮時保留最新約 ${stats.keep_recent_tokens} tokens 原文；` +
+    `摘要模型 ${stats.summary_model}`;
+  // 背景壓縮完成／失敗的通知（後端在組 stats 時取走，不會重複）
+  (stats.notices || []).forEach(t => renderEntry(toolLog, 'system', '系統', t));
+  // 背景壓縮進行中：每 4 秒輪詢一次狀態，結束時最後一次輪詢會帶回完成通知
+  if (stats.compressing && !compressPoll) {
+    compressPoll = setInterval(() => {
+      fetch('/api/status').then(r => r.json()).then(updateStatus).catch(() => {});
+    }, 4000);
+  } else if (!stats.compressing && compressPoll) {
+    clearInterval(compressPoll);
+    compressPoll = null;
+  }
   // 伺服器端附件已被消費（送出新任務）或清空時，同步清掉輸入框上方的縮圖
   if (stats.attachments === 0) clearAttachStrip();
 }
@@ -922,6 +986,17 @@ class ConsoleHandler(BaseHTTPRequestHandler):
             pending_mode=pending["mode"] if awaiting_decision else None,
         )
 
+    def _finish_turn(self, stream, awaiting_decision):
+        """回合真正結束（不在等決策、也沒有計畫待核准）時的收尾：先做軟水位檢查再送 done。
+        AI 的最終回覆事件早已串流到前端，這裡的壓縮不影響使用者看到答案的時間；
+        /parallel_cal on 時壓縮在背景執行緒進行，done 會立刻送出。"""
+        if not awaiting_decision and not plan_pending["active"]:
+            after_turn_compression(
+                agent, state["parallel_cal"],
+                lambda text: stream.append({"channel": "system", "text": text}),
+            )
+        self._finish(stream, awaiting_decision)
+
     def do_GET(self):
         if self.path == "/":
             body = HTML_PAGE.encode("utf-8")
@@ -1017,7 +1092,10 @@ class ConsoleHandler(BaseHTTPRequestHandler):
             awaiting_decision = False
             if outcome == "approved":
                 awaiting_decision = run_turn(stream)
-            self._finish(stream, awaiting_decision)
+            if outcome == "revised":
+                self._finish(stream, False)  # 仍在規劃中，不算回合結束
+            else:
+                self._finish_turn(stream, awaiting_decision)  # 核准後跑完、或取消，都是回合結束
             return
 
         if not message:
@@ -1055,7 +1133,7 @@ class ConsoleHandler(BaseHTTPRequestHandler):
             return
 
         agent.messages.append({'role': 'user', 'content': content})
-        self._finish(stream, run_turn(stream))
+        self._finish_turn(stream, run_turn(stream))
 
     def _handle_decision(self, data, stream):
         action = (data.get("action") or "").strip().lower()
@@ -1067,7 +1145,7 @@ class ConsoleHandler(BaseHTTPRequestHandler):
 
         should_continue = apply_decision(action, stream)
         awaiting = run_turn(stream) if should_continue else False
-        self._finish(stream, awaiting)
+        self._finish_turn(stream, awaiting)
 
 
 def main():

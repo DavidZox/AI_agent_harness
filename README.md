@@ -30,7 +30,7 @@
 
 **腳本回傳慣例與逾時機制**：所有技能腳本統一由 stdout 回傳結果，成功以 `[PASS]` 開頭、失敗（含逾時）一律以 `[ERROR]` 開頭並說明原因與建議動作——`_content_for_context()` 就是靠這個前綴判定成功/失敗，`SKILLS.md` 開頭也向模型說明了這個慣例。每支會呼叫外部程序或網路的腳本都有自己的逾時上限（各 `tools/<name>.md` 的「語法 / 參數規範」有寫）；容器相關腳本共用 `scripts/_docker_common.py`，在容器內以 coreutils `timeout` 包住指令，逾時會真正終止容器內的程序而不是只殺掉宿主機端的 `docker exec`，並把常見的 docker / ros2 錯誤翻成可行動的說明。`SkillAgent.run_tool` 另設 `TOOL_EXEC_TIMEOUT`（600 秒）作為最後防線，並在腳本以非零 exit code 結束時補上 `[ERROR]` 前綴、以及在腳本完全沒有輸出時給出明確訊息——否則空字串會被誤判成「沒有工具需要執行」。
 
-### 1.3 上下文管理：兩層 token 門檻與可選的 AI 摘要
+### 1.3 上下文管理：雙水位線壓縮、滾動融合摘要與可選的 AI 摘要
 
 **Token 計量方式（真實 token 尺度）**：Ollama 沒有 tokenize API（Python 套件與伺服器皆無），所以採「能精確就精確、不能就校準估算」：AI 回覆用每次 `ollama.chat()` 回報的 `eval_count`；整體上下文大小用回報的 `prompt_eval_count`（完整 prompt 的 token 數，含 chat 模板；prompt cache 命中時仍回報完整值，已實測），兩次呼叫之間新增的訊息以校準比估算增量（`SkillAgent.context_tokens()`）；使用者輸入與工具回傳沒有模型呼叫可依，用「字元數 ÷ `chars_per_token`」估算，`chars_per_token` 每次呼叫後以 `prompt_eval_count` 對整個 prompt 重新校準（`_record_usage()`，中文為主的內容實測約 1.8～1.9）。因此下表所有門檻與 `num_ctx` 同一尺度，可以直接比較。Web Console 標題列的 `ctx` 顯示目前上下文大小，前面有 `≈` 代表估算值。
 
@@ -39,14 +39,24 @@
 | 常數 | 目前值 | 作用 |
 | :--- | :--- | :--- |
 | `NUM_CTX` | 12288（環境變數 `AGENT_NUM_CTX`） | 一次請求給 Ollama 的 context 上限，主對話、壓縮摘要、工具摘要三種 session 共用。模型本身支援 131072，這是為記憶體與速度自設的。 |
-| `TOKEN_THRESHOLD` | `NUM_CTX × 70%`（預設 8601） | 整體上下文超過此 token 數，自動觸發 `compress_context_to_file()`：用 LLM 把舊對話摘要成結構化 Markdown 存到 `logs/`，只保留最近 2 筆對話 + 摘要繼續（進行中的計畫與任務敘述一併保留；舊版會在壓縮時誤呼叫 `reset_conversation()` 把這些都清掉，已修正）。檢查點有兩處：每輪工具執行後（`run_turn` / `main`），以及 `ask_ai()` 呼叫模型前——後者確保使用者貼一大段文字時，壓縮也一定發生在 Ollama 於 `num_ctx` 靜默截斷之前。 |
+| `TOKEN_THRESHOLD`（硬水位） | `NUM_CTX × 70%`（預設 8601） | 呼叫模型前的最後防線：`ask_ai()` 送出前若上下文超過此值，一定**同步**壓縮（`ensure_context_budget()`），確保壓縮先於 Ollama 在 `num_ctx` 處的靜默截斷；若剛好有背景壓縮在跑，先等它完成、仍超標才自己壓，不會兩份摘要同時跑。這是唯一的硬水位檢查點——舊版在每輪工具執行後還有一處，且壓縮後 `continue` 會跳過「把工具結果加入上下文」那一步、直接再問一次 AI，AI 拿不到剛執行的結果而重複下同一個指令，已移除。 |
+| `SOFT_TOKEN_THRESHOLD`（軟水位） | `NUM_CTX × 50%`（預設 6144） | 只在**回合結束後**檢查（`after_turn_compression()`：CLI 印完最終回覆、Web Console 串流送出最終 chat 事件之後）。此時使用者正在讀答案、模型閒著，壓縮不會拉長任何一次回覆的等待時間，切點也剛好落在任務邊界，不會把一個任務切成兩半。`/parallel_cal on` 時改在背景執行緒做（見下方）。若超過水位但所有訊息都在保留預算內（例如 system prompt 本身就很大），不會宣告也不會動作。 |
+| `KEEP_RECENT_TOKENS`（low watermark） | `NUM_CTX × 15%`（預設 1843） | 壓縮時保留最新這麼多 token 的**原文**：從最新往回累加、在訊息邊界切、至少保留最新一則、不拆開 assistant 的 `EXECUTE:` 與它的 `[tool result]`（`_split_for_compression()`）。其餘交給摘要。舊版固定「保留最新 2 則」，兩則可能只有 50 tokens 也可能 1500 tokens，銜接感不穩定。 |
+| `SUMMARY_MAX_CHARS` / `SUMMARY_MAX_PREDICT` | 600 字 / 2000 tokens | 融合摘要的長度目標（寫進摘要 prompt；實測 gemma4:e4b 會超過目標約三成，實際落在 450～600 tokens）與輸出硬上限（`num_predict`，防止失控；被截斷時 JSON 會解析失敗退回原文，所以留得夠寬）。 |
+| `SUMMARY_MODEL` | `None`（環境變數 `AGENT_SUMMARY_MODEL`） | 壓縮摘要與工具摘要兩種獨立 session 共用的模型，預設與主模型相同；與主模型不同時，`/parallel_cal on` 的背景摘要才會真的與主對話平行。取捨見下方「摘要模型」。 |
 | `TOOL_RESULT_TOKEN_THRESHOLD` | 500（約 1000 字元） | 單一工具回傳超過此 token 數時，**不會**把完整原始輸出塞進 AI 的上下文，預設改用 `_content_for_context()` 產生的精簡摘要（依內容是否以 `[ERROR]` 開頭，回報「成功」或「失敗」），避免一次大量的搜尋/列目錄結果打斷模型的推理節奏。完整內容仍會顯示給使用者（CLI 印出、或 Web Console 的「系統 / 工具回傳」面板並標記 ⚠️ 待確認）。**技能規格文件例外**：`run_tool` 載入規格文件的回傳（以 `SKILL_DOC_PREFIX` 開頭）一律完整進入上下文、不標 ⚠️——它是按需載入機制的核心，被精簡掉 AI 就拿不到腳本路徑；規格書本身以 400 tokens（約 800 字元）以內為原則。 |
 
 Web Console 另外加了 `MAX_AUTO_ITERATIONS = 25`：Auto 模式下連續執行工具超過此輪數會強制中止本回合，避免模型陷入迴圈時把伺服器卡死（CLI 版本因為有人在終端機前，可以直接 Ctrl+C，暫無此限制）。
 
 **`num_ctx` 與門檻的關係**：所有 `ollama.chat()` 呼叫都帶 `num_ctx=NUM_CTX`。若不指定，Ollama 會用內建預設值 4096，對話還沒到壓縮門檻就會在背後悄悄截斷最舊的內容並擠壓輸出空間，看起來就像模型的輸出被無故砍短。`TOKEN_THRESHOLD` 直接定義為 `NUM_CTX` 的 70%，兩者同一尺度，壓縮一定先於截斷發生。歷史教訓：舊版 `TOKEN_THRESHOLD = 8000` 是以「字元÷4」計量，換成真實 token 約 17000，早已超過 `num_ctx` 12288，壓縮實際上永遠來不及觸發。
 
-**工具回傳摘要模式（可選，預設關閉）**：CLI 用 `/summarize on|off`、Web Console 用同名指令切換（狀態各自存在 `main()` 的區域變數 / `state["tool_summary_mode"]`）。關閉時就是上表「成功/失敗」判定的預設行為；開啟後，超過 `TOOL_RESULT_TOKEN_THRESHOLD` 的內容會改由 `SkillAgent.summarize_tool_result()` 處理——做法比照 `compress_context_to_file()`：另外開一個獨立、乾淨的一次性 session（專屬 system/user prompt，不接觸主對話的 `self.messages`），對原始輸出做語意摘要，讓主 session 拿到的是「有意義的重點摘要」而不只是成功/失敗判定，摘要完即丟棄。若摘要 session 本身失敗（例如模型出錯），`_content_for_context()` 會自動 fallback 回成功/失敗判定，不會讓主推理流程中斷。Web Console 會把這次獨立摘要的結果額外用紫色卡片顯示在「系統 / 工具回傳」面板（標籤「🧠 AI 摘要（獨立 session）」）。這是本節提到 token 門檻機制的加強版，代價是超過門檻時會多一次 LLM 呼叫、增加延遲，因此設計成可自由開關。
+**滾動融合摘要（rolling summary）**：`compress_context_to_file()` 先用 `_split_for_compression()` 切出保留區以外的舊訊息，交給 `summarize_messages()`：摘要模型同時收到「上一份 `rolling_summary`」與「這次要併入的新片段」（渲染成 `[user]` / `[assistant]` 標頭的純文字，舊版直接塞 Python list 的 repr，夾帶 `{'role': ...}` 與 `\n` 轉義，浪費 token 又難讀），輸出一份更新後的完整摘要**取代**上一份——延續舊內容、依新片段更新進度、淘汰已解決或過時的細節，但使用者明確表達的偏好與限制一律保留。結構由 Ollama 的 `format=` JSON schema（`SUMMARY_SCHEMA`：overview / key_progress / results_and_errors / user_preferences / open_items）強制，再由 `_render_summary_markdown()` 排成固定五段的 Markdown，不靠模型自己遵守範本；模型仍沒給合法 JSON 時退回原文，總比丟掉整段歷史好。每次壓縮都會寫一個 `logs/summary_<時間>.md` 供稽核，但 `get_system_prompt()` 的「Recent Compressed History Summary」**只注入最新一份**（舊版載入最近 5 個檔案，prompt 成本是單份摘要的 5 倍，且第 6 次壓縮起最舊的會無聲消失）。啟動時從 `logs/` 最新一份載入，因此摘要會跨 session 延續；`/clear` 不會清掉它（與舊版行為一致），要完全重來請刪除 `logs/` 下的檔案。
+
+**`/parallel_cal on|off`（背景壓縮，預設關閉）**：CLI 與 Web Console 同名指令，預設值可用 `AGENT_PARALLEL_CAL=1` 改成開啟。開啟後軟水位的壓縮改由 `start_background_compression()` 在背景執行緒進行：先快照要壓的訊息、呼叫摘要模型（期間不持有任何鎖）、完成後 `_apply_compression()` 以**物件身分**把那幾則從 `messages` 原地移除（不重綁 list、不靠索引），所以壓縮期間主對話新加入的訊息不會遺失；主對話送給 Ollama 的也是快照，校準比以真正送出的那份計算。完成或失敗的通知放進 `pop_notices()`：CLI 在下一次輸入後印出，Web Console 隨每次 stats 推送、且背景進行中前端每 4 秒輪詢一次 `/api/status`，標題列會顯示「🗜️ 背景壓縮中」。同一時間只允許一個背景壓縮；硬水位遇到背景進行中會先等它完成。**前提（實測）**：摘要要真的與主對話同時推論，需要 Ollama 為模型配置 2 個以上 slot，**或**摘要模型與主模型不同（不同模型是不同 runner 程序，天然平行）。本機 `OLLAMA_NUM_PARALLEL=2`，但 Ollama 0.34 的新引擎對多模態模型（gemma4）強制單 slot：`/api/ps` 的 `context_length` 只有一份 `num_ctx`，並發送出一長一短兩個請求時，單獨只要 0.1 秒的短請求要等 3 秒的長請求結束才回來。因此**同模型**開 `/parallel_cal on`，背景摘要期間你的下一次對話會在 Ollama 內排隊，等待只是搬到下一次呼叫（UI 上 done 仍立即送出、通知照常到達、不會遺失訊息）。搭配 `AGENT_SUMMARY_MODEL` 指定另一個模型才有真正的平行：實測 `gemma4:26b` 生成長文期間，`gemma4:e4b` 的短請求 0.2 秒回來、不受影響；代價是第二個模型的記憶體與算力分攤（每多一個 slot 也多一份 `num_ctx` 的 KV cache）。API 查不到 slot 數，程式無法自動判斷，算力弱的設備建議維持關閉（序列處理：回合結束後同步壓完再等待輸入，答案仍然是先送出的）。
+
+**摘要模型（`AGENT_SUMMARY_MODEL`）**：預設與主模型相同。可指定同家族的小模型（例如 `gemma3:1b`）縮短摘要時間，但注意三件事：統一記憶體的機器（Jetson、GB10）上「CPU 卸載」省不到記憶體只省算力；多載一個模型可能把主模型擠出 Ollama，重載主模型的代價遠高於一次摘要；摘要會進入之後每一輪的 system prompt，小模型的錯誤會複利累積。有足夠記憶體再考慮。反過來說，這也是目前在多模態 gemma4 上讓 `/parallel_cal on` 真正平行的唯一方法（見上段）。
+
+**工具回傳摘要模式（可選，預設關閉）**：CLI 用 `/summarize on|off`、Web Console 用同名指令切換（狀態各自存在 `main()` 的區域變數 / `state["tool_summary_mode"]`）。關閉時就是上表「成功/失敗」判定的預設行為；開啟後，超過 `TOOL_RESULT_TOKEN_THRESHOLD` 的內容會改由 `SkillAgent.summarize_tool_result()` 處理——做法比照 `compress_context_to_file()`：另外開一個獨立、乾淨的一次性 session（專屬 system/user prompt，不接觸主對話的 `self.messages`，模型同 `SUMMARY_MODEL`），對原始輸出做語意摘要，讓主 session 拿到的是「有意義的重點摘要」而不只是成功/失敗判定，摘要完即丟棄。若摘要 session 本身失敗（例如模型出錯），`_content_for_context()` 會自動 fallback 回成功/失敗判定，不會讓主推理流程中斷。Web Console 會把這次獨立摘要的結果額外用紫色卡片顯示在「系統 / 工具回傳」面板（標籤「🧠 AI 摘要（獨立 session）」）。這是本節提到 token 門檻機制的加強版，代價是超過門檻時會多一次 LLM 呼叫、增加延遲，因此設計成可自由開關。
 
 **訊息則數的滑動視窗（`_truncate_memory`）已預設停用**：`SkillAgent(max_history=None)` 是 CLI 與 Web Console 的預設值，上下文大小只由上面的 token 門檻決定，舊內容一律「摘要歸檔」而不是「無聲丟棄」。`max_history` 保留為可選的保險絲（例如設 200），啟用時超過則數會直接砍掉最舊訊息、不摘要不歸檔，一般情況不建議開。
 
@@ -59,7 +69,7 @@ Web Console 另外加了 `MAX_AUTO_ITERATIONS = 25`：Auto 模式下連續執行
 ### 1.5 記憶
 
 - **長期記憶**（`Memory.md`）：只有使用者明確要求（「記住這件事」等）才會透過 `modify_memory` 技能寫入，格式固定為 `[問題種類] | [問題描述] | [解決方法或結論]`（規則見 `AGENT.md`）。`modify_memory_cmd.py` 內的檔案路徑是根據腳本自身位置往上推算出的絕對路徑，固定指向專案根目錄下的 `Memory.md`，**不受 `current_cwd` 影響**——早期版本用相對路徑，若 AI 當下的虛擬工作目錄（`current_cwd`，可被 `change_dir` 技能改變）剛好在別的專案，會把記憶寫到那個專案底下而不是這裡，已修正。
-- **壓縮歷史**（`logs/summary_*.md`）：`compress_context_to_file()` 產生，`get_system_prompt()` 每次都會讀最近 5 份放進系統提示詞的「Recent Compressed History Summary」。
+- **壓縮歷史**（`logs/summary_*.md`）：每次壓縮寫一個檔供稽核，但 `get_system_prompt()` 只注入記憶體中最新一份融合摘要（`rolling_summary`，啟動時從最新的檔案載入），詳見 1.3 的「滾動融合摘要」。
 - **Sticky Objective**：使用者可設定一個最高優先任務，會持續出現在系統提示詞裡提醒模型，直到被清除。
 
 ### 1.6 Plan 模式：先規劃、經使用者核准才執行
@@ -96,7 +106,7 @@ AI_agent_harness/
 ├── web_console.py           # Web 版介面，重用 Agent_Runner 的邏輯，不重複定義規則
 ├── AGENT.md                 # 系統提示詞主體：角色設定、EXECUTE 協議、安全原則、記憶協議
 ├── Memory.md                # 長期記憶（AI 透過 modify_memory 技能寫入）
-├── logs/                    # 自動壓縮產生的歷史對話摘要
+├── logs/                    # 壓縮歸檔：每次融合摘要一個檔；system prompt 只載入最新一份
 ├── skills_system/
 │   ├── SKILLS.md             # 技能輕量索引
 │   ├── tools/<name>.md       # 各技能的 OKF 規格文件（按需載入）
@@ -138,8 +148,11 @@ python3 web_console.py
 | `WEB_CONSOLE_MODEL` | `gemma4:e4b` | 使用的 Ollama 模型 |
 | `WEB_CONSOLE_HOST` | `127.0.0.1` | 綁定位址，設 `0.0.0.0` 可開放區網存取 |
 | `WEB_CONSOLE_PORT` | `8765` | 監聽埠 |
+| `AGENT_NUM_CTX` | `12288` | Ollama context 上限，各水位都是它的比例（1.3 節；CLI 亦適用） |
+| `AGENT_SUMMARY_MODEL` | 同主模型 | 壓縮摘要／工具摘要用的模型（1.3 節；CLI 亦適用） |
+| `AGENT_PARALLEL_CAL` | 未設定＝關閉 | `/parallel_cal` 的啟動預設值（1.3 節；CLI 亦適用） |
 
-畫面分成左右兩欄：左邊是「使用者 ↔ Agent 對話」，右邊是「系統 / 工具回傳」（規格文件載入內容、腳本執行結果、系統通知都會出現在這裡）。輸入 `/menu` 可查詢目前支援的所有指令。開啟 `/summarize on` 後，超過門檻的工具結果除了原始輸出，右欄還會多一張紫色的「🧠 AI 摘要（獨立 session）」卡片。開啟 `/plan on` 後，新任務會先在左欄顯示一張青綠色的「📝 計畫（待你確認）」卡片，畫面下方會出現核准／取消按鈕，詳見 1.6 節。輸入框旁的 📷 可以「框選畫面」或「選擇檔案」附加影像，送出後右欄會先出現藍色的「🖼️ 視覺分析（獨立 session）」卡片，再由主 Agent 依分析結果回應，詳見 1.7 節；視覺模型可用 `VISION_MODEL`、逾時可用 `VISION_TIMEOUT` 環境變數調整。
+畫面分成左右兩欄：左邊是「使用者 ↔ Agent 對話」，右邊是「系統 / 工具回傳」（規格文件載入內容、腳本執行結果、系統通知都會出現在這裡）。輸入 `/menu` 可查詢目前支援的所有指令。開啟 `/summarize on` 後，超過門檻的工具結果除了原始輸出，右欄還會多一張紫色的「🧠 AI 摘要（獨立 session）」卡片。開啟 `/plan on` 後，新任務會先在左欄顯示一張青綠色的「📝 計畫（待你確認）」卡片，畫面下方會出現核准／取消按鈕，詳見 1.6 節。輸入框旁的 📷 可以「框選畫面」或「選擇檔案」附加影像，送出後右欄會先出現藍色的「🖼️ 視覺分析（獨立 session）」卡片，再由主 Agent 依分析結果回應，詳見 1.7 節；視覺模型可用 `VISION_MODEL`、逾時可用 `VISION_TIMEOUT` 環境變數調整。標題列的 `ctx` 顯示目前上下文大小與軟／硬水位（`≈` 代表估算值）；回合結束後觸發軟水位壓縮時右欄會出現「🗜️ 回合結束…壓縮中」與「📦 已將 N 則舊對話融合成摘要」兩則系統訊息，開啟 `/parallel_cal on` 後則是「已在背景開始壓縮」，完成時另有通知，詳見 1.3 節。
 
 ---
 
@@ -155,6 +168,8 @@ python3 web_console.py
 6. **CLI 與 Web Console 功能不完全對等**：CLI 的 `objective set` 是互動式多行輸入（輸入到 `objective end` 為止），Web Console 為了適應單次 HTTP 請求，簡化成單行的 `/objective set <內容>`。
 7. **沒有自動化測試**：目前所有驗證都是開發過程中手動寫的一次性腳本（stub `ollama.chat`、模擬多輪對話），沒有留在專案裡形成正式的測試套件。
 8. **使用者輸入與工具回傳的 token 數仍是估算值**：Ollama 沒有 tokenize API，只有 AI 回覆（`eval_count`）與整體上下文（`prompt_eval_count`）是精確的；其餘以每次呼叫後校準的字元比估算（見 1.3 節），對中文為主的內容誤差通常在一成以內，但夾雜大量程式碼或 URL 的工具輸出可能偏差較大。`count_tokens()` 保留了對 `ollama.tokenize()` 的偵測，日後套件提供時會自動改用精確值。
+9. **背景壓縮是否真的平行取決於 Ollama 的 slot 配置**：`OLLAMA_NUM_PARALLEL=2` 不保證有 2 個 slot——實測 Ollama 0.34 新引擎對多模態模型（gemma4）強制單 slot，同模型的背景摘要會讓下一次主對話在 Ollama 內排隊；要真的平行需以 `AGENT_SUMMARY_MODEL` 指定另一個模型（已實測可行）。API 查不到 slot 數，程式無法自動判斷，只能靠文件提醒（1.3 節）。
+10. **融合摘要的長度只能靠 prompt 約束**：`SUMMARY_MAX_CHARS` 是寫進提示詞的目標，實測 `gemma4:e4b` 會超過約三成；`SUMMARY_MAX_PREDICT` 只是防失控的硬上限，被截斷時 JSON 解析失敗會退回原文（結構消失但內容不丟）。
 
 ---
 
@@ -184,9 +199,11 @@ python3 web_console.py
 - 把目前開發過程中用來驗證行為的 stub 測試腳本，整理成正式的 `tests/` 目錄（用假的 `ollama.chat` 逐一驗證 `run_tool`、`_content_for_context`、`run_turn`、`apply_decision` 等關鍵函式的行為）。
 - 把 `current_cwd`、模型名稱等寫死的預設值改成可透過環境變數或設定檔覆寫，方便在不同機器上部署。
 
-### 5.5 ～已解決～ 滑動視窗與 token 壓縮收斂成同一套機制
+### 5.5 ～已解決～ 滑動視窗、雙水位線與背景壓縮收斂成同一套機制
 
-原本 `_truncate_memory` 以「訊息則數」（30 則）硬砍、`compress_context_to_file` 以 token 觸發，兩套邏輯並存且前者可能先於後者無聲丟棄內容。現在：token 計量改為真實尺度（`prompt_eval_count` / `eval_count` + 校準估算，見 1.3），`TOKEN_THRESHOLD` 定義為 `NUM_CTX` 的 70%，壓縮檢查點涵蓋每輪工具執行後與 `ask_ai()` 呼叫前，因此壓縮一定先於 Ollama 截斷發生；則數視窗預設停用（`max_history=None`），只保留為可選保險絲。
+原本 `_truncate_memory` 以「訊息則數」（30 則）硬砍、`compress_context_to_file` 以 token 觸發，兩套邏輯並存且前者可能先於後者無聲丟棄內容。第一步：token 計量改為真實尺度（`prompt_eval_count` / `eval_count` + 校準估算，見 1.3），`TOKEN_THRESHOLD` 定義為 `NUM_CTX` 的 70%，則數視窗預設停用（`max_history=None`），只保留為可選保險絲。
+
+第二步（雙水位線 + 滾動融合 + 背景壓縮，見 1.3）：壓縮從「卡在關鍵路徑上的單一門檻」改成兩道水位——軟水位在回合結束後、答案送出之後才動作，硬水位只留在 `ask_ai()` 呼叫前當保證；保留區從「最新 2 則」改為 token 預算且不拆開指令／結果；摘要從「每次獨立一份、system prompt 載最近 5 份」改為與上一份融合、只注入一份，並以 JSON schema 保證結構；`/parallel_cal on` 讓軟水位壓縮在背景執行緒進行（同一個多模態模型在目前的 Ollama 被強制單 slot，要真的平行需搭配不同的摘要模型，見 1.3）。序列模式的三種候選策略中未採用「閒置計時器觸發」（本質仍是背景執行，1 個 slot 的弱設備上等待只是被搬走，且 auto 模式沒有閒置）與「小模型／CPU 卸載當預設」（統一記憶體省不到記憶體、可能擠掉主模型、摘要錯誤會累積），後者保留為 `AGENT_SUMMARY_MODEL` 旋鈕。
 
 ### 5.6 grep（精準檢索）vs 獨立 session 摘要，該用哪個不應該只看 token 量
 
