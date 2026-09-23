@@ -214,7 +214,7 @@ class SkillAgent:
    results_and_errors（執行結果與錯誤，每項含 category／description／detail）、
    user_preferences（使用者偏好與約束）、open_items（未完成事項與下一步）。沒有內容的欄位給空陣列。
 6. 使用繁體中文。
-7. 標頭為 [harness ...] 的訊息（工具回傳、規劃流程）與 [user] 訊息中 [vision result] 之後的段落，
+7. 標頭為 [harness ...] 的訊息（工具回傳、規劃流程）與 [user] 訊息中 [vision result]、[skill loaded] 之後的段落，
    都是框架自動插入的系統內容，不是使用者說的話：其中的格式要求、流程規則不要記成使用者偏好；
    只有 [user] 自己寫的文字才算使用者的偏好與指示。"""
         user_prompt = (
@@ -771,6 +771,48 @@ class SkillAgent:
         except OSError:
             return []
 
+    def list_skills(self):
+        """解析 SKILLS.md 索引：每個技能的名稱、一行描述、所屬分類（## 標題），以及是否有綁定的經驗記憶。
+        只列出 tools/<name>.md 真的存在的技能。Web Console 的「/」選單與 CLI 的 /skills 都用這個。"""
+        skills = []
+        category = "其他"
+        try:
+            with open(self.index_file, "r", encoding="utf-8") as f:
+                lines = f.read().splitlines()
+        except OSError:
+            return skills
+        for line in lines:
+            if line.startswith("## "):
+                category = line[3:].strip()
+                continue
+            if not line.startswith("- ["):
+                continue
+            name = line[3:line.index("]")] if "]" in line else ""
+            if not name or not os.path.exists(os.path.join(self.tools_dir, f"{name}.md")):
+                continue
+            desc = line.split("—", 1)[1].strip() if "—" in line else ""
+            skills.append({
+                "name": name,
+                "description": desc,
+                "category": category,
+                "has_memory": bool(self._skill_memory_entries(name)),
+            })
+        return skills
+
+    def manual_skill_block(self, skill_name):
+        """使用者手動按需載入技能規格時，要附在下一則使用者訊息後面的區塊（含該技能的經驗記憶）。
+        內容等同 AI 自己 EXECUTE 技能名稱後系統回傳的規格，讓 AI 可以直接依其中的腳本路徑執行、
+        省掉一輪「先載規格」。技能不存在回傳 None。"""
+        doc = self._load_skill_doc(skill_name)
+        if doc is None:
+            return None
+        name = skill_name[:-3] if skill_name.endswith(".md") else skill_name
+        return (
+            f"{SKILL_LOADED_MARKER}\n"
+            f"{SKILL_DOC_PREFIX} '{name}' 的規格文件（使用者從選單手動載入，等同你以技能名稱 EXECUTE 後"
+            f"系統回傳的規格；依此內容才可執行，請使用其中標明的實際腳本路徑）：\n{doc.rstrip()}"
+        )
+
     def _load_skill_doc(self, skill_name):
         """若 skill_name 對應到 tools/<skill_name>.md，回傳其內容；否則回傳 None。
         容忍 AI 直接照抄索引連結而帶上 .md 後綴（例如 list_dir.md）。
@@ -1004,10 +1046,21 @@ SUMMARY_ARCHIVE_KEEP = int(os.environ.get("AGENT_SUMMARY_KEEP", "30"))
 
 # 框架自動插入、但以 user 角色送進對話的系統訊息標記（AGENT.md「Harness Messages」有對應說明）。
 # 摘要模型渲染對話時用它把這些訊息標成 [harness ...] 而不是 [user]，避免把框架的規則記成使用者偏好。
+SKILL_LOADED_MARKER = "[skill loaded]"  # 使用者從選單手動載入的技能規格（附在使用者訊息後面）
 HARNESS_MARKERS = (
-    "[tool result]", "【系統執行結果】", "[vision result]",
+    "[tool result]", "【系統執行結果】", "[vision result]", SKILL_LOADED_MARKER,
     "[PLAN_REQUEST]", "[PLAN_REVISION]", "[PLAN_CONFIRMED]", "[PLAN_REJECTED]",
 )
+
+
+def attach_skill_docs(message, blocks):
+    """把使用者手動載入的技能規格區塊（manual_skill_block 的回傳）附在這則使用者訊息後面。
+    跟 📷 影像分析結果同一種做法：使用者原文在前、系統插入的內容在後，主對話維持純文字單一訊息，
+    不會出現連續兩則 user 訊息。"""
+    blocks = [b for b in (blocks or []) if b]
+    if not blocks:
+        return message
+    return message + "\n\n" + "\n\n".join(blocks)
 
 # 融合摘要的長度目標（字，寫進摘要 prompt）與模型輸出硬上限（token，num_predict），
 # 讓滾動摘要不會越滾越長；輸出被硬上限截斷時 JSON 會解析失敗、退回原文，因此上限要留得夠寬。
@@ -1150,6 +1203,7 @@ def main():
     hybrid_mode = False  # 👈 新增狀態
     tool_summary_mode = False  # 👈 工具回傳超過門檻時，是否改用獨立 session 做語意摘要
     parallel_cal = PARALLEL_CAL_DEFAULT  # 👈 軟水位壓縮改在背景執行緒做（需 Ollama 有 ≥2 個 parallel slot 才真的平行）
+    pending_skill_blocks = []  # 👈 /skill <名稱> 手動載入的技能規格，隨下一則新任務訊息一起送出
     plan_mode = False  # 👈 開啟後，下一個新任務先規劃、經使用者核准後才執行；核准即自動退出
 
     print("\n" + "="*50)
@@ -1216,6 +1270,26 @@ def main():
                 parallel_cal = False
                 print("🔁 已關閉平行壓縮：改回序列處理，回合結束後超過軟水位時同步壓縮完再等待輸入")
                 continue
+            if user_msg.lower() == '/skills':
+                cat = None
+                for sk in agent.list_skills():
+                    if sk["category"] != cat:
+                        cat = sk["category"]; print(f"\n【{cat}】")
+                    print(f"  {sk['name']:<20} {sk['description']}" + ("（含經驗記憶）" if sk["has_memory"] else ""))
+                print("\n輸入 /skill <名稱> 可手動載入規格，隨下一則訊息一起送出")
+                continue
+            if user_msg.lower().startswith('/skill ') or user_msg.lower() == '/skill':
+                name = user_msg[len('/skill'):].strip()
+                block = agent.manual_skill_block(name) if name else None
+                if block is None:
+                    print(f"⚠️ 找不到技能 '{name}'，輸入 /skills 查看可用名稱" if name else "用法：/skill <技能名稱>")
+                    continue
+                if any(b == block for b in pending_skill_blocks):
+                    print(f"ℹ️ 技能 {name} 的規格已在待送清單")
+                    continue
+                pending_skill_blocks.append(block)
+                print(f"\n📘 已載入技能 {name} 的規格（≈{agent.count_tokens(block)} tokens），會隨你下一則訊息一起送出：\n{'-'*30}\n{block}\n{'-'*30}")
+                continue
             if user_msg.lower() == '/plan on':
                 plan_mode = True
                 print("📝 已開啟 Plan 模式（下一個新任務會先規劃步驟，經你核准後才執行；核准後自動退出）")
@@ -1267,16 +1341,24 @@ def main():
             # （見 _build_task_anchor_text）
             agent.current_task = user_msg
 
+            # 📘 手動載入的技能規格附在這則訊息後面一起送出（與 Web Console 一致）
+            content = user_msg
+            if pending_skill_blocks:
+                content = attach_skill_docs(user_msg, pending_skill_blocks)
+                agent.total_tool_tokens += sum(agent.count_tokens(b) for b in pending_skill_blocks)
+                print(f"📘 隨訊息載入 {len(pending_skill_blocks)} 份技能規格")
+                pending_skill_blocks.clear()
+
             # --- 📝 PLAN 模式：先規劃、經使用者核准才進入下面的執行迴圈 ---
             if plan_mode:
-                if not _run_plan_flow(agent, user_msg):
+                if not _run_plan_flow(agent, content):
                     after_turn_compression(agent, parallel_cal, print)  # 取消也算回合結束
                     continue  # 使用者取消了計畫，維持 Plan 模式，回到最上層等待新的輸入
                 # 核准即退出 Plan 模式：規劃階段結束，這個任務依 current_plan 執行，下一個新任務直接執行
                 plan_mode = False
                 print("📝 計畫已核准，已自動退出 Plan 模式（要再規劃下一個任務請重新 /plan on）")
             else:
-                agent.messages.append({'role': 'user', 'content': user_msg})
+                agent.messages.append({'role': 'user', 'content': content})
 
             while True:
                 # --- 🧠 AI 推論 ---

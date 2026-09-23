@@ -38,6 +38,7 @@ from Agent_Runner import (
     _append_discarded_tool_result,
     _content_for_context,
     after_turn_compression,
+    attach_skill_docs,
     NUM_CTX,
     TOKEN_THRESHOLD,
     SOFT_TOKEN_THRESHOLD,
@@ -78,6 +79,70 @@ plan_pending = {"active": False, "text": None}  # 等待使用者核准／修改
 vision_session = VisionSession()  # 📷 尚未送出的影像附件（框選截圖／上傳的檔案），送出新任務時一次消費
 lock = threading.Lock()
 
+# 📘 使用者從「/」選單（或 /skill <名稱>）手動載入、尚未送出的技能規格：name -> block。
+# 跟 📷 附件同一種生命週期：送出下一個新任務時一次消費（slash 指令、計畫回應、工具決策不會）。
+pending_skills = {}
+pending_skills_lock = threading.Lock()
+
+# 「/」選單裡的功能開關與指令（技能清單另由 agent.list_skills() 提供）。args=True 代表選取後只填入、等使用者接參數。
+SLASH_COMMANDS = [
+    {"cmd": "/auto on", "desc": "Auto Continue：工具結果自動帶入下一輪，不需確認", "group": "模式開關"},
+    {"cmd": "/auto off", "desc": "關閉 Auto Continue（回到手動確認）", "group": "模式開關"},
+    {"cmd": "/hybrid on", "desc": "Hybrid：每次工具結果都詢問，捨棄後仍讓 AI 接續", "group": "模式開關"},
+    {"cmd": "/hybrid off", "desc": "關閉 Hybrid", "group": "模式開關"},
+    {"cmd": "/summarize on", "desc": "超過門檻的工具回傳改由獨立 session 語意摘要", "group": "模式開關"},
+    {"cmd": "/summarize off", "desc": "改回精簡的成功／失敗判定", "group": "模式開關"},
+    {"cmd": "/plan on", "desc": "下一個新任務先規劃、經核准後執行（核准後自動退出）", "group": "模式開關"},
+    {"cmd": "/plan off", "desc": "關閉 Plan 模式", "group": "模式開關"},
+    {"cmd": "/parallel_cal on", "desc": "軟水位壓縮改在背景執行緒進行", "group": "模式開關"},
+    {"cmd": "/parallel_cal off", "desc": "壓縮改回序列處理", "group": "模式開關"},
+    {"cmd": "/skill ", "desc": "手動載入某技能的規格，隨下一則訊息送出（直接點下方技能清單更快）", "group": "動作與查詢", "args": True},
+    {"cmd": "/skills", "desc": "列出所有可用技能", "group": "動作與查詢"},
+    {"cmd": "/menu", "desc": "顯示完整指令說明", "group": "動作與查詢"},
+    {"cmd": "/compress", "desc": "手動壓縮並歸檔目前的歷史對話", "group": "動作與查詢"},
+    {"cmd": "/plan done", "desc": "提早清除目前已核准的計畫", "group": "動作與查詢"},
+    {"cmd": "/objective set ", "desc": "設定 Sticky Objective（後面接內容）", "group": "動作與查詢", "args": True},
+    {"cmd": "/objective show", "desc": "查看目前的 Objective", "group": "動作與查詢"},
+    {"cmd": "/objective clear", "desc": "清除 Objective", "group": "動作與查詢"},
+    {"cmd": "/clear", "desc": "清空對話記憶，重新開始（選取後需再按 Enter 才會送出）", "group": "動作與查詢"},
+]
+
+DEFAULT_SKILL_PROMPT = "我已手動載入上述技能的規格，請依規格用兩三句話說明它的用途與呼叫方式，然後等待我的指示。"
+
+
+def load_pending_skill(name):
+    """把技能規格加入待送清單。回傳 {name, doc, tokens, pending}；技能不存在時 raise ValueError。"""
+    name = (name or "").strip()
+    if name.endswith(".md"):
+        name = name[:-3]
+    block = agent.manual_skill_block(name) if name else None
+    if block is None:
+        raise ValueError(f"找不到技能 '{name}'，請用 /skills 或「/」選單查看可用名稱。" if name else "用法：/skill <技能名稱>")
+    with pending_skills_lock:
+        already = name in pending_skills
+        pending_skills[name] = block
+        pending = list(pending_skills)
+    return {"name": name, "doc": block, "tokens": agent.count_tokens(block), "pending": pending, "already": already}
+
+
+def remove_pending_skill(name):
+    with pending_skills_lock:
+        pending_skills.pop((name or "").strip(), None)
+        return list(pending_skills)
+
+
+def pending_skill_names():
+    with pending_skills_lock:
+        return list(pending_skills)
+
+
+def take_all_pending_skills():
+    """送出新任務時一次取走全部待送的技能規格（回傳 [(name, block), ...]）。"""
+    with pending_skills_lock:
+        items = list(pending_skills.items())
+        pending_skills.clear()
+    return items
+
 MAX_AUTO_ITERATIONS = 25  # 安全防護：避免 auto 模式下模型無限迴圈卡住伺服器
 
 MENU_TEXT = """可用指令：
@@ -93,6 +158,14 @@ MENU_TEXT = """可用指令：
 /objective set <內容>   設定 Sticky Objective（最高優先任務，會持續提醒 AI）
 /objective show         查看目前的 Objective
 /objective clear        清除 Objective
+/skills                 列出所有可用技能
+/skill <技能名稱>        手動載入該技能的規格（含其經驗記憶），隨你下一則訊息一起送出
+
+在輸入框打「/」會彈出選單：上半是功能開關與指令，下半是 SKILLS.md 裡的技能（依分類）。
+↑↓ 移動、Enter／Tab 選取、Esc 關閉，也可以繼續打字過濾。選指令只會填入輸入框、要再按
+Enter 才送出（避免誤點 /clear）；選技能等同 /skill <名稱>：規格立刻顯示在右欄、輸入框上方
+出現 📘 chip，下一則訊息送出時附在後面，AI 就能直接依規格裡的腳本路徑執行，省掉一輪
+「先載規格」。chip 可個別移除；slash 指令、計畫回應、工具決策不會消耗它。
 
 不切換 auto／hybrid 時，預設為「手動模式」：每次工具執行完都會等待你確認
 是否要把結果加入上下文，畫面下方會出現決策按鈕。
@@ -189,6 +262,7 @@ def build_stats():
         "num_ctx": NUM_CTX,
         "chars_per_token": round(agent.chars_per_token, 2),
         "attachments": vision_session.count(),
+        "pending_skills": pending_skill_names(),
         "vision_model": VISION_MODEL,
         "summary_model": agent.summary_model,
         "parallel_cal": state["parallel_cal"],
@@ -513,6 +587,32 @@ def handle_slash_command(message, events):
         agent.sticky_objective = ""
         events.append({"channel": "system", "text": "🧹 已清除 Sticky Objective"})
         return True
+    if lower == "/skills":
+        lines, cat = ["📘 可用技能（/skill <名稱> 或「/」選單可手動載入規格）："], None
+        for sk in agent.list_skills():
+            if sk["category"] != cat:
+                cat = sk["category"]; lines.append(f"\n【{cat}】")
+            lines.append(f"  {sk['name']} — {sk['description']}" + ("（含經驗記憶）" if sk["has_memory"] else ""))
+        events.append({"channel": "system", "text": "\n".join(lines)})
+        return True
+    if lower == "/skill" or lower.startswith("/skill "):
+        try:
+            info = load_pending_skill(text[len("/skill"):])
+        except ValueError as e:
+            events.append({"channel": "system", "text": f"⚠️ {e}"})
+            return True
+        if info["already"]:
+            events.append({"channel": "system", "text": f"ℹ️ 技能 {info['name']} 的規格已在待送清單。"})
+            return True
+        events.append({
+            "channel": "skillload", "name": info["name"], "tokens": info["tokens"],
+            "text": info["doc"],
+        })
+        events.append({"channel": "system", "text": (
+            f"📘 已手動載入技能 {info['name']} 的規格（≈{info['tokens']} tokens），會隨你下一則訊息一起送出；"
+            f"輸入框上方的 chip 可移除。"
+        )})
+        return True
 
     return False
 
@@ -605,6 +705,36 @@ HTML_PAGE = r"""<!DOCTYPE html>
   #attach-menu.show { display: flex; }
   #attach-menu button { background: #34363b; text-align: left; cursor: pointer; }
   #attach-menu button:hover { background: #3a6df0; }
+
+  /* ===== 「/」選單：功能開關／指令 + 技能（手動按需載入規格）===== */
+  #slash-menu {
+    display: none; position: absolute; bottom: 62px; left: 0; right: 0; z-index: 110;
+    max-height: 46vh; overflow-y: auto; background: #26282c; border: 1px solid #3a3c40;
+    border-radius: 8px; padding: 6px; font-size: 13px;
+  }
+  #slash-menu.show { display: block; }
+  .slash-section { padding: 6px 8px 2px; font-size: 11px; color: #c7c9cc; letter-spacing: .04em; }
+  .slash-section + .slash-section, .slash-group + .slash-section, .slash-item + .slash-section {
+    border-top: 1px solid #3a3c40; margin-top: 6px; padding-top: 8px;
+  }
+  .slash-group { padding: 4px 10px 0; font-size: 11px; color: #7f8a96; }
+  .slash-item { display: flex; gap: 10px; align-items: baseline; padding: 5px 10px; border-radius: 6px; cursor: pointer; }
+  .slash-item:hover, .slash-item.active { background: #3a6df0; color: white; }
+  .slash-item .name { font-family: "Cascadia Code", Consolas, monospace; white-space: nowrap; }
+  .slash-item .desc { color: #b8bcc2; font-size: 12px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .slash-item:hover .desc, .slash-item.active .desc { color: #e8eefc; }
+  .slash-item .badge { font-size: 10px; background: #4a4c50; border-radius: 4px; padding: 1px 5px; color: #d8c9a3; white-space: nowrap; }
+  .slash-empty { padding: 8px 10px; color: #9aa0a6; }
+  #skill-strip { display: none; gap: 6px; flex-wrap: wrap; margin-bottom: 8px; align-items: center; }
+  #skill-strip.show { display: flex; }
+  #skill-hint { font-size: 12px; color: #9aa0a6; }
+  .skill-chip {
+    background: #1f2a24; border: 1px solid #2f4a3a; color: #bfe3cf; border-radius: 12px; padding: 2px 8px;
+    font-size: 12px; display: inline-flex; gap: 6px; align-items: center;
+  }
+  .skill-chip .rm { cursor: pointer; color: #e6b95c; }
+  .entry.skillload { background: #1f2a24; border: 1px dashed #4fa37a; font-family: "Cascadia Code", Consolas, monospace; }
+  .entry.skillload .tag { color: #7fd8a8; opacity: 1; }
 </style>
 </head>
 <body>
@@ -643,13 +773,15 @@ HTML_PAGE = r"""<!DOCTYPE html>
     <button class="danger" onclick="sendPlanDecision('n')">🚫 取消任務</button>
   </div>
   <div id="attach-strip"><span id="attach-hint">📎 已附加影像（送出時一起分析）：</span></div>
+  <div id="skill-strip"><span id="skill-hint">📘 已載入技能規格（隨下一則訊息一起送出）：</span></div>
   <div class="input-row">
+    <div id="slash-menu"></div>
     <div id="attach-menu">
       <button onclick="attachFromScreen()">🖥️ 框選畫面</button>
       <button onclick="attachFromFile()">📁 選擇檔案</button>
     </div>
     <button class="secondary" id="attach-btn" title="附加影像：框選畫面或選擇檔案" onclick="toggleAttachMenu()">📷</button>
-    <textarea id="msg" placeholder="輸入訊息，或用 /menu 查詢可用指令...（Enter 送出，Shift+Enter 換行；📷 可附加影像）"></textarea>
+    <textarea id="msg" placeholder="輸入訊息；打「/」選擇功能開關或手動載入技能規格...（Enter 送出，Shift+Enter 換行；📷 可附加影像）"></textarea>
     <button id="send-btn" onclick="sendMessage()">送出</button>
     <input type="file" id="file-input" accept="image/*" multiple style="display:none">
   </div>
@@ -697,8 +829,11 @@ function renderEntry(container, cls, tag, text, oversized) {
 function renderEvents(events) {
   events.forEach(ev => {
     if (ev.channel === 'chat') {
-      const note = (ev.role === 'user' && ev.attachments) ? `\n📎 附加了 ${ev.attachments} 張影像` : '';
+      let note = (ev.role === 'user' && ev.attachments) ? `\n📎 附加了 ${ev.attachments} 張影像` : '';
+      if (ev.role === 'user' && ev.skills && ev.skills.length) note += `\n📘 附加了技能規格：${ev.skills.join(', ')}`;
       renderEntry(chatLog, ev.role, ev.role === 'user' ? '你' : 'AI', ev.text + note);
+    } else if (ev.channel === 'skillload') {
+      renderEntry(toolLog, 'skillload', `📘 手動載入技能規格：${ev.name}（≈${ev.tokens} tokens，隨下一則訊息送出）`, ev.text);
     } else if (ev.channel === 'vision') {
       renderEntry(toolLog, 'vision', `🖼️ 視覺分析（獨立 session，${ev.count} 張影像）`, ev.text, ev.oversized);
     } else if (ev.channel === 'tool') {
@@ -740,6 +875,8 @@ function updateStatus(stats) {
   }
   // 伺服器端附件已被消費（送出新任務）或清空時，同步清掉輸入框上方的縮圖
   if (stats.attachments === 0) clearAttachStrip();
+  // 📘 待送的技能規格以伺服器狀態為準
+  if (stats.pending_skills) syncSkillStrip(stats.pending_skills);
 }
 
 function setBusy(busy) {
@@ -822,7 +959,9 @@ function applyDone(data) {
 
 async function sendMessage() {
   const text = msgBox.value.trim();
-  if (!text) return;
+  const hasPending = skillStrip.querySelectorAll('.skill-chip').length > 0 || attachStrip.querySelectorAll('.attach-item').length > 0;
+  if (!text && !hasPending) return;   // 只有 chip／附件沒有文字時，伺服器會用預設提示詞
+  hideSlashMenu();
   setBusy(true);
   hideDecisionBar();
   hidePlanBar();
@@ -919,7 +1058,117 @@ VisionSnip.init({
   onError: (t) => renderEntry(toolLog, 'system', '錯誤', t),
 });
 
+// ===== 「/」選單：功能開關／指令 + 技能（選技能 = 手動按需載入規格，隨下一則訊息送出）=====
+const slashMenu = document.getElementById('slash-menu');
+const skillStrip = document.getElementById('skill-strip');
+let catalog = { commands: [], skills: [] };
+let slashItems = [];   // 目前顯示的可選項目（扁平，供 ↑↓ 移動）
+let slashActive = -1;
+fetch('/api/commands').then(r => r.json()).then(d => { catalog = d; }).catch(() => {});
+
+function slashQuery() {
+  const v = msgBox.value;
+  if (!v.startsWith('/') || v.includes('\n')) return null;
+  return v.slice(1).toLowerCase();
+}
+function updateSlashMenu() {
+  const q = slashQuery();
+  if (q === null) { hideSlashMenu(); return; }
+  const cmds = catalog.commands.filter(c => c.cmd.toLowerCase().includes(q) || (c.desc || '').toLowerCase().includes(q));
+  const skills = catalog.skills.filter(s => s.name.toLowerCase().includes(q) || (s.description || '').toLowerCase().includes(q) || (s.category || '').toLowerCase().includes(q));
+  slashItems = []; slashMenu.innerHTML = '';
+  const addSection = (title) => { const h = document.createElement('div'); h.className = 'slash-section'; h.textContent = title; slashMenu.appendChild(h); };
+  const addGroup = (title) => { const g = document.createElement('div'); g.className = 'slash-group'; g.textContent = title; slashMenu.appendChild(g); };
+  const addItem = (item, nameText, descText, badge) => {
+    const el = document.createElement('div'); el.className = 'slash-item'; el.dataset.index = slashItems.length;
+    const n = document.createElement('span'); n.className = 'name'; n.textContent = nameText; el.appendChild(n);
+    if (badge) { const b = document.createElement('span'); b.className = 'badge'; b.textContent = badge; el.appendChild(b); }
+    const d = document.createElement('span'); d.className = 'desc'; d.textContent = descText || ''; el.appendChild(d);
+    el.onmousedown = (e) => { e.preventDefault(); selectSlashItem(item); };  // mousedown：避免 textarea 先失焦
+    el.onmouseenter = () => setSlashActive(Number(el.dataset.index));
+    slashMenu.appendChild(el); slashItems.push({ item, el });
+  };
+  if (cmds.length) {
+    addSection('⚙️ 功能開關與指令');
+    let last = null;
+    cmds.forEach(c => { if (c.group !== last) { addGroup(c.group); last = c.group; } addItem({ type: 'command', ...c }, c.cmd, c.desc); });
+  }
+  if (skills.length) {
+    addSection('📘 技能（選取 = 手動載入規格，隨下一則訊息送出）');
+    let last = null;
+    skills.forEach(s => {
+      if (s.category !== last) { addGroup(s.category); last = s.category; }
+      addItem({ type: 'skill', ...s }, '/skill ' + s.name, s.description, s.has_memory ? '含經驗記憶' : null);
+    });
+  }
+  if (!slashItems.length) { const e = document.createElement('div'); e.className = 'slash-empty'; e.textContent = '沒有符合的指令或技能'; slashMenu.appendChild(e); }
+  slashMenu.classList.add('show');
+  setSlashActive(slashItems.length ? 0 : -1);
+}
+function setSlashActive(i) {
+  slashActive = i;
+  slashItems.forEach((it, k) => it.el.classList.toggle('active', k === i));
+  if (i >= 0) slashItems[i].el.scrollIntoView({ block: 'nearest' });
+}
+function hideSlashMenu() { slashMenu.classList.remove('show'); slashMenu.innerHTML = ''; slashItems = []; slashActive = -1; }
+function slashMenuOpen() { return slashMenu.classList.contains('show'); }
+async function selectSlashItem(item) {
+  hideSlashMenu();
+  if (item.type === 'command') {
+    // 只填入、不送出：/clear 這類指令誤點會清掉整段對話，按 Enter 才送
+    msgBox.value = item.cmd + (item.args ? '' : '');
+    msgBox.focus();
+    msgBox.setSelectionRange(msgBox.value.length, msgBox.value.length);
+    return;
+  }
+  msgBox.value = '';
+  await loadSkill(item.name);
+  msgBox.focus();
+}
+async function loadSkill(name) {
+  try {
+    const data = await VisionSnip.postJSON('/api/skill/load', { name });
+    if (data.error) { renderEntry(toolLog, 'system', '錯誤', data.error); return; }
+    if (data.already) { renderEntry(toolLog, 'system', '系統', `ℹ️ 技能 ${name} 的規格已在待送清單。`); return; }
+    renderEntry(toolLog, 'skillload', `📘 手動載入技能規格：${data.name}（≈${data.tokens} tokens，隨下一則訊息送出）`, data.doc);
+    syncSkillStrip(data.pending);
+  } catch (e) {
+    renderEntry(toolLog, 'system', '錯誤', '載入技能規格失敗：' + e);
+  }
+}
+function syncSkillStrip(names) {
+  skillStrip.querySelectorAll('.skill-chip').forEach(el => el.remove());
+  (names || []).forEach(name => {
+    const chip = document.createElement('span'); chip.className = 'skill-chip'; chip.dataset.name = name;
+    const t = document.createElement('span'); t.textContent = '📘 ' + name; chip.appendChild(t);
+    const rm = document.createElement('span'); rm.className = 'rm'; rm.textContent = '✕'; rm.title = '移除（不會隨下一則訊息送出）';
+    rm.onclick = async () => { const d = await VisionSnip.postJSON('/api/skill/remove', { name }); syncSkillStrip(d.pending); };
+    chip.appendChild(rm); skillStrip.appendChild(chip);
+  });
+  skillStrip.classList.toggle('show', (names || []).length > 0);
+}
+msgBox.addEventListener('input', updateSlashMenu);
+document.addEventListener('click', (e) => {
+  if (!slashMenu.contains(e.target) && e.target !== msgBox) hideSlashMenu();
+});
+
 msgBox.addEventListener('keydown', (e) => {
+  if (slashMenuOpen()) {
+    if (e.key === 'Escape') { e.preventDefault(); hideSlashMenu(); return; }
+    if (slashItems.length) {
+      if (e.key === 'ArrowDown') { e.preventDefault(); setSlashActive((slashActive + 1) % slashItems.length); return; }
+      if (e.key === 'ArrowUp') { e.preventDefault(); setSlashActive((slashActive - 1 + slashItems.length) % slashItems.length); return; }
+      if (e.key === 'Tab') { e.preventDefault(); if (slashActive >= 0) selectSlashItem(slashItems[slashActive].item); return; }
+      if (e.key === 'Enter' && !e.shiftKey) {
+        e.preventDefault();
+        const active = slashActive >= 0 ? slashItems[slashActive].item : null;
+        // 已經把指令完整打出來（例如 /auto on）就直接送出，不必再選一次
+        if (active && active.type === 'command' && msgBox.value.trim() === active.cmd.trim()) { hideSlashMenu(); sendMessage(); return; }
+        if (active) selectSlashItem(active);
+        return;
+      }
+    }
+  }
   if (e.key === 'Enter' && !e.shiftKey) {
     e.preventDefault();
     sendMessage();
@@ -1036,6 +1285,10 @@ class ConsoleHandler(BaseHTTPRequestHandler):
         if self.path == "/api/status":
             self._send_json(build_stats())
             return
+        if self.path == "/api/commands":
+            # 「/」選單的內容：功能開關／指令 + SKILLS.md 技能清單（含分類、是否有經驗記憶）
+            self._send_json({"commands": SLASH_COMMANDS, "skills": agent.list_skills()})
+            return
         static = vision_static_file(self.path)
         if static:
             body, content_type = static
@@ -1050,6 +1303,9 @@ class ConsoleHandler(BaseHTTPRequestHandler):
     def do_POST(self):
         if self.path.startswith("/api/vision/"):
             self._handle_vision(self.path[len("/api/vision/"):])
+            return
+        if self.path.startswith("/api/skill/"):
+            self._handle_skill(self.path[len("/api/skill/"):])
             return
         if self.path not in ("/api/send", "/api/decision"):
             self.send_error(404)
@@ -1068,6 +1324,27 @@ class ConsoleHandler(BaseHTTPRequestHandler):
                 traceback.print_exc()
                 stream.error(f"伺服器處理時發生錯誤：{e}")
                 self._finish(stream, bool(pending["mode"]))
+
+    def _handle_skill(self, action):
+        """📘 手動載入技能規格的 JSON 端點（不串流、不進 agent 的 lock，狀態在 pending_skills 自己的 lock）。"""
+        data = self._read_json()
+        try:
+            if action == "load":
+                self._send_json(load_pending_skill(data.get("name")))
+            elif action == "remove":
+                self._send_json({"pending": remove_pending_skill(data.get("name"))})
+            elif action == "clear":
+                take_all_pending_skills()
+                self._send_json({"pending": []})
+            elif action == "status":
+                self._send_json({"pending": pending_skill_names()})
+            else:
+                self.send_error(404)
+        except ValueError as e:
+            self._send_json({"error": str(e)}, status=400)
+        except Exception as e:
+            traceback.print_exc()
+            self._send_json({"error": f"伺服器處理技能規格時發生錯誤：{e}"}, status=500)
 
     def _handle_vision(self, action):
         """📷 影像附件的一般 JSON 端點（不串流）。附件狀態在 vision_session 自己的 lock 裡，
@@ -1126,23 +1403,26 @@ class ConsoleHandler(BaseHTTPRequestHandler):
             return
 
         if not message:
-            if vision_session.count() == 0:
+            if vision_session.count() == 0 and not pending_skill_names():
                 self._finish(stream, False)
                 return
-            message = DEFAULT_VISION_PROMPT  # 只附圖不打字：用預設提示詞
+            # 只附圖／只載入技能而不打字：用預設提示詞
+            message = DEFAULT_VISION_PROMPT if vision_session.count() else DEFAULT_SKILL_PROMPT
 
         if handle_slash_command(message, stream):
             self._finish(stream, False)  # slash 指令不消耗附件
             return
 
-        # 📷 只有「新任務」才消費附件（slash 指令與計畫核准／修改意見不會）
+        # 📷📘 只有「新任務」才消費附件與手動載入的技能規格（slash 指令與計畫核准／修改意見不會）
         attachments = vision_session.take_all()
+        skill_items = take_all_pending_skills()
 
         user_tokens = agent.count_tokens(message)
         agent.total_user_tokens += user_tokens
         stream.append({
             "channel": "chat", "role": "user", "text": message,
             "tokens": user_tokens, "attachments": len(attachments),
+            "skills": [name for name, _ in skill_items],
         })
 
         # 新任務開始：上一個已核准的計畫到此結束（見 clear_plan_for_new_task）
@@ -1156,6 +1436,16 @@ class ConsoleHandler(BaseHTTPRequestHandler):
         # 有附加影像：先跑獨立視覺 sub-session，把分析結果以文字併入這次的使用者訊息，
         # 之後不論是 plan 模式還是直接執行，主 Agent 拿到的都是「原文 + 影像分析」的純文字
         content = _run_vision_subsession(message, attachments, stream) if attachments else message
+
+        # 📘 手動載入的技能規格附在這則訊息後面（AI 可直接依規格裡的腳本路徑執行，省掉一輪「先載規格」）
+        if skill_items:
+            blocks = [block for _, block in skill_items]
+            skill_tokens = sum(agent.count_tokens(b) for b in blocks)
+            agent.total_tool_tokens += skill_tokens
+            content = attach_skill_docs(content, blocks)
+            stream.append({"channel": "system", "text": (
+                f"📘 隨訊息載入技能規格：{', '.join(name for name, _ in skill_items)}（≈{skill_tokens} tokens）"
+            )})
 
         if state["plan_mode"]:
             start_plan_flow(content, stream)
