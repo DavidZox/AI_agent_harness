@@ -33,4 +33,3 @@
 
 ## 記憶修改
 - [modify_memory](tools/modify_memory.md) — 寫入經驗記憶：預設全域常駐；加 `--skill <技能名稱>` 綁定該技能，只在載入其規格時出現
-

@@ -4,3 +4,6 @@ __pycache__/
 
 # 自動壓縮產生的摘要歸檔（logs/summary_*.md / .json），機器產生、會依 AGENT_SUMMARY_KEEP 自動輪替
 logs/
+
+# make_skill 的技能草稿（核准後才搬進 tools/ 與 scripts/，草稿是暫時檔）
+skills_system/drafts/

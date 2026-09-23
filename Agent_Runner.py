@@ -6,6 +6,7 @@ import threading
 import ollama  # 導入官方庫
 import shlex
 import time
+import re
 
 class SkillAgent:
     def __init__(self, model="gemma4:e4b", max_history=None, summary_model=None):
@@ -84,6 +85,20 @@ class SkillAgent:
         self._compress_state_lock = threading.Lock()
         self._notices = []                    # 背景壓縮完成／失敗的通知，下一次互動時顯示
         self.last_compression = None          # 最近一次壓縮的統計（檔名、則數、摘要 token 數）
+
+        # =========================
+        # 🧩 操作軌跡與 make_skill（見檔尾 SKILL_MODEL / MAKE_SKILL_SCHEMA 說明）
+        # trajectory：run_tool 每執行一支腳本就記一筆（指令、參數、當時的 cwd、成功／失敗、輸出開頭），
+        #   另有 kind="boundary" 的起點記錄（/clear、計畫核准、上一次 make_skill）。存在 messages 之外，
+        #   上下文壓縮不會沖掉，/make_skill 從這裡取「做對的步驟」編譯成組合技能，而不是靠模型回憶。
+        # pending_skill_draft：等待使用者核准／修改／取消的技能草稿（CLI 與 Web 共用同一份狀態）。
+        # =========================
+        self.session_id = time.strftime("%Y%m%d_%H%M%S")
+        self.trajectory = []
+        self.trajectory_seq = 0
+        self.drafts_dir = os.path.join(self.base_path, "drafts")
+        self.skill_model = SKILL_MODEL or self.summary_model
+        self.pending_skill_draft = None
 
     def count_tokens(self, text: str) -> int:
         """估算一段文字的 token 數（真實 token 尺度）。
@@ -571,6 +586,17 @@ class SkillAgent:
 {user_task}
 """
 
+    def confirm_plan(self, plan_msg):
+        """使用者核准計畫（CLI 的 _run_plan_flow 與 Web 的 handle_plan_response 共用）：
+        存進 current_plan 注入 system prompt、加入 [PLAN_CONFIRMED] 訊息，並在操作軌跡記一個起點，
+        之後 /make_skill 不指定範圍時就從這裡開始取步驟。"""
+        self.current_plan = plan_msg
+        self.messages.append({
+            'role': 'user',
+            'content': "[PLAN_CONFIRMED]\n使用者已核准上述計畫，現在開始依計畫執行第一個步驟。"
+        })
+        self.add_trajectory_boundary("plan_confirmed", plan=plan_msg)
+
     def build_plan_revision_request(self, feedback):
         """/plan 模式用：使用者對計畫不滿意時，帶著回饋重新規劃一次。規則同上。"""
         return f"""[PLAN_REVISION]
@@ -688,6 +714,7 @@ class SkillAgent:
     def reset_conversation(self):
         self.current_plan = None  # /clear 時一併清掉進行中的計畫，避免舊計畫殘留誤導新任務
         self.current_task = None  # 同上，避免舊任務敘述殘留誤導下一次的摘要 session
+        self.add_trajectory_boundary("clear")  # 軌跡本身保留（/trajectory 仍看得到），只記一個起點
         # 原地替換而不重綁 list：背景壓縮執行緒若正在對舊 list 做原地刪除，不會操作到已被丟棄的物件
         with self.messages_lock:
             self.messages[:] = [{'role': 'system', 'content': self.get_system_prompt()}]
@@ -917,6 +944,7 @@ class SkillAgent:
             # 將目前的容器路徑作為環境變數注入，讓 docker_run.py 讀取
             env = os.environ.copy()
             env["CONTAINER_CWD"] = self.container_cwd
+            cwd_before, container_before = self.current_cwd, self.container_cwd  # 軌跡記錄用：執行「前」的狀態
 
             try:
                 res = subprocess.run(
@@ -928,10 +956,12 @@ class SkillAgent:
                     timeout=TOOL_EXEC_TIMEOUT,
                 )
             except subprocess.TimeoutExpired:
-                return (
+                output_text = (
                     f"[ERROR] 工具 {script_name} 執行逾時（超過 {TOOL_EXEC_TIMEOUT} 秒），已被系統強制終止。"
                     f"這是 harness 的最後防線，各腳本自身應有更短的逾時；若經常觸發請檢查該腳本。"
                 )
+                self._record_trajectory(script_name, clean_args, output_text, cwd_before, container_before)
+                return output_text
 
             if res.returncode == 0:
                 output_text = res.stdout.strip()
@@ -943,10 +973,702 @@ class SkillAgent:
                 if not output_text.startswith("[ERROR]"):
                     output_text = f"[ERROR] 腳本 {script_name} 異常結束（exit code {res.returncode}）:\n{output_text}"
             self._sync_state_from_tool_output(output_text)
+            self._record_trajectory(script_name, clean_args, output_text, cwd_before, container_before)
             return output_text
 
         except Exception as e:
             return f"解析指令失敗: {e}"
+
+
+    # =========================================================
+    # 🧩 操作軌跡記錄與 make_skill（把做對的步驟編譯成組合技能）
+    # 分工：harness 記錄軌跡、挑步驟、驗證模型填的表單、用範本產生檔案、寫入索引；
+    # 模型只填一份 JSON（標題、描述、分類、參數化、每步目的、注意事項）；使用者在預覽後核准。
+    # 模型不寫任何 Python：產生的腳本只是資料，執行邏輯在 scripts/_composite.py。
+    # =========================================================
+    def _script_skill_map(self):
+        """scripts/<x>.py -> 技能名稱。先以「<技能>.md 提到 scripts/<技能>_cmd.py」為準，
+        其餘出現過的腳本再補上；每次重建（十幾個小檔案，成本可忽略），技能新增後不需重啟。"""
+        mapping, mentions = {}, {}
+        if not os.path.isdir(self.tools_dir):
+            return mapping
+        for fname in sorted(os.listdir(self.tools_dir)):
+            if not fname.endswith(".md"):
+                continue
+            skill = fname[:-3]
+            try:
+                with open(os.path.join(self.tools_dir, fname), "r", encoding="utf-8") as f:
+                    scripts = set(re.findall(r"scripts/([A-Za-z0-9_]+\.py)", f.read()))
+            except OSError:
+                continue
+            if f"{skill}_cmd.py" in scripts:
+                mapping[f"{skill}_cmd.py"] = skill
+            for s in scripts:
+                mentions.setdefault(s, skill)
+        for s, skill in mentions.items():
+            mapping.setdefault(s, skill)
+        return mapping
+
+    def _record_trajectory(self, script_name, args, output_text, cwd, container_cwd):
+        """run_tool 每執行一支腳本（成功、失敗、逾時都算；找不到腳本的猜測不算）記一筆。"""
+        status = "ERROR" if output_text.lstrip().startswith("[ERROR]") else "PASS"
+        self.trajectory_seq += 1
+        record = {
+            "id": self.trajectory_seq,
+            "kind": "exec",
+            "ts": time.strftime("%m-%d %H:%M:%S"),
+            "script": script_name,
+            "skill": self._script_skill_map().get(script_name),
+            "args": list(args),
+            "command": self._format_execute(script_name, args),
+            "cwd": cwd,
+            "container_cwd": container_cwd,
+            "status": status,
+            "output_head": output_text[:TRAJECTORY_OUTPUT_HEAD],
+            "task": (self.current_task or "")[:200],
+            "plan_active": bool(self.current_plan),
+        }
+        self.trajectory.append(record)
+        self._append_trajectory_log(record)
+        return record
+
+    def add_trajectory_boundary(self, reason, **extra):
+        """在軌跡記一個起點（/clear、計畫核准、make_skill 完成）；連續的起點只留一個。"""
+        if not self.trajectory:
+            return None  # 什麼都還沒執行（例如啟動時的 reset_conversation），不需要起點
+        if self.trajectory[-1]["kind"] == "boundary" and not extra:
+            return None  # 連續的一般起點只留一個；帶資料的起點（計畫核准、make_skill）一律記
+        self.trajectory_seq += 1
+        record = {"id": self.trajectory_seq, "kind": "boundary", "ts": time.strftime("%m-%d %H:%M:%S"),
+                  "reason": reason, **extra}
+        self.trajectory.append(record)
+        self._append_trajectory_log(record)
+        return record
+
+    def _append_trajectory_log(self, record):
+        """追加到 logs/trajectory.jsonl（跨 session 的稽核記錄；寫不進去不影響主流程）。"""
+        try:
+            log_dir = os.path.join(self.script_dir, "logs")
+            os.makedirs(log_dir, exist_ok=True)
+            with open(os.path.join(log_dir, TRAJECTORY_LOG), "a", encoding="utf-8") as f:
+                f.write(json.dumps({"session": self.session_id, **record}, ensure_ascii=False) + "\n")
+        except (OSError, TypeError, ValueError):
+            pass
+
+    @staticmethod
+    def _quote_arg(arg):
+        """顯示用：含空白／引號的參數以雙引號包住（與 AGENT.md 範例一致，shlex 可還原）。"""
+        if arg == "" or any(c.isspace() for c in arg) or '"' in arg or "'" in arg:
+            return '"' + arg.replace("\\", "\\\\").replace('"', '\\"') + '"'
+        return arg
+
+    def _format_execute(self, script_name, args):
+        tail = " ".join(self._quote_arg(a) for a in args)
+        return f"EXECUTE: scripts/{script_name}" + (f" {tail}" if tail else "")
+
+    def trajectory_steps(self, spec=None):
+        """挑出要編譯的步驟，回傳 (steps, error)。
+        spec 省略＝上一個起點之後的全部步驟；'all'＝整個 session；'3-7'、'3,5,8'、'3-5,9'＝依編號。"""
+        execs = [r for r in self.trajectory if r["kind"] == "exec"]
+        if not execs:
+            return [], "本次 session 還沒有執行過任何腳本，沒有可編譯的軌跡。"
+        spec = (spec or "").strip().lower()
+        if spec in ("", "recent", "last"):
+            last_boundary = max((i for i, r in enumerate(self.trajectory) if r["kind"] == "boundary"), default=-1)
+            steps = [r for r in self.trajectory[last_boundary + 1:] if r["kind"] == "exec"]
+            if not steps:
+                return [], ("自上一個起點（/clear、計畫核准或上一次 make_skill）之後沒有執行過腳本；"
+                            "要用更早的步驟請指定編號範圍（例如 3-7）或 all，/trajectory 可查編號。")
+            return steps, None
+        if spec == "all":
+            return execs, None
+        wanted = set()
+        for part in spec.split(","):
+            part = part.strip()
+            if not part:
+                continue
+            if "-" in part:
+                lo, _, hi = part.partition("-")
+                if not (lo.strip().isdigit() and hi.strip().isdigit()):
+                    return [], f"步驟範圍格式錯誤：{part}（可用 3-7、3,5,8 或 all）"
+                lo, hi = sorted((int(lo), int(hi)))
+                wanted.update(range(lo, hi + 1))
+            elif part.isdigit():
+                wanted.add(int(part))
+            else:
+                return [], f"步驟範圍格式錯誤：{part}（可用 3-7、3,5,8 或 all）"
+        steps = [r for r in execs if r["id"] in wanted]
+        if not steps:
+            return [], f"編號 {spec} 沒有對應到任何已執行的腳本步驟，輸入 /trajectory 查看編號。"
+        return steps, None
+
+    def format_trajectory(self):
+        """/trajectory：列出本次 session 的軌跡（編號、成功／失敗、指令、所屬技能、起點）。"""
+        if not self.trajectory:
+            return "本次 session 尚未記錄任何腳本執行。"
+        labels = {"clear": "/clear", "plan_confirmed": "計畫核准", "make_skill": "make_skill"}
+        lines = ["🧭 操作軌跡（✅ 成功 / ❌ 失敗；/make_skill 預設取最後一個起點之後的步驟）："]
+        for r in self.trajectory:
+            if r["kind"] == "boundary":
+                label = labels.get(r["reason"], r["reason"])
+                if r.get("name"):
+                    label += f" {r['name']}"
+                lines.append(f"── 起點 #{r['id']}：{label}（{r['ts']}）──")
+            else:
+                mark = "✅" if r["status"] == "PASS" else "❌"
+                skill = f"（{r['skill']}）" if r.get("skill") else ""
+                lines.append(f"#{r['id']} {mark} {r['command']}{skill}")
+        lines.append("用法：/make_skill <技能名稱> [3-7 | 3,5,8 | all]")
+        return "\n".join(lines)
+
+    @staticmethod
+    def _group_trajectory(steps):
+        """成功步驟各自帶著它之前的失敗嘗試（同一個意圖下的修正歷程）；最後仍未修正的失敗另外回傳。"""
+        groups, pending = [], []
+        for r in steps:
+            if r["status"] == "PASS":
+                groups.append({"step": r, "failed_before": pending})
+                pending = []
+            else:
+                pending.append(r)
+        return groups, pending
+
+    def _plan_for_steps(self, steps):
+        """這批步驟所屬的已核准計畫：最後一個步驟之前最近的計畫核准起點；沒有就用目前的 current_plan。"""
+        last_id = steps[-1]["id"]
+        for r in reversed(self.trajectory):
+            if r["id"] < last_id and r["kind"] == "boundary" and r.get("reason") == "plan_confirmed" and r.get("plan"):
+                return r["plan"]
+        return self.current_plan
+
+    def _skill_categories(self):
+        """SKILLS.md 裡的分類（## 標題），依出現順序。"""
+        cats = []
+        try:
+            with open(self.index_file, "r", encoding="utf-8") as f:
+                for line in f:
+                    if line.startswith("## "):
+                        cats.append(line[3:].strip())
+        except OSError:
+            pass
+        return cats
+
+    def _skill_dependencies(self, skill):
+        """tools/<skill>.md frontmatter 的 dependencies 陣列；讀不到就空。"""
+        if not skill:
+            return []
+        try:
+            with open(os.path.join(self.tools_dir, f"{skill}.md"), "r", encoding="utf-8") as f:
+                for line in f:
+                    if line.startswith("dependencies:"):
+                        return [str(d) for d in json.loads(line.split(":", 1)[1].strip() or "[]")]
+        except (OSError, ValueError):
+            pass
+        return []
+
+    def validate_new_skill_name(self, name):
+        """新技能名稱的規則：英數底線、字母開頭、不與現有技能或腳本衝突。合法回傳 None，否則回傳原因。"""
+        if not SKILL_NAME_RE.match(name or ""):
+            return "技能名稱只能用英文字母、數字與底線，須以字母開頭、2～41 字（例如 check_ros2_nodes）。"
+        if os.path.exists(os.path.join(self.tools_dir, f"{name}.md")) or \
+                os.path.exists(os.path.join(self.base_path, "scripts", f"{name}_cmd.py")):
+            return f"技能 {name} 已存在（tools/{name}.md 或 scripts/{name}_cmd.py），請換一個名稱。"
+        return None
+
+    def _make_skill_prompts(self, name, groups, trailing, plan_text, tasks, previous=None, feedback=None):
+        categories = self._skill_categories() or [DEFAULT_SKILL_CATEGORY]
+        system_prompt = f"""你是機器人維運 Agent 框架的技能規格撰寫者。系統記錄了一段使用者引導 Agent「做對」的操作軌跡，
+現在要把它編譯成一個可重複使用的新技能（名稱：{name}）。新技能的腳本由系統自動組合（依序執行軌跡中既有技能的腳本），
+你不需要寫任何程式，只需要填寫下列 JSON 欄位，全部使用繁體中文：
+- title：中文短標題（12 字內）。
+- description：SKILLS.md 索引用的一行描述，說明「什麼情境該用這個技能」（40 字內）。
+- category：從現有分類中選一個：{"、".join(categories)}；都不合適就填「{DEFAULT_SKILL_CATEGORY}」。
+- purpose：兩三句話，說明這個技能從頭到尾做了什麼、何時使用。
+- parameters：之後重複使用時會變動的值（容器名稱、路徑、關鍵字、topic／node 名稱等），每個含 name（英文 snake_case）、
+  description（中文）、example（軌跡中實際出現的原值，逐字照抄）。固定不變的指令結構不要參數化；沒有會變動的值就給空陣列。
+- steps：軌跡中每一個成功步驟都要有一筆，step_id 照抄。include 通常為 true，只有明顯屬於探索、與最終流程無關的步驟才 false。
+  purpose 為該步的目的（30 字內）。args 必須與該步原本的參數「數量相同、順序相同」：要參數化的值改寫成 {{參數名稱}} 佔位符，
+  其餘逐字照抄；不可新增、刪除或改寫參數。
+- success_criteria：從成功步驟的輸出判斷「怎樣算成功」，一句話。
+- pitfalls：從失敗嘗試與修正歸納出的注意事項（每則 60 字內，沒有就給空陣列），寫給之後使用這個技能的 Agent 看。
+只能使用軌跡中出現過的步驟，不可以憑空新增步驟或腳本。"""
+
+        lines = [f"技能名稱：{name}", ""]
+        lines.append("【使用者在引導過程中下的指令】")
+        lines += [f"- {t}" for t in tasks] or ["（無記錄）"]
+        lines.append("")
+        lines.append("【使用者核准的計畫】")
+        lines.append(plan_text.strip() if plan_text else "（這段操作沒有經過 Plan 模式）")
+        lines.append("")
+        lines.append("【操作軌跡：成功步驟，依時間順序】")
+        for g in groups:
+            r = g["step"]
+            skill = f"技能 {r['skill']}" if r.get("skill") else f"腳本 {r['script']}"
+            lines.append(f"步驟 {r['id']}（{skill}）：{r['command']}")
+            lines.append(f"  參數（JSON）：{json.dumps(r['args'], ensure_ascii=False)}")
+            head = " ".join(r["output_head"].split())[:200]
+            lines.append(f"  結果：PASS；輸出開頭：{head}")
+            if g["failed_before"]:
+                lines.append("  這一步之前失敗過的嘗試：")
+                for fr in g["failed_before"]:
+                    lines.append(f"    - {fr['command']} → {' '.join(fr['output_head'].split())[:160]}")
+        if trailing:
+            lines.append("")
+            lines.append("【最後仍失敗、沒有被修正的嘗試（不會成為步驟，可寫進 pitfalls）】")
+            for fr in trailing:
+                lines.append(f"- {fr['command']} → {' '.join(fr['output_head'].split())[:160]}")
+        if feedback:
+            lines.append("")
+            lines.append("【使用者對上一版草稿的修改意見，請依意見重擬】")
+            lines.append(feedback.strip())
+            lines.append("")
+            lines.append("【上一版草稿（JSON）】")
+            lines.append(json.dumps(previous, ensure_ascii=False))
+        lines.append("")
+        lines.append("請輸出 JSON。")
+        return system_prompt, "\n".join(lines)
+
+    _PLACEHOLDER_RE = re.compile(r"\{([A-Za-z_][A-Za-z0-9_]*)\}")
+
+    @classmethod
+    def _fill_placeholders(cls, text, values):
+        return cls._PLACEHOLDER_RE.sub(lambda m: values[m.group(1)] if m.group(1) in values else m.group(0), text)
+
+    @classmethod
+    def _rename_placeholders(cls, text, rename):
+        return cls._PLACEHOLDER_RE.sub(lambda m: "{" + rename.get(m.group(1), m.group(1)) + "}", text)
+
+    def _normalize_skill_draft(self, name, data, groups, trailing, plan_text, tasks):
+        """把模型填的 JSON 對照實際軌跡做驗證與收斂：參數化必須能還原成記錄到的原值，
+        對不上就退回原值並留下提醒；分類不存在就放預設分類；模型漏填的步驟照原值納入。"""
+        warnings = []
+        get = data.get if isinstance(data, dict) else (lambda k, d=None: d)
+        clean = lambda v, n: " ".join(str(v or "").split())[:n]
+        title = clean(get("title"), 30) or name
+        description = clean(get("description"), 80) or f"由 make_skill 依操作軌跡產生的組合技能"
+        categories = self._skill_categories()
+        category = clean(get("category"), 40)
+        if category not in categories:
+            if category and category != DEFAULT_SKILL_CATEGORY:
+                warnings.append(f"分類「{category}」不在 SKILLS.md 裡，改放「{DEFAULT_SKILL_CATEGORY}」")
+            category = DEFAULT_SKILL_CATEGORY
+        purpose = clean(get("purpose"), 400) or description
+        success = clean(get("success_criteria"), 200)
+
+        params, rename, seen = [], {}, set()
+        for p in (get("parameters") or []):
+            if not isinstance(p, dict):
+                continue
+            raw = str(p.get("name") or "").strip()
+            pname = re.sub(r"[^a-z0-9_]", "_", raw.lower()).strip("_")
+            if pname and pname[0].isdigit():
+                pname = f"p_{pname}"
+            if not pname or pname in seen:
+                continue
+            seen.add(pname)
+            if raw and raw != pname:
+                rename[raw] = pname
+            params.append({"name": pname, "description": clean(p.get("description"), 80) or pname,
+                           "example": str(p.get("example") or "")})
+        examples = {p["name"]: p["example"] for p in params}
+
+        model_steps = {}
+        for s in (get("steps") or []):
+            if isinstance(s, dict) and isinstance(s.get("step_id"), int):
+                model_steps[s["step_id"]] = s
+        steps_out, excluded, used = [], [], set()
+        for g in groups:
+            r = g["step"]
+            ms = model_steps.get(r["id"])
+            if ms is None:
+                warnings.append(f"步驟 #{r['id']} 模型未填寫，依原始參數納入")
+                ms = {}
+            if ms.get("include") is False:
+                excluded.append({"step_id": r["id"], "command": r["command"],
+                                 "reason": clean(ms.get("purpose"), 60) or "模型判定為探索性步驟"})
+                continue
+            fallback = f"執行 {r['skill']}" if r.get("skill") else f"執行 {r['script']}"
+            step_purpose = clean(ms.get("purpose"), 60) or fallback
+            args = list(r["args"])
+            proposed = ms.get("args") if isinstance(ms.get("args"), list) else None
+            if proposed is not None and len(proposed) != len(args):
+                warnings.append(f"步驟 #{r['id']} 的參數數量與實際記錄不同，改用原值")
+            elif proposed is not None:
+                # 模型給的參數名可能含空白／連字號（{Work Dir}）：先做字面改名再走正規的佔位符處理
+                templated = []
+                for a in proposed:
+                    a = str(a)
+                    for raw, new_name in rename.items():
+                        a = a.replace("{" + raw + "}", "{" + new_name + "}")
+                    templated.append(self._rename_placeholders(a, rename))
+                if all(self._fill_placeholders(t, examples) == o for t, o in zip(templated, args)):
+                    args = templated
+                else:
+                    warnings.append(f"步驟 #{r['id']} 的參數化代回原值後與實際記錄不一致，改用原值")
+            # 小模型常見：參數宣告得對（example 是原值），args 卻照抄原值、沒放佔位符。example 就是記錄到的原值，
+            # 由系統代入是安全的（代回一定等於原值）：整個參數相同直接換；長度 ≥3 的值也允許在參數字串裡以
+            # 詞邊界為界的子字串替換（避免 "docker" 換掉 "docker_runcmd" 裡的字）。長的 example 先換。
+            auto_filled = []
+            for p in sorted(params, key=lambda p: -len(p["example"])):
+                ex, pname = p["example"], p["name"]
+                if not ex:
+                    continue
+                for i, a in enumerate(args):
+                    if "{" + pname + "}" in a:
+                        continue
+                    if a == ex:
+                        args[i] = "{" + pname + "}"
+                        auto_filled.append(pname)
+                    elif len(ex) >= 3:
+                        new_a = re.sub(r"(?<![A-Za-z0-9_])" + re.escape(ex) + r"(?![A-Za-z0-9_])", "{" + pname + "}", a)
+                        if new_a != a:
+                            args[i] = new_a
+                            auto_filled.append(pname)
+            if auto_filled:
+                warnings.append(f"步驟 #{r['id']}：模型未放佔位符，系統依原值自動代入參數 {', '.join(sorted(set(auto_filled)))}")
+            for a in args:
+                used.update(n for n in self._PLACEHOLDER_RE.findall(a) if n in examples)
+            steps_out.append({
+                "step_id": r["id"], "skill": r.get("skill"), "script": r["script"], "purpose": step_purpose,
+                "args": args, "original_args": list(r["args"]), "cwd": r.get("cwd"), "container_cwd": r.get("container_cwd"),
+            })
+        if not steps_out:
+            warnings.append("模型把所有步驟都排除了，改為全部納入（可在修改意見指明要拿掉哪幾步）")
+            excluded = []
+            for g in groups:
+                r = g["step"]
+                steps_out.append({
+                    "step_id": r["id"], "skill": r.get("skill"), "script": r["script"],
+                    "purpose": f"執行 {r['skill']}" if r.get("skill") else f"執行 {r['script']}",
+                    "args": list(r["args"]), "original_args": list(r["args"]),
+                    "cwd": r.get("cwd"), "container_cwd": r.get("container_cwd"),
+                })
+        unused = [p["name"] for p in params if p["name"] not in used]
+        if unused:
+            warnings.append(f"參數 {', '.join(unused)} 沒有被任何步驟使用，已移除")
+            params = [p for p in params if p["name"] in used]
+
+        pitfalls, seen_p = [], set()
+        for x in (get("pitfalls") or []):
+            t = clean(x, 120)
+            if t and t not in seen_p:
+                seen_p.add(t)
+                pitfalls.append(t)
+        pitfalls = pitfalls[:8]
+
+        skills_used = sorted({s["skill"] for s in steps_out if s.get("skill")})
+        deps = sorted({d for sk in skills_used for d in self._skill_dependencies(sk)})
+        return {
+            "name": name, "title": title, "description": description, "category": category,
+            "purpose": purpose, "success_criteria": success, "parameters": params, "steps": steps_out,
+            "excluded": excluded, "pitfalls": pitfalls, "warnings": warnings,
+            "skills_used": skills_used, "dependencies": deps,
+            "non_readonly": sorted(set(skills_used) & NON_READONLY_SKILLS),
+            "trailing_failures": [fr["command"] for fr in trailing],
+            "created": time.strftime("%Y-%m-%d %H:%M"), "model": self.skill_model, "revision": 0,
+            "source": {"session": self.session_id, "step_ids": [g["step"]["id"] for g in groups],
+                       "plan": plan_text, "tasks": tasks},
+        }
+
+    def draft_skill_from_trajectory(self, name, steps, plan_text=None, previous=None, feedback=None):
+        """呼叫草擬模型（獨立一次性 session，不碰 self.messages）產生技能草稿 dict。失敗拋 ValueError。"""
+        groups, trailing = self._group_trajectory(steps)
+        if not groups:
+            raise ValueError("選取的步驟裡沒有任何成功的執行，無法編譯成技能。")
+        tasks = []
+        for r in steps:
+            t = (r.get("task") or "").strip()
+            if t and t not in tasks:
+                tasks.append(t)
+        system_prompt, user_prompt = self._make_skill_prompts(name, groups, trailing, plan_text, tasks, previous, feedback)
+        res = ollama.chat(
+            model=self.skill_model,
+            messages=[{'role': 'system', 'content': system_prompt}, {'role': 'user', 'content': user_prompt}],
+            format=MAKE_SKILL_SCHEMA,
+            options={'temperature': 0.1, 'num_ctx': NUM_CTX, 'num_predict': MAKE_SKILL_MAX_PREDICT},
+            think=False,
+        )
+        raw = res['message']['content'].strip()
+        try:
+            data = json.loads(raw)
+        except (ValueError, TypeError):
+            raise ValueError(f"模型沒有回傳合法的 JSON 草稿（開頭：{raw[:120]!r}），請再試一次或換 AGENT_SKILL_MODEL。")
+        draft = self._normalize_skill_draft(name, data, groups, trailing, plan_text, tasks)
+        draft["raw"] = data
+        draft["_steps"] = steps  # 修改意見重擬時要用同一批步驟
+        return draft
+
+    # ---------- 範本渲染：規格文件 / 組合腳本 / 索引行 / 預覽 ----------
+    def _skill_signature(self, draft):
+        return " ".join(f"<{p['name']}>" for p in draft["parameters"])
+
+    def _skill_example_call(self, draft):
+        tail = " ".join(self._quote_arg(p["example"]) for p in draft["parameters"])
+        return f"EXECUTE: scripts/{draft['name']}_cmd.py" + (f" {tail}" if tail else "")
+
+    def render_skill_doc(self, draft):
+        """tools/<name>.md：與其他技能相同的 OKF 段落（用途／語法／範例／回傳／異常），維持精簡。"""
+        n = len(draft["steps"])
+        lines = [
+            "---", "type: Tool", f"title: {draft['title']}", f"description: {draft['description']}",
+            "version: 0.1.0", f"dependencies: {json.dumps(draft['dependencies'], ensure_ascii=False)}",
+            f"source: make_skill {draft['created']}（組合技能，步驟來自實際操作軌跡；可直接編輯）", "---", "",
+            "# 用途", draft["purpose"],
+            f"依序執行 {n} 個既有技能的腳本，任一步回 `[ERROR]` 即停止並回報該步原因：",
+        ]
+        for i, s in enumerate(draft["steps"], 1):
+            skill = s["skill"] or s["script"]
+            call = " ".join(self._quote_arg(a) for a in s["args"])
+            lines.append(f"{i}. {s['purpose']}（{skill}：`scripts/{s['script']}{' ' + call if call else ''}`）")
+        lines += ["", "# 語法", f"`EXECUTE: scripts/{draft['name']}_cmd.py {self._skill_signature(draft)}`".replace(" `", "`")]
+        for p in draft["parameters"]:
+            lines.append(f"* `{p['name']}`：{p['description']}（例：`{p['example']}`）")
+        if not draft["parameters"]:
+            lines.append("不需要參數。")
+        lines += ["", "# 範例", f"`{self._skill_example_call(draft)}`", "", "# 回傳"]
+        success = f" {draft['success_criteria']}" if draft["success_criteria"] else ""
+        lines.append(f"成功：`[PASS] {draft['name']} 完成 {n}/{n} 步` 加各步驟輸出（標明步驟編號）。{success}".rstrip())
+        lines.append("失敗：`[ERROR] ... 在第 k/N 步失敗` 加該步原因，之前步驟的輸出保留供診斷；依原因修正參數，不要原樣重試。")
+        lines += ["", "# 異常"]
+        for p in draft["pitfalls"]:
+            lines.append(f"* {p}")
+        skills = "、".join(draft["skills_used"]) or "（無）"
+        lines.append(f"* 各步驟的參數規則與其他異常見底層技能的規格：{skills}。")
+        return "\n".join(lines) + "\n"
+
+    def render_skill_script(self, draft):
+        """scripts/<name>_cmd.py：只有資料（NAME / PARAMS / STEPS），執行邏輯在 _composite.py。
+        放在 drafts/<name>/ 時會自己往上找到 scripts/，草稿可直接重播測試。"""
+        params = [{"name": p["name"], "description": p["description"], "example": p["example"]} for p in draft["parameters"]]
+        steps = [{"purpose": s["purpose"], "skill": s["skill"] or "", "script": s["script"], "args": s["args"],
+                  "source_step": s["step_id"]} for s in draft["steps"]]
+        header = (
+            f'"""{draft["title"]}（make_skill 於 {draft["created"]} 依實際操作軌跡自動產生的組合技能）\n\n'
+            f'{draft["description"]}\n'
+            "依序執行下列既有技能的腳本，任一步回 [ERROR] 即停止；命令列位置參數依 PARAMS 順序代入 STEPS 的 {名稱} 佔位符。\n"
+            "這支檔案只是資料，可直接編輯 PARAMS / STEPS；執行邏輯在同目錄的 _composite.py。\n"
+            f'草擬模型：{draft["model"]}；來源軌跡步驟：{draft["source"]["step_ids"]}\n"""\n'
+        )
+        body = (
+            "import os\n"
+            "import sys\n\n"
+            "_HERE = os.path.dirname(os.path.abspath(__file__))\n"
+            "# 正式位置為 skills_system/scripts/；草稿位於 skills_system/drafts/<name>/ 時往上兩層找 scripts/\n"
+            '_SCRIPTS_DIR = _HERE if os.path.exists(os.path.join(_HERE, "_composite.py")) \\\n'
+            '    else os.path.join(os.path.dirname(os.path.dirname(_HERE)), "scripts")\n'
+            "sys.path.insert(0, _SCRIPTS_DIR)\n"
+            "from _composite import run_composite\n\n"
+            f"NAME = {json.dumps(draft['name'])}\n"
+            f"PARAMS = {json.dumps(params, ensure_ascii=False, indent=4)}\n"
+            f"STEPS = {json.dumps(steps, ensure_ascii=False, indent=4)}\n\n"
+            'if __name__ == "__main__":\n'
+            "    print(run_composite(NAME, PARAMS, STEPS, sys.argv[1:], scripts_dir=_SCRIPTS_DIR))\n"
+        )
+        return header + body
+
+    def skill_index_line(self, draft):
+        return f"- [{draft['name']}](tools/{draft['name']}.md) — {draft['description']}"
+
+    def skill_draft_preview(self, draft):
+        """給使用者看的預覽：摘要、參數、步驟、排除、注意事項、提醒，最後附完整規格文件。"""
+        d = draft
+        lines = [f"🧩 技能草稿 {d['name']}：{d['title']}" + (f"（第 {d['revision']} 次重擬）" if d.get("revision") else ""),
+                 f"分類：{d['category']}｜索引描述：{d['description']}",
+                 f"參數：{len(d['parameters'])} 個" + ("" if d["parameters"] else "（不需要參數）")]
+        for p in d["parameters"]:
+            lines.append(f"  - {p['name']}：{p['description']}（例：{p['example']}）")
+        lines.append(f"步驟：{len(d['steps'])} 步（來自軌跡 #{', #'.join(str(i) for i in d['source']['step_ids'])}）")
+        for i, s in enumerate(d["steps"], 1):
+            call = " ".join(self._quote_arg(a) for a in s["args"])
+            lines.append(f"  {i}. {s['purpose']} — {s['skill'] or s['script']}：scripts/{s['script']}{' ' + call if call else ''}")
+        if d["excluded"]:
+            lines.append("排除的步驟（要加回請在修改意見指明編號）：")
+            for e in d["excluded"]:
+                lines.append(f"  - #{e['step_id']} {e['command']}（{e['reason']}）")
+        if d["pitfalls"]:
+            lines.append("異常／注意事項：")
+            lines += [f"  - {p}" for p in d["pitfalls"]]
+        notes = list(d["warnings"])
+        if d["non_readonly"]:
+            notes.append(f"含會改變狀態的步驟（{'、'.join(d['non_readonly'])}）：重播驗證會實際執行這些操作，請先確認。")
+        if d["trailing_failures"]:
+            notes.append(f"軌跡最後仍有 {len(d['trailing_failures'])} 次未修正的失敗嘗試，未納入步驟：" + "；".join(d["trailing_failures"][:3]))
+        if notes:
+            lines.append("⚠️ 提醒：")
+            lines += [f"  - {n}" for n in notes]
+        paths = d.get("paths") or {}
+        if paths:
+            lines.append(f"草稿檔案：{os.path.relpath(os.path.dirname(paths['doc']), self.script_dir)}/（{d['name']}.md、{d['name']}_cmd.py、draft.json）")
+        lines.append("── 規格文件預覽（tools/%s.md）──" % d["name"])
+        lines.append(self.render_skill_doc(d).rstrip())
+        return "\n".join(lines)
+
+    # ---------- 草稿檔案：寫入 / 重播 / 註冊 / 丟棄 ----------
+    def write_skill_draft(self, draft):
+        """寫到 skills_system/drafts/<name>/：<name>.md、<name>_cmd.py、draft.json（供稽核與修改意見重擬）。"""
+        d = os.path.join(self.drafts_dir, draft["name"])
+        os.makedirs(d, exist_ok=True)
+        paths = {"doc": os.path.join(d, f"{draft['name']}.md"),
+                 "script": os.path.join(d, f"{draft['name']}_cmd.py"),
+                 "json": os.path.join(d, "draft.json")}
+        with open(paths["doc"], "w", encoding="utf-8") as f:
+            f.write(self.render_skill_doc(draft))
+        with open(paths["script"], "w", encoding="utf-8") as f:
+            f.write(self.render_skill_script(draft))
+        draft["paths"] = paths
+        with open(paths["json"], "w", encoding="utf-8") as f:
+            json.dump({k: v for k, v in draft.items() if k != "_steps"} | {"steps_source": draft.get("_steps")},
+                      f, ensure_ascii=False, indent=2)
+        return paths
+
+    def replay_skill_draft(self, draft):
+        """用軌跡中的原值（各參數的 example）實際跑一次草稿腳本，回傳 (ok, output)。
+        cwd 用第一步當時的工作目錄（相對路徑才會一樣），不同步 harness 狀態（這只是測試）。"""
+        script = draft["paths"]["script"]
+        argv = [p["example"] for p in draft["parameters"]]
+        first = draft["steps"][0]
+        cwd = first.get("cwd") if first.get("cwd") and os.path.isdir(first["cwd"]) else self.current_cwd
+        env = os.environ.copy()
+        env["CONTAINER_CWD"] = first.get("container_cwd") or self.container_cwd
+        try:
+            res = subprocess.run([sys.executable, script] + argv, capture_output=True, text=True,
+                                 cwd=cwd, env=env, timeout=TOOL_EXEC_TIMEOUT)
+        except subprocess.TimeoutExpired:
+            return False, f"[ERROR] 重播逾時（超過 {TOOL_EXEC_TIMEOUT} 秒）"
+        out = res.stdout.strip() or res.stderr.strip() or "（沒有任何輸出）"
+        if res.returncode != 0 and not out.startswith("[ERROR]"):
+            out = f"[ERROR] 草稿腳本異常結束（exit code {res.returncode}）:\n{out}"
+        return not out.lstrip().startswith("[ERROR]"), out
+
+    def _insert_skill_index_line(self, category, line):
+        with open(self.index_file, "r", encoding="utf-8") as f:
+            lines = f.read().splitlines()
+        header = f"## {category}"
+        if header in lines:
+            start = lines.index(header)
+            end = next((i for i in range(start + 1, len(lines)) if lines[i].startswith("## ")), len(lines))
+            insert_at = end
+            while insert_at > start + 1 and not lines[insert_at - 1].strip():
+                insert_at -= 1
+            lines.insert(insert_at, line)
+        else:
+            if lines and lines[-1].strip():
+                lines.append("")
+            lines += [header, line]
+        with open(self.index_file, "w", encoding="utf-8") as f:
+            f.write("\n".join(lines).rstrip("\n") + "\n")
+
+    def register_skill_draft(self, draft):
+        """核准：搬進 tools/ 與 scripts/、寫入 SKILLS.md、刪除草稿目錄、軌跡記起點。回傳給使用者的訊息。"""
+        err = self.validate_new_skill_name(draft["name"])
+        if err:
+            raise ValueError(err)
+        doc_path = os.path.join(self.tools_dir, f"{draft['name']}.md")
+        script_path = os.path.join(self.base_path, "scripts", f"{draft['name']}_cmd.py")
+        with open(doc_path, "w", encoding="utf-8") as f:
+            f.write(self.render_skill_doc(draft))
+        with open(script_path, "w", encoding="utf-8") as f:
+            f.write(self.render_skill_script(draft))
+        self._insert_skill_index_line(draft["category"], self.skill_index_line(draft))
+        # 稽核：草稿 JSON 搬到 logs/，草稿目錄刪除
+        try:
+            log_dir = os.path.join(self.script_dir, "logs")
+            os.makedirs(log_dir, exist_ok=True)
+            with open(os.path.join(log_dir, f"make_skill_{draft['name']}_{time.strftime('%Y%m%d_%H%M%S')}.json"),
+                      "w", encoding="utf-8") as f:
+                json.dump({k: v for k, v in draft.items() if k not in ("_steps", "paths")}, f, ensure_ascii=False, indent=2)
+        except (OSError, TypeError, ValueError):
+            pass
+        self.discard_skill_draft(draft)
+        self.add_trajectory_boundary("make_skill", name=draft["name"])
+        rel = lambda p: os.path.relpath(p, self.script_dir)
+        return (
+            f"✅ 已註冊技能 {draft['name']}（{draft['title']}）：\n"
+            f"- 規格：{rel(doc_path)}\n"
+            f"- 腳本：{rel(script_path)}（組合 {len(draft['steps'])} 步，執行邏輯在 scripts/_composite.py）\n"
+            f"- 索引：SKILLS.md「{draft['category']}」新增一行\n"
+            f"之後 `EXECUTE: {draft['name']}` 載入規格、`{self._skill_example_call(draft)}` 執行；"
+            f"下一次呼叫 AI 時 system prompt 的技能索引就會包含它。規格與腳本都可以直接手動修改。"
+        )
+
+    def discard_skill_draft(self, draft):
+        d = os.path.join(self.drafts_dir, draft["name"])
+        for fname in ("draft.json", f"{draft['name']}.md", f"{draft['name']}_cmd.py"):
+            try:
+                os.remove(os.path.join(d, fname))
+            except OSError:
+                pass
+        try:
+            os.rmdir(d)
+        except OSError:
+            pass
+
+    # ---------- 待決定的草稿：CLI 與 Web 共用的狀態機 ----------
+    def start_skill_draft(self, name, spec=None):
+        """/make_skill <name> [範圍]：挑步驟、呼叫模型草擬、寫草稿檔、設為待決定。回傳 (draft, error)。"""
+        name = (name or "").strip()
+        if self.pending_skill_draft:
+            return None, (f"已有技能草稿 {self.pending_skill_draft['name']} 待決定：請先核准（y）、"
+                          f"重播驗證後核准（t）、取消（n）或送出修改意見。")
+        err = self.validate_new_skill_name(name)
+        if err:
+            return None, err
+        steps, err = self.trajectory_steps(spec)
+        if err:
+            return None, err
+        try:
+            draft = self.draft_skill_from_trajectory(name, steps, self._plan_for_steps(steps))
+        except ValueError as e:
+            return None, str(e)
+        except Exception as e:
+            return None, f"呼叫模型草擬技能失敗：{e}"
+        self.write_skill_draft(draft)
+        self.pending_skill_draft = draft
+        return draft, None
+
+    def revise_skill_draft(self, feedback):
+        """使用者的修改意見：帶著上一版 JSON 與意見重擬，同一批步驟。回傳 (draft, error)。"""
+        old = self.pending_skill_draft
+        if not old:
+            return None, "目前沒有待決定的技能草稿。"
+        try:
+            draft = self.draft_skill_from_trajectory(old["name"], old["_steps"], old["source"]["plan"],
+                                                     previous=old.get("raw"), feedback=feedback)
+        except ValueError as e:
+            return None, str(e)
+        except Exception as e:
+            return None, f"呼叫模型重擬技能失敗：{e}"
+        draft["revision"] = old.get("revision", 0) + 1
+        self.write_skill_draft(draft)
+        self.pending_skill_draft = draft
+        return draft, None
+
+    def approve_skill_draft(self, replay=False):
+        """核准並註冊；replay=True 先用原值重播草稿腳本，失敗則保留草稿不註冊。回傳 (ok, message)。"""
+        draft = self.pending_skill_draft
+        if not draft:
+            return False, "目前沒有待決定的技能草稿。"
+        note = ""
+        if replay:
+            ok, out = self.replay_skill_draft(draft)
+            if not ok:
+                return False, ("🧪 重播驗證失敗，草稿保留、尚未註冊。可送出修改意見重擬、直接核准（y）跳過驗證，"
+                               f"或取消（n）：\n{out[:2000]}")
+            note = f"🧪 重播驗證通過（以軌跡中的原值執行草稿腳本）：\n{out[:1500]}\n\n"
+        try:
+            msg = self.register_skill_draft(draft)
+        except (OSError, ValueError) as e:
+            return False, f"⚠️ 註冊技能失敗，草稿保留：{e}"
+        self.pending_skill_draft = None
+        return True, note + msg
+
+    def cancel_skill_draft(self):
+        draft = self.pending_skill_draft
+        if not draft:
+            return "目前沒有待決定的技能草稿。"
+        self.discard_skill_draft(draft)
+        self.pending_skill_draft = None
+        return f"🚫 已取消技能草稿 {draft['name']}（草稿檔已刪除，軌跡保留，可再次 /make_skill）。"
 
 # =========================================================
 # 🚀 MAIN LOOP (加入 Token Tracking 顯示)
@@ -982,11 +1704,7 @@ def _run_plan_flow(agent, user_task):
         choice = input("\n是否核准此計畫並開始執行？(y=核准 / n=取消 / 直接輸入修改意見=重新規劃): ").strip()
 
         if choice.lower() == 'y':
-            agent.current_plan = plan_msg
-            agent.messages.append({
-                'role': 'user',
-                'content': "[PLAN_CONFIRMED]\n使用者已核准上述計畫，現在開始依計畫執行第一個步驟。"
-            })
+            agent.confirm_plan(plan_msg)
             return True
 
         if choice == "" or choice.lower() in ('n', 'no'):
@@ -1078,6 +1796,57 @@ SUMMARY_MODEL = os.environ.get("AGENT_SUMMARY_MODEL", "").strip() or None
 
 # /parallel_cal 的預設值（CLI 與 Web Console 啟動時的初始狀態），可用 AGENT_PARALLEL_CAL=1 開啟。
 PARALLEL_CAL_DEFAULT = os.environ.get("AGENT_PARALLEL_CAL", "").strip().lower() in ("1", "on", "true", "yes")
+
+# 🧩 make_skill：把使用者引導 Agent「做對」的操作軌跡編譯成新的組合技能（SkillAgent.start_skill_draft 起）。
+# 草擬用的模型預設同摘要模型（AGENT_SUMMARY_MODEL，再退回主模型）；這是離線、一次性的工作，記憶體夠的話可用
+# AGENT_SKILL_MODEL 指定較大的模型（例如 gemma4:26b）提高參數化與描述的品質。模型只填 JSON，不寫程式。
+SKILL_MODEL = os.environ.get("AGENT_SKILL_MODEL", "").strip() or None
+MAKE_SKILL_MAX_PREDICT = 3000
+TRAJECTORY_LOG = "trajectory.jsonl"   # logs/ 下的軌跡稽核記錄（每次腳本執行一行，跨 session 追加；已 .gitignore）
+TRAJECTORY_OUTPUT_HEAD = 300          # 每筆軌跡保留的輸出開頭字元數（讓草擬模型知道結果長什麼樣）
+DEFAULT_SKILL_CATEGORY = "自建技能"   # 模型選的分類不在 SKILLS.md 裡時的落點（沒有這個段落會自動建立）
+SKILL_NAME_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_]{1,40}$")
+# 會改變狀態（建容器、送工單、寫記憶、切換目錄／容器）的技能：組合技能含這些步驟時，預覽會提醒「重播驗證會真的執行」
+NON_READONLY_SKILLS = {"docker_est", "workitem_est", "modify_memory", "change_dir", "docker_open"}
+
+# 技能草稿的 JSON schema（Ollama format=）：欄位意義見 SkillAgent._make_skill_prompts，驗證見 _normalize_skill_draft。
+MAKE_SKILL_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "title": {"type": "string"},
+        "description": {"type": "string"},
+        "category": {"type": "string"},
+        "purpose": {"type": "string"},
+        "parameters": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "name": {"type": "string"},
+                    "description": {"type": "string"},
+                    "example": {"type": "string"},
+                },
+                "required": ["name", "description", "example"],
+            },
+        },
+        "steps": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "step_id": {"type": "integer"},
+                    "include": {"type": "boolean"},
+                    "purpose": {"type": "string"},
+                    "args": {"type": "array", "items": {"type": "string"}},
+                },
+                "required": ["step_id", "include", "purpose", "args"],
+            },
+        },
+        "success_criteria": {"type": "string"},
+        "pitfalls": {"type": "array", "items": {"type": "string"}},
+    },
+    "required": ["title", "description", "category", "purpose", "parameters", "steps", "success_criteria", "pitfalls"],
+}
 
 # 使用者角色但實為工具回傳的訊息前綴（見 _split_for_compression 的配對規則）
 TOOL_RESULT_PREFIXES = ("[tool result]", "【系統執行結果】")
@@ -1193,6 +1962,40 @@ def after_turn_compression(agent, parallel, notify):
         return 'sync'
     return None
 
+def _run_make_skill_flow(agent, arg_text):
+    """CLI 的 /make_skill：草擬 → 預覽 → y 核准／t 重播驗證後核准／n 取消／其他文字＝修改意見重擬。
+    與 Web 的 handle_skill_draft_response 用同一套 SkillAgent 狀態機。"""
+    parts = arg_text.split()
+    if not parts:
+        print("用法：/make_skill <技能名稱> [步驟範圍，例如 3-7、3,5,8 或 all]；先用 /trajectory 查看已記錄的步驟")
+        return
+    name, spec = parts[0], (parts[1] if len(parts) > 1 else None)
+    print(f"🧩 正在依操作軌跡草擬技能 {name}（模型 {agent.skill_model}）…")
+    draft, err = agent.start_skill_draft(name, spec)
+    if err:
+        print(f"⚠️ {err}")
+        return
+    print(agent.skill_draft_preview(draft))
+    while True:
+        choice = input("\n核准並註冊(y) / 先重播驗證再註冊(t) / 取消(n) / 直接輸入修改意見: ").strip()
+        lower = choice.lower()
+        if lower in ('y', 't'):
+            ok, msg = agent.approve_skill_draft(replay=(lower == 't'))
+            print(msg)
+            if ok:
+                return
+            continue
+        if choice == "" or lower in ('n', 'no'):
+            print(agent.cancel_skill_draft())
+            return
+        print("🧩 依修改意見重新草擬…")
+        draft, err = agent.revise_skill_draft(choice)
+        if err:
+            print(f"⚠️ {err}")
+            continue
+        print(agent.skill_draft_preview(draft))
+
+
 def main():
     agent = SkillAgent(
         model="gemma4:e4b",
@@ -1297,6 +2100,12 @@ def main():
             if user_msg.lower() == '/plan off':
                 plan_mode = False
                 print("📝 已關閉 Plan 模式（恢復直接執行）")
+                continue
+            if user_msg.lower() == '/trajectory':
+                print(agent.format_trajectory())
+                continue
+            if user_msg.lower() == '/make_skill' or user_msg.lower().startswith('/make_skill '):
+                _run_make_skill_flow(agent, user_msg[len('/make_skill'):].strip())
                 continue
             if user_msg.lower() == '/plan done':
                 if agent.current_plan:

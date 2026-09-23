@@ -101,6 +101,8 @@ SLASH_COMMANDS = [
     {"cmd": "/menu", "desc": "顯示完整指令說明", "group": "動作與查詢"},
     {"cmd": "/compress", "desc": "手動壓縮並歸檔目前的歷史對話", "group": "動作與查詢"},
     {"cmd": "/plan done", "desc": "提早清除目前已核准的計畫", "group": "動作與查詢"},
+    {"cmd": "/make_skill ", "desc": "把這段做對的操作步驟編譯成新技能（後接技能名稱，可再接步驟範圍如 3-7）", "group": "動作與查詢", "args": True},
+    {"cmd": "/trajectory", "desc": "列出本次 session 記錄到的腳本執行軌跡（步驟編號、成功／失敗）", "group": "動作與查詢"},
     {"cmd": "/objective set ", "desc": "設定 Sticky Objective（後面接內容）", "group": "動作與查詢", "args": True},
     {"cmd": "/objective show", "desc": "查看目前的 Objective", "group": "動作與查詢"},
     {"cmd": "/objective clear", "desc": "清除 Objective", "group": "動作與查詢"},
@@ -160,6 +162,8 @@ MENU_TEXT = """可用指令：
 /objective clear        清除 Objective
 /skills                 列出所有可用技能
 /skill <技能名稱>        手動載入該技能的規格（含其經驗記憶），隨你下一則訊息一起送出
+/trajectory             列出本次 session 記錄到的腳本執行軌跡（步驟編號、成功／失敗、所屬技能）
+/make_skill <名稱> [範圍] 把做對的操作步驟編譯成新技能（範圍省略＝上一個起點之後；可用 3-7、3,5,8 或 all）
 
 在輸入框打「/」會彈出選單：上半是功能開關與指令，下半是 SKILLS.md 裡的技能（依分類）。
 ↑↓ 移動、Enter／Tab 選取、Esc 關閉，也可以繼續打字過濾。選指令只會填入輸入框、要再按
@@ -219,11 +223,24 @@ prompt_eval_count），使用者輸入與工具回傳以每次呼叫後校準的
 會出現通知。但要注意：只有 Ollama 真的為模型配置多個 slot、或摘要模型（AGENT_SUMMARY_MODEL）
 與主模型不同時，摘要才會與主對話同時推論；目前版本的 Ollama 對多模態模型（gemma4）強制
 單 slot，同模型的背景摘要會讓你的下一次對話在 Ollama 內排隊，等待只是搬到下一次呼叫。
-算力弱的設備建議維持關閉（序列處理）。""".format(
+算力弱的設備建議維持關閉（序列處理）。
+
+自建技能（/make_skill）：每次腳本執行（成功或失敗）都會記進「操作軌跡」，它存在對話 messages 之外，
+上下文壓縮不會沖掉，/trajectory 可以查看。當你一步步引導 AI 把一件事做對之後，輸入
+/make_skill <技能名稱> 會把「上一個起點（/clear、計畫核准、上一次 make_skill）之後」的成功步驟、
+之前失敗的嘗試與核准過的計畫交給草擬模型（{skill_model}，可用 AGENT_SKILL_MODEL 換更大的模型）
+填一份結構化草稿：標題、索引描述、分類、哪些值要變成參數、每步的目的、注意事項。模型不寫任何
+程式：系統依範本產生規格文件與一支依序呼叫既有腳本的組合腳本（skills_system/drafts/<名稱>/），
+並用實際記錄驗證模型的參數化（代回原值必須一致，否則退回原值並提醒）。左欄會顯示草稿預覽，下方
+出現「核准並註冊／重播驗證後註冊／取消」按鈕，也可以直接打字送出修改意見重擬。核准後才會搬進
+tools/ 與 scripts/ 並寫入 SKILLS.md，下一次呼叫 AI 就能用 EXECUTE: <名稱> 載入規格再執行。
+「重播驗證」會用軌跡中的原值實際跑一次草稿腳本，含會改變狀態的步驟（docker_est、workitem_est、
+change_dir 等）時預覽會先提醒。只有一步的做對經驗請改用 modify_memory --skill 記憶，不必做技能。""".format(
     threshold=TOOL_RESULT_TOKEN_THRESHOLD, vision_model=VISION_MODEL,
     token_threshold=TOKEN_THRESHOLD, soft_threshold=SOFT_TOKEN_THRESHOLD,
     keep_recent=KEEP_RECENT_TOKENS, num_ctx=NUM_CTX, min_compress=MIN_COMPRESS_TOKENS,
     soft_pct=round(SOFT_TOKEN_THRESHOLD / NUM_CTX * 100), hard_pct=round(TOKEN_THRESHOLD / NUM_CTX * 100),
+    skill_model=agent.skill_model,
 )
 
 
@@ -265,6 +282,8 @@ def build_stats():
         "pending_skills": pending_skill_names(),
         "vision_model": VISION_MODEL,
         "summary_model": agent.summary_model,
+        "skill_model": agent.skill_model,
+        "skill_draft": agent.pending_skill_draft["name"] if agent.pending_skill_draft else None,
         "parallel_cal": state["parallel_cal"],
         "compressing": agent.compression_in_progress(),
         "last_compression": agent.last_compression,
@@ -359,11 +378,7 @@ def handle_plan_response(text, events):
     choice = text.strip()
 
     if choice.lower() == 'y':
-        agent.current_plan = plan_pending["text"]
-        agent.messages.append({
-            'role': 'user',
-            'content': "[PLAN_CONFIRMED]\n使用者已核准上述計畫，現在開始依計畫執行第一個步驟。"
-        })
+        agent.confirm_plan(plan_pending["text"])  # 存 current_plan、加 [PLAN_CONFIRMED]、軌跡記起點（與 CLI 共用）
         plan_pending["active"] = False
         plan_pending["text"] = None
         # 核准即退出 Plan 模式：Plan 模式的意義是「下一個新任務先規劃」，規劃階段到此結束；
@@ -390,6 +405,30 @@ def handle_plan_response(text, events):
     # 其餘輸入視為修改意見，重新規劃一次
     agent.messages.append({'role': 'user', 'content': agent.build_plan_revision_request(choice)})
     _ask_and_present_plan(events)
+    return "revised"
+
+
+def handle_skill_draft_response(text, events):
+    """處理使用者對待決定技能草稿的回應（比照計畫核准）：y 核准並註冊、t 先重播驗證再註冊、
+    n／空白取消、其他文字＝修改意見重擬。狀態在 agent.pending_skill_draft（與 CLI 共用）。
+    回傳 "registered" / "cancelled" / "revised" / "failed"（失敗時草稿仍待決定）。"""
+    choice = text.strip()
+    lower = choice.lower()
+    if lower in ("y", "t"):
+        if lower == "t":
+            events.append({"channel": "system", "text": "🧪 正在以軌跡中的原值重播草稿腳本…"})
+        ok, msg = agent.approve_skill_draft(replay=(lower == "t"))
+        events.append({"channel": "system", "text": msg})
+        return "registered" if ok else "failed"
+    if choice == "" or lower in ("n", "no"):
+        events.append({"channel": "system", "text": agent.cancel_skill_draft()})
+        return "cancelled"
+    events.append({"channel": "system", "text": "🧩 依修改意見重新草擬技能…"})
+    draft, err = agent.revise_skill_draft(choice)
+    if err:
+        events.append({"channel": "system", "text": f"⚠️ {err}（上一版草稿仍待決定）"})
+        return "failed"
+    events.append({"channel": "skilldraft", "name": draft["name"], "text": agent.skill_draft_preview(draft)})
     return "revised"
 
 
@@ -587,6 +626,28 @@ def handle_slash_command(message, events):
         agent.sticky_objective = ""
         events.append({"channel": "system", "text": "🧹 已清除 Sticky Objective"})
         return True
+    if lower == "/trajectory":
+        events.append({"channel": "system", "text": agent.format_trajectory()})
+        return True
+    if lower == "/make_skill" or lower.startswith("/make_skill "):
+        parts = text[len("/make_skill"):].split()
+        if not parts:
+            events.append({"channel": "system", "text": (
+                "用法：/make_skill <技能名稱> [步驟範圍，例如 3-7、3,5,8 或 all]；先用 /trajectory 查看已記錄的步驟。"
+            )})
+            return True
+        name, spec = parts[0], (parts[1] if len(parts) > 1 else None)
+        events.append({"channel": "system", "text": f"🧩 正在依操作軌跡草擬技能 {name}（模型 {agent.skill_model}）…"})
+        draft, err = agent.start_skill_draft(name, spec)
+        if err:
+            events.append({"channel": "system", "text": f"⚠️ {err}"})
+            return True
+        events.append({"channel": "skilldraft", "name": draft["name"], "text": agent.skill_draft_preview(draft)})
+        events.append({"channel": "system", "text": (
+            "🧩 草稿已寫入 skills_system/drafts/，尚未註冊。下方按鈕：核准並註冊／重播驗證後註冊／取消；"
+            "也可以直接在輸入框送出修改意見，系統會重擬草稿。"
+        )})
+        return True
     if lower == "/skills":
         lines, cat = ["📘 可用技能（/skill <名稱> 或「/」選單可手動載入規格）："], None
         for sk in agent.list_skills():
@@ -657,6 +718,8 @@ HTML_PAGE = r"""<!DOCTYPE html>
   .entry.summary .tag { color: #b39ddb; opacity: 1; }
   .entry.plan { background: #16302c; border: 1px solid #2f6f5e; }
   .entry.plan .tag { color: #4fd8ba; opacity: 1; }
+  .entry.skilldraft { background: #26203a; border: 1px solid #6d5aa8; font-family: "Cascadia Code", Consolas, monospace; font-size: 12px; }
+  .entry.skilldraft .tag { color: #c4b0ff; opacity: 1; font-family: inherit; }
   .entry.tool.oversized { border: 1px solid #b0873f; box-shadow: 0 0 0 1px #b0873f inset; }
   .entry.tool.oversized .tag { color: #e6b95c; opacity: 1; }
   .entry.tool.oversized.reviewed { border-color: #2f4a3a; box-shadow: none; opacity: 0.75; }
@@ -666,9 +729,9 @@ HTML_PAGE = r"""<!DOCTYPE html>
     background: #4a4c50; border-radius: 4px; cursor: pointer;
   }
   footer { border-top: 1px solid #3a3c40; padding: 10px 12px; background: #2b2d31; }
-  #decision-bar, #plan-bar { display: none; margin-bottom: 8px; gap: 8px; align-items: center; font-size: 13px; flex-wrap: wrap; }
-  #decision-bar.show, #plan-bar.show { display: flex; }
-  #decision-bar button, #plan-bar button { cursor: pointer; }
+  #decision-bar, #plan-bar, #skill-draft-bar { display: none; margin-bottom: 8px; gap: 8px; align-items: center; font-size: 13px; flex-wrap: wrap; }
+  #decision-bar.show, #plan-bar.show, #skill-draft-bar.show { display: flex; }
+  #decision-bar button, #plan-bar button, #skill-draft-bar button { cursor: pointer; }
   .input-row { display: flex; gap: 8px; }
   textarea#msg {
     flex: 1; resize: none; height: 54px; background: #1e1f22; color: #e3e3e3;
@@ -772,6 +835,12 @@ HTML_PAGE = r"""<!DOCTYPE html>
     <button onclick="sendPlanDecision('y')">✅ 核准並執行</button>
     <button class="danger" onclick="sendPlanDecision('n')">🚫 取消任務</button>
   </div>
+  <div id="skill-draft-bar">
+    <span>🧩 有技能草稿待你決定（也可以直接在下方輸入修改意見送出，系統會重擬）：</span>
+    <button onclick="sendSkillDraftDecision('y')">✅ 核准並註冊</button>
+    <button class="secondary" onclick="sendSkillDraftDecision('t')">🧪 重播驗證後註冊</button>
+    <button class="danger" onclick="sendSkillDraftDecision('n')">🚫 取消草稿</button>
+  </div>
   <div id="attach-strip"><span id="attach-hint">📎 已附加影像（送出時一起分析）：</span></div>
   <div id="skill-strip"><span id="skill-hint">📘 已載入技能規格（隨下一則訊息一起送出）：</span></div>
   <div class="input-row">
@@ -795,6 +864,7 @@ const msgBox = document.getElementById('msg');
 const sendBtn = document.getElementById('send-btn');
 const decisionBar = document.getElementById('decision-bar');
 const planBar = document.getElementById('plan-bar');
+const skillDraftBar = document.getElementById('skill-draft-bar');
 const attachStrip = document.getElementById('attach-strip');
 const attachMenu = document.getElementById('attach-menu');
 const attachBtn = document.getElementById('attach-btn');
@@ -842,6 +912,8 @@ function renderEvents(events) {
       renderEntry(toolLog, 'summary', '🧠 AI 摘要（獨立 session）', ev.text);
     } else if (ev.channel === 'plan') {
       renderEntry(chatLog, 'plan', '📝 計畫（待你確認）', ev.text);
+    } else if (ev.channel === 'skilldraft') {
+      renderEntry(chatLog, 'skilldraft', `🧩 技能草稿 ${ev.name}（待你決定：核准／重播驗證／取消，或送出修改意見）`, ev.text);
     } else if (ev.channel === 'system') {
       renderEntry(toolLog, 'system', '系統', ev.text);
     }
@@ -906,6 +978,14 @@ function hidePlanBar() {
   planBar.classList.remove('show');
 }
 
+function showSkillDraftBar() {
+  skillDraftBar.classList.add('show');
+}
+
+function hideSkillDraftBar() {
+  skillDraftBar.classList.remove('show');
+}
+
 function handleStreamMessage(msg) {
   if (msg.type === 'event') {
     renderEvents([msg.event]);
@@ -955,6 +1035,7 @@ function applyDone(data) {
   if (data.stats) updateStatus(data.stats);
   if (data.awaiting_decision) showDecisionBar(data.pending_mode);
   if (data.awaiting_plan) showPlanBar();
+  if (data.awaiting_skill_draft) showSkillDraftBar();
 }
 
 async function sendMessage() {
@@ -965,6 +1046,7 @@ async function sendMessage() {
   setBusy(true);
   hideDecisionBar();
   hidePlanBar();
+  hideSkillDraftBar();
   msgBox.value = '';
   try {
     applyDone(await streamPost('/api/send', { message: text }));
@@ -992,6 +1074,20 @@ async function sendDecision(action) {
 async function sendPlanDecision(action) {
   setBusy(true);
   hidePlanBar();
+  try {
+    applyDone(await streamPost('/api/send', { message: action }));
+  } catch (e) {
+    renderEntry(toolLog, 'system', '錯誤', '與伺服器的連線中斷：' + e);
+  } finally {
+    setBusy(false);
+    msgBox.focus();
+  }
+}
+
+// 🧩 技能草稿的決定跟計畫一樣走 /api/send：有草稿待決定時，輸入框的內容一律視為對草稿的回應
+async function sendSkillDraftDecision(action) {
+  setBusy(true);
+  hideSkillDraftBar();
   try {
     applyDone(await streamPost('/api/send', { message: action }));
   } catch (e) {
@@ -1259,6 +1355,7 @@ class ConsoleHandler(BaseHTTPRequestHandler):
         stream.done(
             awaiting_decision=awaiting_decision,
             awaiting_plan=plan_pending["active"],
+            awaiting_skill_draft=agent.pending_skill_draft is not None,
             pending_mode=pending["mode"] if awaiting_decision else None,
         )
 
@@ -1400,6 +1497,13 @@ class ConsoleHandler(BaseHTTPRequestHandler):
                 self._finish(stream, False)  # 仍在規劃中，不算回合結束
             else:
                 self._finish_turn(stream, awaiting_decision)  # 核准後跑完、或取消，都是回合結束
+            return
+
+        # 有技能草稿待決定時，輸入框的內容一律視為對草稿的回應（y／t／n／修改意見），
+        # 與計畫核准同一種處理方式；這裡不呼叫模型的主對話，也不消耗附件與待送技能規格。
+        if agent.pending_skill_draft:
+            handle_skill_draft_response(message, stream)
+            self._finish(stream, False)
             return
 
         if not message:
