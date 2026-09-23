@@ -32,5 +32,5 @@
 - [workitem_est](tools/workitem_est.md) — 發送工作項目給調度系統時使用
 
 ## 記憶修改
-- [modify_memory](tools/modify_memory.md) — 寫入經驗記憶
+- [modify_memory](tools/modify_memory.md) — 寫入經驗記憶：預設寫入全域 Memory.md（每輪常駐）；加 `--skill <技能名稱>` 則綁定該技能，只在載入其規格時一併出現
 

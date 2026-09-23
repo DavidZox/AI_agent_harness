@@ -33,6 +33,9 @@ class SkillAgent:
 
         # 技能規格文件（OKF：Open Knowledge Format）目錄，每個技能一份 tools/<name>.md
         self.tools_dir = os.path.join(self.base_path, "tools")
+        # 技能綁定的經驗記憶目錄，每個技能一份 memory/<name>.md（由 modify_memory --skill 寫入）。
+        # 載入規格文件時自動附在後面，跟規格文件同一套按需載入；全域記憶仍在 Memory.md 常駐。
+        self.skill_memory_dir = os.path.join(self.base_path, "memory")
 
         # =========================
         # 🧠 Token Tracker（真實 token 尺度，見檔尾 NUM_CTX / TOKEN_THRESHOLD 說明）
@@ -692,16 +695,38 @@ class SkillAgent:
 
         return payload or None
 
+    def _skill_memory_entries(self, skill_name):
+        """技能綁定的經驗記憶條目（skills_system/memory/<skill>.md 裡以「- [」開頭的行）。
+        沒有檔案或沒有條目時回傳空 list。"""
+        path = os.path.join(self.skill_memory_dir, f"{skill_name}.md")
+        if not os.path.exists(path):
+            return []
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                return [line.rstrip() for line in f if line.lstrip().startswith("- [")]
+        except OSError:
+            return []
+
     def _load_skill_doc(self, skill_name):
         """若 skill_name 對應到 tools/<skill_name>.md，回傳其內容；否則回傳 None。
-        容忍 AI 直接照抄索引連結而帶上 .md 後綴（例如 list_dir.md）。"""
+        容忍 AI 直接照抄索引連結而帶上 .md 後綴（例如 list_dir.md）。
+        若該技能有綁定的經驗記憶（memory/<skill_name>.md），附在規格文件後面一起回傳：
+        這些是使用者要求記住、專屬於此技能的修正，只在真的用到此技能時才進入上下文。"""
         if skill_name.endswith(".md"):
             skill_name = skill_name[:-3]
         doc_path = os.path.join(self.tools_dir, f"{skill_name}.md")
         if not os.path.exists(doc_path):
             return None
         with open(doc_path, "r", encoding="utf-8") as f:
-            return f.read()
+            doc = f.read()
+        entries = self._skill_memory_entries(skill_name)
+        if not entries:
+            return doc
+        memory_block = (
+            f"# 經驗記憶（使用者曾要求記住、專屬於 {skill_name} 的 {len(entries)} 則經驗，使用此技能時必須遵守）\n"
+            + "\n".join(entries)
+        )
+        return f"{doc.rstrip()}\n\n{memory_block}\n"
 
     def _normalize_script_name(self, raw_token):
         """確保腳本檔名以 _cmd.py 結尾（例如 cd -> cd_cmd.py，find_file.py -> find_file_cmd.py）。"""
@@ -755,7 +780,9 @@ class SkillAgent:
 
             skill_doc = self._load_skill_doc(raw_token)
             if skill_doc is not None:
-                print(f"📖 Agent 選擇技能索引: {raw_token}（載入規格文件，尚未執行）")
+                n_memory = len(self._skill_memory_entries(raw_token[:-3] if raw_token.endswith(".md") else raw_token))
+                memory_note = f"，附 {n_memory} 則技能經驗記憶" if n_memory else ""
+                print(f"📖 Agent 選擇技能索引: {raw_token}（載入規格文件{memory_note}，尚未執行）")
                 return f"{SKILL_DOC_PREFIX} '{raw_token}' 的規格文件（依此內容才可執行，請使用其中標明的實際腳本路徑）：\n{skill_doc}"
 
             script_name = self._normalize_script_name(raw_token)

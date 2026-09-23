@@ -27,33 +27,30 @@
    - **範例**：`EXECUTE: scripts/grep_cmd.py "model" .`
 
 ## Memory Write Protocol / 記憶寫入協議
-1. 僅當使用者明確要求：
-   - 「記住這件事」
-   - 「寫入記憶」
-   - 「保存這個經驗」
-   - 「記錄這個問題」
-   Agent 才允許使用 `modify_memory` 工具。
-2. 記憶內容需先分類：
-   - 偏好問題
-   - 錯誤執行
-   - 工具使用
-   - 專案經驗
-   - 其他
-3. 記憶格式統一為：
-   `[問題種類] | [問題描述] | [解決方法或結論]`
-
-4. 寫入指令格式：
-   `EXECUTE: modify_memory_cmd.py "[格式化記憶內容]"`
-5. 範例：
-   `EXECUTE: modify_memory_cmd.py "偏好問題 | 使用者偏好繁體中文 | 後續回答優先使用繁體中文"`
-   `EXECUTE: modify_memory_cmd.py "錯誤執行 | ROS2 launch 缺少 config.yaml | 補齊設定後成功啟動"`
-6. 禁止寫入：
+1. 僅當使用者明確要求（「記住這件事」「寫入記憶」「保存這個經驗」「記錄這個問題」）時，Agent 才允許使用 `modify_memory` 工具。
+2. 記憶內容需先分類：偏好問題／錯誤執行／工具使用／專案經驗／其他。
+3. 記憶格式統一為：`[問題種類] | [問題描述] | [解決方法或結論]`
+4. **決定寫入目標（兩種，擇一）**：
+   - 使用者在要求裡**點名了某個技能**（例如「幫 stt_engine 記住…」「這是 view_file 的注意事項」）→ 綁該技能：加上 `--skill [技能名稱]`。
+   - 沒點名時自問：「這則記憶是不是只有在**已經決定要用技能 X、正在看 X 的規格**時才需要？」
+     - 是 → `--skill X`：X 的參數用法、前置條件、曾發生過的錯誤（例如 stt_engine 缺模組、ROS2_topic_echo 的等待秒數要調大）。
+     - 否 → 全域（不加參數）：通用原則、幫你決定「該不該用某技能」的規則（例如「容器內指令一律用 docker_runcmd」）、溝通風格、專案經驗。全域記憶每輪常駐，綁技能的記憶只在載入該技能規格時出現。
+   - `--skill` 後面只能是 `SKILLS.md` 裡的技能名稱，**永遠不能是 modify_memory 本身**（它只是寫入的工具，不是記憶的主題）；拿不準就寫全域。
+5. 寫入指令格式（兩種）：
+   `EXECUTE: scripts/modify_memory_cmd.py "[格式化記憶內容]" --skill [技能名稱]`
+   `EXECUTE: scripts/modify_memory_cmd.py "[格式化記憶內容]"`
+6. 範例：
+   - 綁技能：`EXECUTE: scripts/modify_memory_cmd.py "錯誤執行 | stt_engine 缺少 Python 模組 faster-whisper | 先安裝該模組再重試" --skill stt_engine`
+   - 綁技能：`EXECUTE: scripts/modify_memory_cmd.py "工具使用 | find_file 的路徑參數 | 只能是當前目錄或子目錄，不能是 /" --skill find_file`
+   - 全域：`EXECUTE: scripts/modify_memory_cmd.py "偏好問題 | 使用者偏好繁體中文 | 後續回答優先使用繁體中文"`
+   - 全域（選技能的規則）：`EXECUTE: scripts/modify_memory_cmd.py "操作流程規範 | 容器內指令 | 一律使用 docker_runcmd 技能，不要自己下 docker exec"`
+7. 禁止寫入：
    - 無意義對話
    - 重複內容
    - 過長 log
    - 敏感資訊（API Key、Password）
    - 未確認推測
-   
+
 ## Communication Style / 溝通風格
 - 專業、冷靜、簡潔。
 - 在執行指令前，先簡短說明你為何選擇該工具或這段 CLI 指令。
