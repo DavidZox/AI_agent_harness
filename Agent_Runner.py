@@ -99,6 +99,7 @@ class SkillAgent:
         self.drafts_dir = os.path.join(self.base_path, "drafts")
         self.skill_model = SKILL_MODEL or self.summary_model
         self.pending_skill_draft = None
+        self.last_reply_retry = None  # 最近一次 ask_ai 是否因「空白回覆」自動重試過（給 UI 顯示的說明），見 ask_ai
 
     def count_tokens(self, text: str) -> int:
         """估算一段文字的 token 數（真實 token 尺度）。
@@ -212,6 +213,13 @@ class SkillAgent:
                 marker = next((mk for mk in HARNESS_MARKERS if content.startswith(mk)), None)
                 if marker:
                     role = f"harness {marker}"
+            elif role == 'assistant':
+                # 回覆協議的 JSON：只保留給使用者的文字與這輪的 action，thought 與 JSON 語法不進摘要
+                parsed = parse_agent_reply(content)
+                if parsed["valid"]:
+                    content = parsed["reply"]
+                    if parsed["action"]:
+                        content = (content + "\n" if content else "") + f"[action] {action_text(parsed['action'])}"
             parts.append(f"[{role}]\n{content}")
         return "\n\n".join(parts)
 
@@ -580,7 +588,7 @@ class SkillAgent:
 - 用條列式（1. 2. 3. ...）列出步驟，簡短清楚即可
 - 每個步驟盡量標明會用到的技能名稱（來自 SKILLS.md），以及這步要做什麼
 - 如果某步驟不需要任何技能，直接說明要做什麼即可
-- 這一輪絕對不要輸出 EXECUTE: 指令，只列出計畫，等待使用者確認
+- 這一輪的 action 必須是 null（不執行任何技能），計畫寫在 reply 裡，等待使用者確認
 
 任務：
 {user_task}
@@ -601,7 +609,7 @@ class SkillAgent:
         """/plan 模式用：使用者對計畫不滿意時，帶著回饋重新規劃一次。規則同上。"""
         return f"""[PLAN_REVISION]
 使用者對你剛才列出的計畫有以下修改意見，請依照意見重新規劃一份新的步驟清單。
-規則同上：只列出計畫、不要輸出 EXECUTE: 指令，等待使用者確認。
+規則同上：計畫寫在 reply、action 必須是 null，等待使用者確認。
 
 修改意見：
 {feedback}
@@ -667,6 +675,10 @@ class SkillAgent:
                 (m['content'] for m in reversed(self.messages) if m['role'] == 'assistant'),
                 None,
             )
+            if last_assistant:
+                parsed = parse_agent_reply(last_assistant)
+                if parsed["valid"]:
+                    last_assistant = parsed["reply"] + (f"\n[action] {action_text(parsed['action'])}" if parsed["action"] else "")
             plan_section = f"【使用者已核准的任務計畫（依步驟拆解逐步執行）】\n{self.current_plan}"
             if last_assistant:
                 plan_section += (
@@ -745,46 +757,75 @@ class SkillAgent:
             with self.messages_lock:
                 snapshot = list(self.messages)
 
-            # 關閉 Ollama 的獨立 thinking 模式：此版本 Ollama 會把推理過程放進
-            # message.thinking 欄位，而非像舊版把 <thought> 內嵌在 content 裡。
-            # 若不關閉，模型有時會把整個決策都留在 thinking 裡，
-            # 導致 content 回傳空字串（並非被截斷，而是模型判斷自己已經回答完畢）。
-            # num_ctx：若不指定，Ollama 會用內建預設值（4096），而非模型實際支援的上限。
-            # 4096 遠小於我們的壓縮門檻，代表對話還沒到門檻 Ollama 就已經在背後截斷最舊的
-            # 內容。這裡統一用 NUM_CTX，TOKEN_THRESHOLD 定義為它的 70%（同一尺度：真實 token），
-            # 保留空間給模型輸出與下一則訊息。
-            response = ollama.chat(
-                model=self.model,
-                messages=snapshot,
-                options={'temperature': 0.2, 'num_ctx': NUM_CTX},
-                think=False
-            )
-            self._record_usage(response, snapshot)
+            self.last_reply_retry = None
+            raw_content, eval_tokens = self._chat_once(snapshot)
 
-            raw_content = response['message']['content'].strip()
-
-            if "<thought>" in raw_content:
-                raw_content = raw_content.split("</thought>")[-1].strip()
-            elif "...done thinking." in raw_content:
-                raw_content = raw_content.split("...done thinking.")[-1].strip()
+            # 空白回覆的自動重試：合法 JSON、reply 是空字串、action 是 null。實測成因是 thought／reply 的文字裡
+            # 出現英文雙引號（例如想寫 關鍵字是 "scheduler"），在 JSON 字串裡它就是「字串結束」，文法接著只允許
+            # , "reply":，模型被迫給空字串與 null，思考看起來像被截斷。這種回覆對使用者沒有任何用處，
+            # 重試一次並附上暫時的提醒（只放進這次送出的快照，不進 self.messages，歷史裡不會留下壞範例）。
+            parsed = parse_agent_reply(raw_content)
+            if parsed["valid"] and not parsed["reply"] and not parsed["action"]:
+                tail = parsed["thought"][-30:].replace("\n", " ")
+                nudge = {'role': 'user', 'content': (
+                    "[harness] 你剛才的回覆 reply 是空字串、action 是 null"
+                    + (f"，thought 在「{tail}」處中斷" if tail else "")
+                    + "——很可能是文字裡的英文雙引號 \" 提前結束了 JSON 字串。請針對同一個問題重新回覆："
+                    "thought 一到兩句、不要使用英文雙引號（引用名稱用「」或反引號），reply 必須有內容；"
+                    "若需要執行技能就填 action。"
+                )}
+                raw_retry, eval_retry = self._chat_once(snapshot + [nudge])
+                parsed_retry = parse_agent_reply(raw_retry)
+                self.last_eval_tokens = (eval_tokens or 0) + (eval_retry or 0)  # 兩次呼叫的產出都算這一輪的 AI tokens
+                still_blank = parsed_retry["valid"] and not parsed_retry["reply"] and not parsed_retry["action"]
+                self.last_reply_retry = (
+                    "⚠️ 模型第一次回覆為空白（thought 疑似被英文雙引號提前截斷），已自動重試一次"
+                    + ("，重試後仍為空白。" if still_blank else "。")
+                )
+                raw_content = raw_retry
 
             return raw_content
 
         except Exception as e:
             return f"Ollama 連線錯誤: {e}"
 
-    def _extract_execute_payload(self, ai_response):
-        """從 AI 回應中取出 EXECUTE: 後面的內容；去除 code fence／註解殘留後為空則回傳 None。"""
-        start_marker = "EXECUTE:"
-        start_idx = ai_response.find(start_marker)
-        payload = ai_response[start_idx + len(start_marker):].strip()
+    def _chat_once(self, snapshot):
+        """呼叫一次主模型，回傳 (回覆原文, 這次產出的 token 數)。
+        關閉 Ollama 的獨立 thinking 模式：此版本 Ollama 會把推理過程放進 message.thinking 欄位，若不關閉，
+        模型有時會把整個決策都留在 thinking 裡，導致 content 回傳空字串。
+        num_ctx：若不指定，Ollama 會用內建預設值（4096）而非模型實際支援的上限，對話還沒到我們的門檻
+        Ollama 就已經在背後截斷最舊的內容；這裡統一用 NUM_CTX（各水位與它同一尺度）。"""
+        response = ollama.chat(
+            model=self.model,
+            messages=snapshot,
+            format=AGENT_REPLY_SCHEMA,  # 回覆協議：{thought, reply, action}，見檔尾 AGENT_REPLY_SCHEMA 說明
+            options={'temperature': 0.2, 'num_ctx': NUM_CTX},
+            think=False
+        )
+        self._record_usage(response, snapshot)
+        raw_content = response['message']['content'].strip()
+        if "<thought>" in raw_content:
+            raw_content = raw_content.split("</thought>")[-1].strip()
+        elif "...done thinking." in raw_content:
+            raw_content = raw_content.split("...done thinking.")[-1].strip()
+        return raw_content, self.last_eval_tokens
 
-        if "```" in payload:
-            payload = payload.split("```")[0].strip()
-        if "# ---" in payload:
-            payload = payload.split("# ---")[0].strip()
+    def parse_reply(self, raw):
+        """ask_ai() 的原始回覆 → {"thought", "reply", "action", "valid"}（見 parse_agent_reply）。"""
+        return parse_agent_reply(raw)
 
-        return payload or None
+    @staticmethod
+    def format_reply_for_console(parsed):
+        """CLI 顯示：思考（有才印）、給使用者的文字、以及這輪要執行的 action（有才印）。"""
+        lines = []
+        if parsed["thought"]:
+            lines.append(f"💭 {parsed['thought']}")
+        lines.append(parsed["reply"] or ("（本輪沒有文字回覆）" if parsed["action"] else "（空白回覆）"))
+        if parsed["action"]:
+            lines.append(f"▶ action: {action_text(parsed['action'])}")
+        if not parsed["valid"]:
+            lines.append("⚠️ 模型輸出不是合法的 JSON 回覆，已降級為純文字顯示，本輪不執行任何指令。")
+        return "\n".join(lines)
 
     def _skill_memory_entries(self, skill_name):
         """技能綁定的經驗記憶條目（skills_system/memory/<skill>.md 裡以「- [」開頭的行）。
@@ -836,8 +877,8 @@ class SkillAgent:
         name = skill_name[:-3] if skill_name.endswith(".md") else skill_name
         return (
             f"{SKILL_LOADED_MARKER}\n"
-            f"{SKILL_DOC_PREFIX} '{name}' 的規格文件（使用者從選單手動載入，等同你以技能名稱 EXECUTE 後"
-            f"系統回傳的規格；依此內容才可執行，請使用其中標明的實際腳本路徑）：\n{doc.rstrip()}"
+            f"{SKILL_DOC_PREFIX} '{name}' 的規格文件（使用者從選單手動載入，等同你以 action.command 填技能名稱後"
+            f"系統回傳的規格；依此內容才可執行：action.command 填其中標明的實際腳本路徑、args 填參數）：\n{doc.rstrip()}"
         )
 
     def _load_skill_doc(self, skill_name):
@@ -890,23 +931,24 @@ class SkillAgent:
                 self.container_cwd = lines[i + 1].strip()
 
     def run_tool(self, ai_response):
-        """解析 AI 回應中的 EXECUTE: 指令並執行，行為分兩種：
+        """依 AI 回覆 JSON 的 action 欄位執行（ai_response 可以是原始 JSON 字串或 parse_reply 的結果）。
+        action 為 null／回覆不是合法 JSON → 不執行、回傳 None；reply 裡的文字完全不看。
+        有 action 時行為分兩種：
 
-        1. 若目標字串對應到 tools/<name>.md 的技能規格文件（代表 AI 用的是
+        1. 若 command 對應到 tools/<name>.md 的技能規格文件（代表 AI 用的是
            SKILLS.md 索引裡的技能名稱），直接把規格文件內容當作系統回傳注入
            上下文，不執行任何腳本——這就是按需載入 (Progressive Disclosure)。
            不做技能名稱 -> 腳本檔名的猜測或對照；AI 讀完規格後，下一輪需改用
            規格書中標明的實際腳本路徑（例如 scripts/cd_cmd.py）才會真正執行。
-        2. 否則將目標字串視為實際腳本路徑，執行對應的 CLI 腳本並回傳結果。
+        2. 否則將 command 視為實際腳本路徑，以 args 為參數執行對應的 CLI 腳本並回傳結果。
         """
-        if "EXECUTE:" not in ai_response:
+        parsed = ai_response if isinstance(ai_response, dict) else parse_agent_reply(ai_response)
+        action = parsed.get("action")
+        if not action:
             return None
 
         try:
-            payload = self._extract_execute_payload(ai_response)
-            if not payload:
-                return None
-
+            payload = action_text(action)
             parts = payload.split(maxsplit=1)
             raw_token = os.path.basename(parts[0])
             remainder = parts[1] if len(parts) > 1 else ""
@@ -916,7 +958,11 @@ class SkillAgent:
                 n_memory = len(self._skill_memory_entries(raw_token[:-3] if raw_token.endswith(".md") else raw_token))
                 memory_note = f"，附 {n_memory} 則技能經驗記憶" if n_memory else ""
                 print(f"📖 Agent 選擇技能索引: {raw_token}（載入規格文件{memory_note}，尚未執行）")
-                return f"{SKILL_DOC_PREFIX} '{raw_token}' 的規格文件（依此內容才可執行，請使用其中標明的實際腳本路徑）：\n{skill_doc}"
+                # 回給模型的這段話是兩階段流程裡最關鍵的一句：實測 JSON 協議下小模型載完規格容易停下來解釋規格或
+                # 反問使用者（reply 欄位本身就在邀請它聊天），所以這裡直接下達下一輪該做的事。
+                return (f"{SKILL_DOC_PREFIX} '{raw_token}' 的規格文件。這一輪只是載入規格、還沒有執行任何東西："
+                        f"下一輪請直接依規格繼續使用者原本的任務——action.command 填規格標明的實際腳本路徑（scripts/...）、"
+                        f"args 填參數；不要向使用者解釋規格內容，也不要詢問是否要執行。\n{skill_doc}")
 
             script_name = self._normalize_script_name(raw_token)
             script_path = os.path.join(self.base_path, "scripts", script_name)
@@ -931,10 +977,10 @@ class SkillAgent:
                     if f.endswith(".md") and (f[:-3] in stem or stem in f[:-3])
                 ] if os.path.isdir(self.tools_dir) else []
                 hint = (
-                    f"這個名稱看起來是技能 {', '.join(candidates)}，請先 `EXECUTE: {candidates[0]}` 載入規格文件，"
-                    f"再依規格標明的實際腳本路徑執行。"
+                    f"這個名稱看起來是技能 {', '.join(candidates)}，請先把 action.command 填成 `{candidates[0]}`（args 留空）"
+                    f"載入規格文件，再依規格標明的實際腳本路徑執行。"
                     if candidates else
-                    "腳本路徑只能從規格文件取得，不可自行推測：請先 `EXECUTE: [SKILLS.md 裡的技能名稱]` 載入規格。"
+                    "腳本路徑只能從規格文件取得，不可自行推測：請先以 action.command 填入 SKILLS.md 裡的技能名稱載入規格。"
                 )
                 return f"[ERROR] 找不到腳本 {script_name}。{hint}"
 
@@ -1587,7 +1633,7 @@ class SkillAgent:
             f"- 規格：{rel(doc_path)}\n"
             f"- 腳本：{rel(script_path)}（組合 {len(draft['steps'])} 步，執行邏輯在 scripts/_composite.py）\n"
             f"- 索引：SKILLS.md「{draft['category']}」新增一行\n"
-            f"之後 `EXECUTE: {draft['name']}` 載入規格、`{self._skill_example_call(draft)}` 執行；"
+            f"之後 action.command 填 `{draft['name']}` 載入規格，再依規格執行（範例：`{self._skill_example_call(draft)}`）；"
             f"下一次呼叫 AI 時 system prompt 的技能索引就會包含它。規格與腳本都可以直接手動修改。"
         )
 
@@ -1696,9 +1742,15 @@ def _run_plan_flow(agent, user_task):
     agent.messages.append({'role': 'user', 'content': agent.build_plan_request(user_task)})
 
     while True:
-        plan_msg = agent.ask_ai()
-        agent.total_ai_tokens += agent.last_ai_tokens(plan_msg)
-        agent.messages.append({'role': 'assistant', 'content': plan_msg})
+        plan_raw = agent.ask_ai()
+        agent.total_ai_tokens += agent.last_ai_tokens(plan_raw)
+        agent.messages.append({'role': 'assistant', 'content': plan_raw})
+        parsed = agent.parse_reply(plan_raw)
+        if agent.last_reply_retry:
+            print(agent.last_reply_retry)
+        plan_msg = parsed["reply"] or plan_raw  # 計畫文字在 reply；就算模型夾帶了 action，這裡也不會執行
+        if parsed["thought"]:
+            print(f"💭 {parsed['thought']}")
         print(f"\n📝 AI 規劃的任務計畫:\n{'-'*30}\n{plan_msg}\n{'-'*30}")
 
         choice = input("\n是否核准此計畫並開始執行？(y=核准 / n=取消 / 直接輸入修改意見=重新規劃): ").strip()
@@ -1782,6 +1834,90 @@ def attach_skill_docs(message, blocks):
 
 # 融合摘要的長度目標（字，寫進摘要 prompt）與模型輸出硬上限（token，num_predict），
 # 讓滾動摘要不會越滾越長；輸出被硬上限截斷時 JSON 會解析失敗、退回原文，因此上限要留得夠寬。
+# 🧷 回覆協議：模型每次回覆都是一個 JSON 物件 {thought, reply, action}。執行與否只看 action 欄位，
+# reply 裡不論寫了什麼（包括解釋、舉例時抄出來的 `EXECUTE: ...` 字串）都不會被執行——這是「實體隔離」：
+# 給人看的文字與給系統執行的指令分開存放，不再用文字比對從回覆裡找指令。以 Ollama 的 format= schema 強制
+# 結構（與摘要、make_skill 同一機制），小模型不需要自律「解釋時不要輸出指令」。
+# action 為 null 或 {"command": 技能名稱｜規格標明的腳本路徑, "args": 參數字串}；args 是字串而不是物件，
+# 因為所有技能腳本都吃位置參數、規格文件的寫法也是位置參數，這樣既有的 tools/*.md 一份都不用改：
+# 規格裡的 `EXECUTE: <路徑> <參數>` 範例就對應 command=<路徑>、args=<參數>。
+AGENT_REPLY_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "thought": {"type": "string"},
+        "reply": {"type": "string"},
+        "action": {"anyOf": [
+            {"type": "null"},
+            {
+                "type": "object",
+                "properties": {"command": {"type": "string"}, "args": {"type": "string"}},
+                "required": ["command", "args"],
+            },
+        ]},
+    },
+    "required": ["thought", "reply", "action"],
+}
+
+
+def quote_cli_arg(arg):
+    """含空白／引號的參數以雙引號包住（與規格範例一致，shlex 可還原）。"""
+    arg = str(arg)
+    if arg == "" or any(c.isspace() for c in arg) or '"' in arg or "'" in arg:
+        return '"' + arg.replace("\\", "\\\\").replace('"', '\\"') + '"'
+    return arg
+
+
+def parse_agent_reply(raw):
+    """模型回覆（JSON 字串）→ {"thought", "reply", "action", "valid"}。
+
+    action 正規化為 None 或 {"command": str, "args": str}。不是合法 JSON 時 valid=False、reply=原文、
+    action=None：降級成「只顯示文字、不執行任何東西」，絕不退回用文字比對找指令（那正是要避免的誤觸發來源）。
+    對非 format= 強制的後端保留一點容錯：args 給成陣列／物件、把整行 `EXECUTE: ...` 塞進 command、
+    command 裡夾帶參數，都會被整理成同一種形狀。"""
+    text = (raw or "").strip()
+    if text.startswith("```"):  # format= 下不會出現，保險去掉程式碼區塊包裹
+        text = text.strip("`").strip()
+        if text.lower().startswith("json"):
+            text = text[4:].strip()
+    try:
+        data = json.loads(text)
+    except (ValueError, TypeError):
+        data = None
+    if not isinstance(data, dict):
+        return {"thought": "", "reply": (raw or "").strip(), "action": None, "valid": False}
+
+    thought = str(data.get("thought") or "").strip()
+    reply = data.get("reply")
+    reply = "" if reply is None else str(reply).strip()
+    action = data.get("action")
+    norm = None
+    if isinstance(action, str) and action.strip().lower() not in ("", "null", "none"):
+        action = {"command": action, "args": ""}
+    if isinstance(action, dict):
+        command = str(action.get("command") or "").strip()
+        args = action.get("args")
+        if isinstance(args, list):
+            args = " ".join(quote_cli_arg(a) for a in args)
+        elif isinstance(args, dict):
+            args = " ".join(quote_cli_arg(v) for v in args.values())
+        args = "" if args is None else str(args).strip()
+        if command.upper().startswith("EXECUTE:"):
+            command = command[len("EXECUTE:"):].strip()
+        head, _, rest = command.partition(" ")
+        if rest.strip():  # command 夾帶了參數："scripts/cd_cmd.py /opt" → 拆到 args 前面
+            command, args = head, (rest.strip() + (" " + args if args else ""))
+        if command:
+            norm = {"command": command, "args": args}
+    return {"thought": thought, "reply": reply, "action": norm, "valid": True}
+
+
+def action_text(action):
+    """action 的單行文字表示（顯示與軌跡用）：`command args`。"""
+    if not action:
+        return ""
+    return f"{action['command']} {action['args']}".strip()
+
+
 SUMMARY_MAX_CHARS = 600
 SUMMARY_MAX_PREDICT = 2000
 
@@ -2176,12 +2312,15 @@ def main():
                 agent.total_ai_tokens += ai_tokens
                 if agent.auto_compressed:
                     print("📦 上下文超過門檻，呼叫前已自動壓縮並歸檔。")
-                print(f"\n🧠 AI:\n{'-'*30}\n{ai_msg}\n{'-'*30}")
+                parsed = agent.parse_reply(ai_msg)  # 回覆協議：顯示 reply／thought，執行只看 action
+                if agent.last_reply_retry:
+                    print(agent.last_reply_retry)
+                print(f"\n🧠 AI:\n{'-'*30}\n{agent.format_reply_for_console(parsed)}\n{'-'*30}")
                 print(f"📤 AI Tokens: {ai_tokens}")
                 agent.messages.append({'role': 'assistant', 'content': ai_msg})
 
-                # --- 🧰 TOOL 執行 ---
-                result = agent.run_tool(ai_msg)
+                # --- 🧰 TOOL 執行（只看 action 欄位，reply 裡的文字不會被執行）---
+                result = agent.run_tool(parsed)
                 tool_tokens = 0
                 if result:
                     tool_tokens = agent.count_tokens(result)

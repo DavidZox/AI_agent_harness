@@ -9,7 +9,7 @@ Web Console for SkillAgent
   _append_discarded_tool_result 這個共用函式，重用既有邏輯。
 - 畫面拆成兩塊：
     左邊「使用者 ↔ Agent 對話」：使用者輸入與 AI 的文字回應。
-    右邊「系統 / 工具回傳」：EXECUTE 指令觸發的規格書載入或腳本執行結果。
+    右邊「系統 / 工具回傳」：AI 回覆 JSON 的 action 觸發的規格書載入或腳本執行結果、以及 💭 思考。
 - CLI 版本原本用 /auto on、/compress 這類指令切換模式；這裡沿用同樣的
   指令字串，並新增 /menu 可以查詢目前支援哪些指令。
 - 即時串流：後端每完成一次推論或工具執行，就立刻把該筆事件以 NDJSON
@@ -34,6 +34,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 # Agent_Runner.py 裡，CLI（main()）與這裡共用同一份，避免兩邊各自維護一份
 # 而逐漸產生行為落差。
 from Agent_Runner import (
+    action_text,
     SkillAgent,
     _append_discarded_tool_result,
     _content_for_context,
@@ -173,6 +174,11 @@ Enter 才送出（避免誤點 /clear）；選技能等同 /skill <名稱>：規
 
 不切換 auto／hybrid 時，預設為「手動模式」：每次工具執行完都會等待你確認
 是否要把結果加入上下文，畫面下方會出現決策按鈕。
+
+AI 的每一次回覆都是固定的 JSON（thought／reply／action），由 Ollama 的結構化輸出強制：左欄顯示 reply
+（有 action 時附一行「▶ action」），右欄多一張灰色「💭 思考」卡片。系統只看 action 欄位決定要不要
+載入規格或執行腳本，reply 裡不論寫了什麼指令文字都不會被執行；回覆不是合法 JSON 時降級為純文字顯示、
+該輪不執行任何東西。
 
 開啟 /plan on 後，輸入新任務時 AI 不會馬上執行，而是先依 SKILLS.md 規劃出
 步驟清單顯示出來，畫面下方會出現「✅ 核准並執行 / 🚫 取消任務」按鈕；也可以
@@ -346,16 +352,29 @@ def _run_vision_subsession(message, images, events):
     )
 
 
+def _emit_reply_meta(parsed, events):
+    """回覆協議的附帶資訊：💭 思考推到右欄；不是合法 JSON 時先推一則降級警告（放在正文之前，最後一筆仍是正文）。"""
+    if agent.last_reply_retry:
+        events.append({"channel": "system", "text": agent.last_reply_retry})
+    if not parsed["valid"]:
+        events.append({"channel": "system", "text": "⚠️ 模型輸出不是合法的 JSON 回覆，已降級為純文字顯示，本輪不執行任何指令。"})
+    if parsed["thought"]:
+        events.append({"channel": "thought", "text": parsed["thought"]})
+
+
 def _ask_and_present_plan(events):
     """呼叫一次 ask_ai() 取得計畫文字，推到 events 給前端顯示，並把
     plan_pending 標記為待核准。跟 CLI 的 _run_plan_flow 用同一套
     SkillAgent.build_plan_request / build_plan_revision_request，
     只是這裡拆成「單次 HTTP 請求處理一小段」的非同步形式。"""
-    plan_msg = agent.ask_ai()
-    agent.total_ai_tokens += agent.last_ai_tokens(plan_msg)
+    plan_raw = agent.ask_ai()
+    agent.total_ai_tokens += agent.last_ai_tokens(plan_raw)
     if agent.auto_compressed:
         events.append({"channel": "system", "text": "📦 上下文超過門檻，呼叫前已自動壓縮並歸檔。"})
-    agent.messages.append({'role': 'assistant', 'content': plan_msg})
+    agent.messages.append({'role': 'assistant', 'content': plan_raw})
+    parsed = agent.parse_reply(plan_raw)
+    _emit_reply_meta(parsed, events)
+    plan_msg = parsed["reply"] or plan_raw  # 計畫文字在 reply；就算模型夾帶了 action，規劃階段也不會執行
     events.append({"channel": "plan", "text": plan_msg})
     plan_pending["active"] = True
     plan_pending["text"] = plan_msg
@@ -445,9 +464,15 @@ def run_turn(events):
         if agent.auto_compressed:
             events.append({"channel": "system", "text": "📦 上下文超過門檻，呼叫前已自動壓縮並歸檔。"})
         agent.messages.append({'role': 'assistant', 'content': ai_msg})
-        events.append({"channel": "chat", "role": "assistant", "text": ai_msg, "tokens": ai_tokens})
+        parsed = agent.parse_reply(ai_msg)  # 回覆協議：左欄顯示 reply，執行只看 action，reply 裡的指令文字不會被執行
+        _emit_reply_meta(parsed, events)
+        events.append({
+            "channel": "chat", "role": "assistant", "tokens": ai_tokens,
+            "text": parsed["reply"] or ("（本輪沒有文字回覆）" if parsed["action"] else "（空白回覆）"),
+            "action": action_text(parsed["action"]) if parsed["action"] else None,
+        })
 
-        result = agent.run_tool(ai_msg)
+        result = agent.run_tool(parsed)
         tool_tokens = 0
         if result:
             tool_tokens = agent.count_tokens(result)
@@ -714,6 +739,8 @@ HTML_PAGE = r"""<!DOCTYPE html>
   .entry.assistant { background: #2b2d31; border: 1px solid #3a3c40; }
   .entry.tool { background: #1f2a24; border: 1px solid #2f4a3a; font-family: "Cascadia Code", Consolas, monospace; }
   .entry.system { background: #2a2620; border: 1px solid #4a4030; color: #d8c9a3; font-style: italic; }
+  .entry.thought { background: #23262b; border: 1px dashed #4a4c50; color: #a7acb3; font-size: 12px; }
+  .entry.thought .tag { color: #8f96a0; opacity: 1; }
   .entry.summary { background: #241f33; border: 1px solid #5a4a8f; color: #cfc3f0; }
   .entry.summary .tag { color: #b39ddb; opacity: 1; }
   .entry.plan { background: #16302c; border: 1px solid #2f6f5e; }
@@ -901,7 +928,10 @@ function renderEvents(events) {
     if (ev.channel === 'chat') {
       let note = (ev.role === 'user' && ev.attachments) ? `\n📎 附加了 ${ev.attachments} 張影像` : '';
       if (ev.role === 'user' && ev.skills && ev.skills.length) note += `\n📘 附加了技能規格：${ev.skills.join(', ')}`;
+      if (ev.role === 'assistant' && ev.action) note += `\n▶ action: ${ev.action}`;
       renderEntry(chatLog, ev.role, ev.role === 'user' ? '你' : 'AI', ev.text + note);
+    } else if (ev.channel === 'thought') {
+      renderEntry(toolLog, 'thought', '💭 思考', ev.text);
     } else if (ev.channel === 'skillload') {
       renderEntry(toolLog, 'skillload', `📘 手動載入技能規格：${ev.name}（≈${ev.tokens} tokens，隨下一則訊息送出）`, ev.text);
     } else if (ev.channel === 'vision') {
