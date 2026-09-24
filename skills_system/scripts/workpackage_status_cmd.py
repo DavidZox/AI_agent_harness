@@ -2,13 +2,16 @@
 
 資料來自 web_console 的 WebSocket /api/ws 快照（"orchestrtor" 鍵＝work package 狀態；其餘＝distribute 佇列、機器人、事件），
 站點以 /api/topology 附上語意名稱。一幀只是瞬間；使用者想知道「一段時間內有沒有變化」時用 --watch，會整理站點推進、
-OverPending 進出、機器人狀態變化與新增事件，開頭 [PASS][digest] 讓 harness 放寬回傳門檻。共用層見 _rmf_common.py。
+OverPending 進出、機器人狀態變化與新增事件（完整的變化清單；超過工具回傳門檻時由 harness 的獨立 session 依任務擷取重點）。
+共用層見 _rmf_common.py。
 """
 import os
 import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from _rmf_common import MAX_WATCH_SECONDS, _ids, fetch_topology, parse_seconds, split_url, station_text, ws_collect, ws_read_json
+
+MAX_CHANGE_LINES = 100   # 變化清單的行數上限（完整清單交給 harness 的獨立 session 擷取；超過只是避免單次輸出失控）
 
 USAGE = (
     "用法: scripts/workpackage_status_cmd.py [task_id] [--watch 秒] [--url 位址]\n"
@@ -152,16 +155,16 @@ def watch_mode(base_url, seconds, task_id=None, topo=None):
         prev = data
     span = frames[-1][0]
     last = frames[-1][1]
-    head = f"[PASS][digest] 觀察 {seconds} 秒（收到 {len(frames)} 幀，實際 {span:.1f} 秒）"
+    head = f"[PASS] 觀察 {seconds} 秒（收到 {len(frames)} 幀，實際 {span:.1f} 秒）"
     lines = [head, "變化：" + ("" if changes else "沒有任何狀態變化（工作包站點、佇列成員、機器人狀態都相同）")]
-    lines += changes[:25]
-    if len(changes) > 25:
-        lines.append(f"…另有 {len(changes) - 25} 筆變化省略")
+    lines += changes[:MAX_CHANGE_LINES]
+    if len(changes) > MAX_CHANGE_LINES:
+        lines.append(f"…另有 {len(changes) - MAX_CHANGE_LINES} 筆變化省略（縮短 --watch 秒數或指定 task_id 可看完整）")
     new_events = [e for e in event_lines if not any(e.split(": ", 1)[-1] in (evs or []) for evs in
                   ((frames[0][1].get("orchestrtor") or {}).get("events") or [], frames[0][1].get("events") or []))]
     if new_events:
         lines.append(f"期間新增事件（{len(new_events)} 則）：" + " ｜ ".join(new_events[-6:]))
-    # 結尾一行摘要（完整內容用不帶 --watch 的一幀快照再看），避免超過工具回傳門檻被精簡掉
+    # 結尾一行摘要：讓一段時間的觀察有明確的結束狀態（完整的一幀用不帶 --watch 的快照再看）
     pk = [p for p in (last.get("orchestrtor") or {}).get("packages") or [] if not task_id or p.get("package_id") == task_id]
     pk_text = "；".join(f"{p.get('package_id')} {p.get('status')} 第 {p.get('station_index', 0) + 1}/{p.get('station_count')} 站 {station_text((p.get('current_item') or {}).get('station'), topo)}"
                         + (f" 機器人 {(p.get('current_item') or {}).get('robot_id')}" if (p.get('current_item') or {}).get('robot_id') else " ⏳") for p in pk[:6]) or "沒有 work package"

@@ -45,6 +45,9 @@ from Agent_Runner import (
     SOFT_TOKEN_THRESHOLD,
     KEEP_RECENT_TOKENS,
     TOOL_RESULT_TOKEN_THRESHOLD,
+    TOOL_SUMMARY_DEFAULT,
+    TOOL_SUMMARY_TAG,
+    tool_result_message,
     MIN_COMPRESS_TOKENS,
     PARALLEL_CAL_DEFAULT,
     is_skill_doc_result,
@@ -72,7 +75,7 @@ agent.reset_conversation()
 state = {
     "auto_mode": False,
     "hybrid_mode": False,
-    "tool_summary_mode": False,
+    "tool_summary_mode": TOOL_SUMMARY_DEFAULT,  # 超過門檻的工具回傳交給獨立 session 做任務導向摘要（預設開）
     "plan_mode": False,
     "parallel_cal": PARALLEL_CAL_DEFAULT,  # 軟水位壓縮改在背景執行緒做（/parallel_cal on|off）
 }
@@ -92,8 +95,8 @@ SLASH_COMMANDS = [
     {"cmd": "/auto off", "desc": "關閉 Auto Continue（回到手動確認）", "group": "模式開關"},
     {"cmd": "/hybrid on", "desc": "Hybrid：每次工具結果都詢問，捨棄後仍讓 AI 接續", "group": "模式開關"},
     {"cmd": "/hybrid off", "desc": "關閉 Hybrid", "group": "模式開關"},
-    {"cmd": "/summarize on", "desc": "超過門檻的工具回傳改由獨立 session 語意摘要", "group": "模式開關"},
-    {"cmd": "/summarize off", "desc": "改回精簡的成功／失敗判定", "group": "模式開關"},
+    {"cmd": "/summarize on", "desc": "超過門檻的工具回傳由獨立 session 依任務擷取重點（預設）", "group": "模式開關"},
+    {"cmd": "/summarize off", "desc": "改為只給成功／失敗判定（不多花一次模型呼叫）", "group": "模式開關"},
     {"cmd": "/plan on", "desc": "下一個新任務先規劃、經核准後執行（核准後自動退出）", "group": "模式開關"},
     {"cmd": "/plan off", "desc": "關閉 Plan 模式", "group": "模式開關"},
     {"cmd": "/parallel_cal on", "desc": "軟水位壓縮改在背景執行緒進行", "group": "模式開關"},
@@ -155,7 +158,7 @@ MENU_TEXT = """可用指令：
 /compress               手動壓縮並歸檔目前的歷史對話
 /auto on / /auto off    切換 Auto Continue 模式（工具結果自動帶入下一輪，不需確認）
 /hybrid on / /hybrid off 切換 Hybrid 模式（每次工具結果都詢問是否加入上下文）
-/summarize on / /summarize off 切換工具回傳摘要模式（見下方說明，預設關閉）
+/summarize on / /summarize off 切換工具回傳的任務導向摘要（見下方說明，預設開啟）
 /parallel_cal on / /parallel_cal off 切換平行壓縮（回合結束後的軟水位壓縮改在背景執行緒做，預設關閉）
 /plan on / /plan off    開啟 Plan 模式：下一個新任務會先規劃步驟、經你核准後才執行；核准後自動退出（預設關閉）
 /plan done              提早清除目前已核准的計畫（正常情況下會在你送出下一個新任務時自動清除）
@@ -197,15 +200,16 @@ AI 的每一次回覆都是固定的 JSON（thought／reply／action），由 Ol
 執行期間，不論經過多少輪工具決策、甚至觸發自動壓縮，AI 都不會忘記它；等你送出
 下一個新任務時會自動清除，不會殘留干擾新任務。若想提早清除可輸入 /plan done。
 
-單一工具回傳若超過 {threshold} tokens，不論目前是什麼模式，預設 AI 只會收到
-精簡的成功／失敗摘要（避免大量原始輸出干擾推理）。開啟 /summarize on 後，
-超過門檻的結果會改由一個獨立、乾淨的 session 做語意摘要（不會混進主對話
-的上下文），主 session 拿到的會是摘要後的重點而不只是成功/失敗；若摘要
-session 失敗會自動退回原本的成功/失敗摘要，不影響主流程。這個獨立 session
-會拿到「使用者原始問題敘述」當聚焦依據（優先用 Objective，其次是目前核准
-中的 plan 執行到哪一步，都沒有就用這一輪任務原始輸入的文字），避免摘要
-時因為不知道重點是什麼而漏掉關鍵資訊。完整原始內容永遠都會顯示在
-「系統 / 工具回傳」面板並標記 ⚠️ 待確認，需自行點「✅ 我已確認」。
+單一工具回傳若超過 {threshold} tokens，不論目前是什麼模式，都不會直接進主對話：
+預設交給一個獨立、乾淨的 session 做「任務導向摘要」——它拿到完整原始輸出、
+使用者的目標（Objective／這一輪任務的原始敘述／已核准的計畫）與這一步的目的
+（AI 剛才的想法與執行的工具），只擷取跟任務有關的事實，名稱與數值照抄、不推測，
+並明說原始輸出沒有涵蓋什麼；主對話收到的就是這份重點（右欄 🧠 卡片顯示同一份
+內容）。所有工具回傳一律如此，包括 topic 擷取、狀態觀察、語義地圖這類分析型輸出
+（腳本回傳完整資訊，重要與否由知道任務的獨立 session 判斷）；只有技能規格文件
+例外、一律完整放行。/summarize off 改回只給成功／失敗判定（省一次模型呼叫，但 AI
+拿不到內容）；摘要 session 失敗時也自動退回判定，不影響主流程。完整原始內容永遠
+都會顯示在「系統 / 工具回傳」面板並標記 ⚠️ 待確認，需自行點「✅ 我已確認」。
 
 輸入框旁的 📷 可以附加影像：「框選畫面」會擷取螢幕並進入全螢幕框選（可連續
 框選多張，Esc 離開），「選擇檔案」可挑本機的圖片檔；縮圖會排在輸入框上方，
@@ -306,9 +310,14 @@ def build_stats():
     }
 
 
-# summarize_tool_result() 產生的內容固定以這個標籤開頭，用來判斷
-# _content_for_context() 這次回傳的是不是「AI 摘要」版本。
-_SUMMARY_TAG = "[tool result - AI 摘要]"
+# summarize_tool_result() 產生的內容固定以 TOOL_SUMMARY_TAG 開頭，用來判斷
+# _content_for_context() 這次回傳的是不是獨立 session 的任務導向摘要。
+_SUMMARY_TAG = TOOL_SUMMARY_TAG
+
+
+def _current_tool_action():
+    """剛執行完的工具是哪個 action：run_turn 與 apply_decision 的時間點，最後一則 assistant 都還是下這個工具的那一輪。"""
+    return (agent._last_assistant_step() or {}).get("action")
 
 
 def _emit_summary_event(content, events):
@@ -498,7 +507,9 @@ def run_turn(events):
                     "text": (
                         f"⚠️ 此工具回傳約 {tool_tokens} tokens，超過門檻 "
                         f"{TOOL_RESULT_TOKEN_THRESHOLD}，已標記待人工確認；"
-                        f"AI 只會收到精簡的成功／失敗摘要。"
+                        + ("加入上下文前將交由獨立 session 依目前任務擷取重點（🧠 卡片會顯示 AI 實際收到的內容）。"
+                           if state["tool_summary_mode"] else
+                           "AI 只會收到成功／失敗判定（/summarize on 可改為獨立 session 摘要）。")
                     ),
                 })
         else:
@@ -517,7 +528,7 @@ def run_turn(events):
                 result, tool_tokens, agent=agent, use_summary=state["tool_summary_mode"]
             )
             _emit_summary_event(content, events)
-            agent.messages.append({'role': 'user', 'content': f"[tool result]\n{content}"})
+            agent.messages.append({'role': 'user', 'content': tool_result_message(content, _current_tool_action())})
             events.append({"channel": "system", "text": "♻️ Auto Continue 中..."})
             continue
 
@@ -548,7 +559,7 @@ def apply_decision(action, events):
                 result, tool_tokens, agent=agent, use_summary=state["tool_summary_mode"]
             )
             _emit_summary_event(content, events)
-            agent.messages.append({'role': 'user', 'content': f"[tool result]\n{content}"})
+            agent.messages.append({'role': 'user', 'content': tool_result_message(content, _current_tool_action())})
         else:
             _append_discarded_tool_result(agent)
         return True  # hybrid 不論加入或捨棄，都會讓 AI 接續推論
@@ -559,7 +570,7 @@ def apply_decision(action, events):
             result, tool_tokens, agent=agent, use_summary=state["tool_summary_mode"]
         )
         _emit_summary_event(content, events)
-        agent.messages.append({'role': 'user', 'content': f"【系統執行結果】:\n{content}"})
+        agent.messages.append({'role': 'user', 'content': tool_result_message(content, _current_tool_action())})
         return True
     if action == "stop":
         return False
@@ -626,11 +637,11 @@ def handle_slash_command(message, events):
         return True
     if lower == "/summarize on":
         state["tool_summary_mode"] = True
-        events.append({"channel": "system", "text": "🧠 已開啟工具回傳摘要模式（超過門檻的結果會由獨立 session 摘要）"})
+        events.append({"channel": "system", "text": "🧠 已開啟工具回傳的任務導向摘要（預設）：超過門檻的結果由獨立 session 依使用者目標與這一步的目的擷取重點"})
         return True
     if lower == "/summarize off":
         state["tool_summary_mode"] = False
-        events.append({"channel": "system", "text": "🧠 已關閉工具回傳摘要模式（改回精簡成功/失敗判定）"})
+        events.append({"channel": "system", "text": "🧠 已關閉工具回傳的任務導向摘要：超過門檻的結果只給 AI 成功/失敗判定（不多花一次模型呼叫）"})
         return True
     if lower == "/plan on":
         state["plan_mode"] = True
@@ -947,7 +958,7 @@ function renderEvents(events) {
     } else if (ev.channel === 'tool') {
       renderEntry(toolLog, 'tool', '系統回傳', ev.text, ev.oversized);
     } else if (ev.channel === 'summary') {
-      renderEntry(toolLog, 'summary', '🧠 AI 摘要（獨立 session）', ev.text);
+      renderEntry(toolLog, 'summary', '🧠 任務導向摘要（獨立 session，AI 實際收到的內容）', ev.text);
     } else if (ev.channel === 'plan') {
       renderEntry(chatLog, 'plan', '📝 計畫（待你確認）', ev.text);
     } else if (ev.channel === 'skilldraft') {

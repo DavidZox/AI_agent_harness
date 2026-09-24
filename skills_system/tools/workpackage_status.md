@@ -18,7 +18,7 @@ WebSocket `/api/ws` 快照：每個 work package 一行（狀態、第幾站含�
 `EXECUTE: scripts/workpackage_status_cmd.py --watch 20`（觀察 20 秒的變化）
 
 # 回傳
-一幀：`[PASS] 目前狀態…`。`--watch`：`[PASS][digest] 觀察 N 秒…` + 變化清單 + 結束時摘要。失敗 `[ERROR] 原因`。
+一幀：`[PASS] 目前狀態…`。`--watch`：`[PASS] 觀察 N 秒…` + 完整變化清單 + 結束時摘要。失敗 `[ERROR] 原因`。
 
 # 異常
 * 找不到 id：未送達、已刪除或 orchestrtor 沒在跑。`⏳ 等待機器人` 不是錯誤。

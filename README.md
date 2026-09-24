@@ -24,7 +24,7 @@
 
 **harness 替模型維護的狀態**（system prompt 的 Current Agent State）：工作目錄與目標容器，都由腳本輸出的狀態標記同步，`/clear` 不清。
 
-**上下文管理**：單次工具回傳超過 500 tokens 只給模型「成功／失敗」（`[PASS][digest]` 開頭的分析型輸出放寬到 1500）；整體上下文超過軟水位在回合結束後壓成滾動摘要、超過硬水位在呼叫模型前壓。
+**上下文管理**：單次工具回傳超過 500 tokens 不直接進主對話，而是交給一個獨立、乾淨的 session，拿「完整原始輸出 + 使用者目標 + 這一步的目的」做任務導向擷取，主對話只收到重點（技能規格文件是唯一例外，一律完整放行）；整體上下文超過軟水位在回合結束後壓成滾動摘要、超過硬水位在呼叫模型前壓。
 
 ---
 
@@ -68,14 +68,16 @@
 
 **手動載入**：Web Console 在輸入框打「/」的選單裡點技能（或 `/skill <名稱>`，CLI 同名指令），`manual_skill_block()` 產生的規格區塊（以 `[skill loaded]` 開頭）會附在下一則訊息後一起送出，省掉一輪「先載規格」；技能清單來自 `list_skills()` 解析 `SKILLS.md`。
 
-**回傳慣例與逾時**：腳本一律由 stdout 回傳，成功以 `[PASS]` 開頭，失敗（含逾時）以 `[ERROR]` 開頭並附原因與建議——`_content_for_context()` 靠這個前綴判定成功／失敗。以 `[PASS][digest]` 開頭代表「已為模型整理過的分析摘要」（`workpackage_status --watch`、`semantic_map`、`ROS2_topic_echo --duration`），門檻放寬到 `DIGEST_TOKEN_THRESHOLD`（1500 tokens），CLI／Web 不標 ⚠️。每支會呼叫外部程序或網路的腳本都有自己的逾時上限（寫在規格裡），`run_tool` 另設 `TOOL_EXEC_TIMEOUT`（600 秒）當最後防線，腳本以非零 exit code 結束時補 `[ERROR]` 前綴、完全沒有輸出時給出明確訊息。
+**回傳慣例與逾時**：腳本一律由 stdout 回傳，成功以 `[PASS]` 開頭，失敗（含逾時）以 `[ERROR]` 開頭並附原因與建議——`_content_for_context()` 靠這個前綴判定成功／失敗。沒有任何腳本自帶的門檻豁免：分析型輸出（`workpackage_status --watch`、`semantic_map`、`ROS2_topic_echo --duration`）也跟其他輸出一樣回傳完整資訊，超過門檻就交給獨立 session 擷取（舊版 `[PASS][digest]` 讓腳本自己的固定格式摘要放寬到 1500 tokens 直接進主對話，等於由不知道任務的腳本決定什麼重要，已移除）。每支會呼叫外部程序或網路的腳本都有自己的逾時上限（寫在規格裡），`run_tool` 另設 `TOOL_EXEC_TIMEOUT`（600 秒）當最後防線，腳本以非零 exit code 結束時補 `[ERROR]` 前綴、完全沒有輸出時給出明確訊息。
+
+**工具結果如何進主對話**：以 user 角色、經 `tool_result_message()` 包裝——第一行 `[tool result]`（框架訊息判定、壓縮切點都認它），第二行【系統回傳】框架句明說「系統執行你上一輪 action（<腳本>）的結果，不是使用者提供的，不要感謝使用者」，CLI 三種模式、Web、捨棄通知都用同一個包裝。寫在每一則裡而不是只寫在 `AGENT.md`：實測 `AGENT.md` 已有 Harness Messages 規則，gemma4:e4b 仍會回「感謝您提供的語義地圖」；改用 Ollama 的 `tool` 角色也不行，gemma4 的模板會把 `tool` 訊息整個丟掉（模型完全看不到內容），這也是影像分析結果用同一招的原因。壓縮摘要渲染時框架句會被去掉，不佔摘要篇幅。
 
 ### 2.4 harness 替模型維護的狀態：工作目錄與目標容器
 
 兩者機制相同：狀態放在 `SkillAgent`（`current_cwd`、`target_container`），顯示在 system prompt 的 Current Agent State 與 Web 標題列，執行腳本時傳給腳本（cwd／環境變數 `TARGET_CONTAINER`），腳本成功改變狀態時在輸出印一行標記，`_sync_state_from_tool_output()` 讀到就更新。`/clear` 不清這兩個狀態。
 
 - **工作目錄**：`change_dir` 印 `[CWD_CHANGED] 路徑`；之後所有腳本以它為 cwd，相對路徑自然生效。
-- **目標容器**：預設空。容器技能（`docker_runcmd`、`ROS2_*`）省略 `<container_name>` 時由 `_docker_common.resolve_container()` 取目標容器，沒有就回 `[ERROR]` 提示先 `docker_containers` 查、`docker_open` 選定；腳本成功操作某容器後在輸出末行印 `[TARGET_CONTAINER] <名稱>`（放末行是為了不破壞 `[PASS]`／`[PASS][digest]` 的開頭判定，與目前目標相同時不印）。所以目標容器＝最近一次成功操作的容器，`docker_open`／`docker_est` 是刻意選定或切換用。`AGENT.md` 要求模型直接用它、不再反問使用者要看哪個容器；`docker_runcmd` 只有一個參數時整串是指令、有目標且第一個參數不是任何現有容器的完整名稱時也把整串當指令（模型常忘記引號或省略名稱）；`ROS2_topic_echo`／`ROS2_node_info` 以 `/` 開頭的第一個參數判定為 topic／node、容器省略。組合技能重播與軌跡記錄也帶著它（`_composite._sync_state`）。
+- **目標容器**：預設空。容器技能（`docker_runcmd`、`ROS2_*`）省略 `<container_name>` 時由 `_docker_common.resolve_container()` 取目標容器，沒有就回 `[ERROR]` 提示先 `docker_containers` 查、`docker_open` 選定；腳本成功操作某容器後在輸出末行印 `[TARGET_CONTAINER] <名稱>`（放末行是為了不破壞 `[PASS]`／`[ERROR]` 的開頭判定，與目前目標相同時不印）。所以目標容器＝最近一次成功操作的容器，`docker_open`／`docker_est` 是刻意選定或切換用。`AGENT.md` 要求模型直接用它、不再反問使用者要看哪個容器；`docker_runcmd` 只有一個參數時整串是指令、有目標且第一個參數不是任何現有容器的完整名稱時也把整串當指令（模型常忘記引號或省略名稱）；`ROS2_topic_echo`／`ROS2_node_info` 以 `/` 開頭的第一個參數判定為 topic／node、容器省略。組合技能重播與軌跡記錄也帶著它（`_composite._sync_state`）。
 
 ### 2.5 上下文管理：真實 token 尺度、雙水位線、滾動融合摘要
 
@@ -91,7 +93,9 @@
 | `SUMMARY_MAX_CHARS` / `SUMMARY_MAX_PREDICT` | 600 字 / 2000 tokens | 融合摘要的長度目標（實測會超過約三成）與 `num_predict` 硬上限；被截斷時 JSON 解析失敗退回原文 |
 | `SUMMARY_ARCHIVE_KEEP` | 30（`AGENT_SUMMARY_KEEP`） | `logs/` 只保留最近 N 份 `summary_*.md` 與同名 `.json` |
 | `SUMMARY_MODEL` | 同主模型（`AGENT_SUMMARY_MODEL`） | 壓縮摘要與工具摘要用的模型；與主模型不同時背景壓縮才真的平行 |
-| `TOOL_RESULT_TOKEN_THRESHOLD` / `DIGEST_TOKEN_THRESHOLD` | 500 / 1500 | 單次工具回傳超過就改成「成功／失敗」判定（或 `/summarize on` 的獨立 session 摘要）；規格文件與 `[PASS][digest]` 例外。完整內容仍顯示給使用者並標 ⚠️ |
+| `TOOL_RESULT_TOKEN_THRESHOLD` | 500 | 單次工具回傳超過就交給獨立 session 做任務導向擷取（`/summarize off` 時只給成功／失敗判定）；技能規格文件例外。完整內容仍顯示給使用者並標 ⚠️ |
+| `TOOL_SUMMARY_INPUT_MAX_CHARS` | 16000 字（`AGENT_TOOL_SUMMARY_INPUT_CHARS`） | 獨立 session 一次最多讀多少原始輸出，超過保留頭尾（6:4）並告知模型中間省略了多少 |
+| `TOOL_SUMMARY_MAX_CHARS` / `TOOL_SUMMARY_MAX_PREDICT` | 400 字 / 1200 tokens | 任務導向摘要的長度目標（寫進 prompt）與 `num_predict` 硬上限；被截斷時 JSON 解析失敗退回原文 |
 
 Web Console 另有 `MAX_AUTO_ITERATIONS = 25`：Auto 模式連續執行工具超過此輪數強制中止本回合。所有 `ollama.chat()` 都帶 `num_ctx=NUM_CTX`（不帶時 Ollama 預設 4096 會在背後悄悄截斷）。
 
@@ -101,7 +105,7 @@ Web Console 另有 `MAX_AUTO_ITERATIONS = 25`：Auto 模式連續執行工具超
 
 **`/parallel_cal on|off`（背景壓縮，預設關閉，`AGENT_PARALLEL_CAL=1` 改預設）**：軟水位壓縮改由 `start_background_compression()` 在背景執行緒進行，完成後 `_apply_compression()` 以物件身分把那幾則從 `messages` 原地移除，期間新加入的訊息不會遺失；通知放進 `pop_notices()`（CLI 下一次輸入後印出、Web 隨 stats 推送並每 4 秒輪詢）。**前提**：Ollama 要為模型配置 2 個以上 slot，或摘要模型與主模型不同——實測 Ollama 0.34 對多模態模型（gemma4）強制單 slot，同模型開背景壓縮時下一次對話會在 Ollama 內排隊；搭配 `AGENT_SUMMARY_MODEL=gemma4:26b` 之類的不同模型才有真正的平行，代價是第二個模型的記憶體與算力。算力弱的設備建議維持關閉。
 
-**`/summarize on|off`（工具回傳摘要模式，預設關閉）**：超過門檻的工具回傳改由 `summarize_tool_result()` 開一個獨立、乾淨的一次性 session 做語意摘要（拿「使用者原始問題」當聚焦依據：Objective → 目前計畫步驟 → 本輪任務文字），主 session 拿到重點而不只是成功／失敗；摘要失敗自動退回判定。Web 以紫色「🧠 AI 摘要（獨立 session）」卡片顯示。代價是多一次模型呼叫。
+**工具回傳的任務導向摘要（預設開啟；`/summarize off` 或 `AGENT_TOOL_SUMMARY=0` 關閉）**：超過門檻的工具回傳一律由 `summarize_tool_result()` 開一個獨立、乾淨的一次性 session 處理，這是「原始上下文 + 當前問題」式的壓縮（context-aware compression），不是通用摘要。獨立 session 收到三樣東西：完整原始輸出（超過 `TOOL_SUMMARY_INPUT_MAX_CHARS` 時保留頭尾並標明省略）、**使用者的目標**（`_build_task_anchor_text()`：Objective、這一輪任務的原始敘述、已核准的計畫）、**這一步的目的**（`_last_assistant_step()`：決策模型剛才的 `thought`／`reply` 與執行的 `action`——在 agent 迴圈裡，比使用者的原話更精確的「當前問題」）。prompt 把它定位成資訊過濾器：只留與目標直接相關的事實，名稱與數值照抄、不推測、不給建議，並用 `not_covered` 明說原始輸出沒有涵蓋什麼。輸出以 `format=TOOL_SUMMARY_SCHEMA`（answer／facts／errors／not_covered）強制結構，排成「執行結果／回答／相關事實／錯誤／未涵蓋」加一段附註（告訴主模型它看不到原文、需要其他資訊就換參數重查），解析失敗退回模型原文，session 失敗退回成功／失敗判定。CLI 印出「🧠 獨立 session 任務導向摘要」、Web 以紫色 🧠 卡片顯示，兩者都是主對話實際收到的內容。**沒有腳本自帶的豁免**：`ROS2_topic_echo --duration` 等分析型技能改成回傳完整資訊（統計 + 全部原始訊息），什麼重要由知道任務的獨立 session 決定。代價是每次超過門檻多一次模型呼叫（同模型時與主對話序列執行）。
 
 **訊息則數視窗停用**：`SkillAgent(max_history=None)` 是預設，上下文大小只由 token 門檻決定，舊內容一律摘要歸檔而不是無聲丟棄；`max_history` 只保留為可選保險絲。
 
@@ -178,7 +182,7 @@ Web Console 另有 `MAX_AUTO_ITERATIONS = 25`：Auto 模式連續執行工具超
 | `docker_open` | 選定目標容器並驗證連線 | `docker_open_cmd.py` | 部分名稱唯一符合即可，多個符合列候選；末行 `[TARGET_CONTAINER]` |
 | `docker_runcmd` | 容器內執行 shell 指令 | `docker_runcmd_cmd.py` | `[--timeout 秒]`（1～570）`[容器] "指令"`，容器可省略 |
 | `ROS2_topic_list` / `ROS2_node_list` | 列 topic／node | `ROS2_topic_list_cmd.py`、`ROS2_node_list_cmd.py` | `[容器]` 可省略 |
-| `ROS2_topic_echo` | 讀一筆訊息，或 `--duration 秒`（2～300）擷取一段時間 | `ROS2_topic_echo_cmd.py` | 一段時間模式回 `[PASS][digest]`：則數、頻率、首尾原文、每個欄位的數值範圍／字串種類／固定不變清單（PyYAML 攤平，String 內的 JSON 也解開） |
+| `ROS2_topic_echo` | 讀一筆訊息，或 `--duration 秒`（2～300）擷取一段時間 | `ROS2_topic_echo_cmd.py` | 一段時間模式回 `[PASS]`：則數、頻率、每個欄位的數值範圍／字串種類／固定不變清單（PyYAML 攤平，String 內的 JSON 也解開），後面附全部原始訊息（超過 12000 字保留頭尾並註明省略幾則）；幾乎必超過門檻，由獨立 session 依這一步的目的擷取 |
 | `ROS2_node_info` | node 詳細資訊 | `ROS2_node_info_cmd.py` | `[容器] <node>`，node 以 `/` 開頭 |
 
 共通：在容器內以 coreutils `timeout` 包住指令，逾時真的終止容器內程序而不是只殺宿主機端的 `docker exec`；常見 docker／ros2 錯誤翻成可行動的說明；ROS2 指令用 `bash -ic` 並由 `ROS2_ENV_FALLBACK` 補齊環境——shell 沒有 `ros2` 就 source `/opt/ros/<distro>`，再靜默 source 第一個找到的 colcon overlay，shell 沒有 `ROS_DOMAIN_ID` 時從容器內正在跑的 ROS 節點的 `/proc/<pid>/environ` 複製 domain／RMW／CycloneDDS／discovery 變數（fih_rmf_system 的節點跑在 domain 98，不補齊會看到空的 topic 列表）。
@@ -190,7 +194,7 @@ Web Console 另有 `MAX_AUTO_ITERATIONS = 25`：Auto 模式連續執行工具超
 | 技能 | 做什麼 | 對應端點 | 重點 |
 | :--- | :--- | :--- | :--- |
 | `workpackage_send` | 發送多站點 work package | `POST /api/send_tasks` → `incoming_work_packages` | 站點可寫代號或語意名稱（「加工線通道-6」→ a0，對不到或對到多站回 `[ERROR]`）；`--loop` 不接數字＝無限循環（orchestrtor `loop_count` None，也收 `--loop 0`／`無限`／`--forever`）、`--loop N`＝N 輪、不加＝一輪；`--amr`／`--type`／`--level`／`--weight`／`--desc`；回傳第一行寫出站數、循環、機器人；`--ros2 [容器]` 備用入口不經 web_console 直接 `ros2 topic pub`（容器省略＝目標容器）；帶了別的技能的選項會直接指路 |
-| `workpackage_status` | 執行狀態：一幀或 `--watch 秒`（1～300） | WebSocket `/api/ws` | 一幀：每個 work package 一行（狀態、第幾站含語意名稱、工作項、機器人或 ⏳、循環進度）、distribute 佇列（raw／processing／OverPending）、機器人、最近事件；`--watch` 回 `[PASS][digest]`：站點推進、OverPending 進出、機器人狀態變化、新增事件與結束摘要 |
+| `workpackage_status` | 執行狀態：一幀或 `--watch 秒`（1～300） | WebSocket `/api/ws` | 一幀：每個 work package 一行（狀態、第幾站含語意名稱、工作項、機器人或 ⏳、循環進度）、distribute 佇列（raw／processing／OverPending）、機器人、最近事件；`--watch` 回 `[PASS]`：完整的變化清單（站點推進、OverPending 進出、機器人狀態變化、新增事件，最多 100 行）與結束摘要 |
 | `workpackage_cancel` | 取消一個 work package | `DELETE /api/work_packages/{id}` | 送出後讀一幀確認；只停止派下一站，當前站可能仍執行完 |
 | `overpending_cancel` | 刪除卡在 OverPending 逾時區的單站任務 | `DELETE /api/overpending_tasks/{id}` | OverPending 會來回：raw 等超過 `threshold_ovp_sec` 才進、再過 `threshold_recovery_sec` 又回流，DELETE 只對此刻在逾時區的任務有效；不在時回報所在佇列（不是錯誤），`--wait 秒` 等它進來再刪 |
 | `semantic_map` | 語義地圖與目前佈局 | `GET /api/topology` + 一幀快照 | 站點代號、semantics.yaml 的語意名稱與說明（VLM 判讀紀錄）、座標、路段；把機器人座標／`target_id`／`current_edge`（RobotState 用節點 id，會換成代號）與 work package 當前站對到每站；帶關鍵字看單站詳情；`--stations`／`--robots` 只列清單 |
@@ -267,7 +271,7 @@ python3 Agent_Runner.py
 python3 web_console.py
 ```
 
-預設監聽 `http://127.0.0.1:8765`（只綁本機）。畫面左欄「使用者 ↔ Agent 對話」、右欄「系統 / 工具回傳」（規格載入、腳本結果、💭 thought、系統通知、🧠 AI 摘要、🖼️ 視覺分析卡片）。輸入框打「/」彈出選單（上半指令、下半 `SKILLS.md` 技能，選技能等同 `/skill`），`/menu` 列出全部指令與說明。Manual／Hybrid 模式下工具執行後出現決策按鈕；Plan 模式出現核准／取消按鈕；`/make_skill` 出現核准／重播驗證／取消按鈕；📷 可框選畫面或選檔附圖。標題列：mode、cwd、container（目標容器）、tokens 與 ctx 水位。後端端點：`POST /api/send`、`POST /api/decision`、`GET /api/status`、`GET /api/commands`、`/api/skill/*`、`/api/vision/*`。
+預設監聽 `http://127.0.0.1:8765`（只綁本機）。畫面左欄「使用者 ↔ Agent 對話」、右欄「系統 / 工具回傳」（規格載入、腳本結果、💭 thought、系統通知、🧠 任務導向摘要、🖼️ 視覺分析卡片）。輸入框打「/」彈出選單（上半指令、下半 `SKILLS.md` 技能，選技能等同 `/skill`），`/menu` 列出全部指令與說明。Manual／Hybrid 模式下工具執行後出現決策按鈕；Plan 模式出現核准／取消按鈕；`/make_skill` 出現核准／重播驗證／取消按鈕；📷 可框選畫面或選檔附圖。標題列：mode、cwd、container（目標容器）、tokens 與 ctx 水位。後端端點：`POST /api/send`、`POST /api/decision`、`GET /api/status`、`GET /api/commands`、`/api/skill/*`、`/api/vision/*`。
 
 | 環境變數 | 預設值 | 說明 |
 | :--- | :--- | :--- |
@@ -278,6 +282,8 @@ python3 web_console.py
 | `AGENT_SUMMARY_KEEP` | `30` | `logs/` 保留的摘要歸檔份數 |
 | `AGENT_SUMMARY_MODEL` | 同主模型 | 壓縮摘要／工具摘要用的模型 |
 | `AGENT_PARALLEL_CAL` | 未設定＝關閉 | `/parallel_cal` 的啟動預設值 |
+| `AGENT_TOOL_SUMMARY` | `1`＝開啟 | `/summarize` 的啟動預設值（`0` 改回只給成功／失敗判定） |
+| `AGENT_TOOL_SUMMARY_INPUT_CHARS` | `16000` | 獨立摘要 session 一次最多讀多少字元的原始輸出 |
 | `AGENT_SKILL_MODEL` | 同摘要模型 | `/make_skill` 草擬用的模型 |
 | `VISION_MODEL` / `VISION_TIMEOUT` | `gemma4:e4b` / `180` | 視覺 sub-session 的模型與逾時秒數 |
 | `RMF_WEB_CONSOLE_URL` | `http://localhost:8020` | 調度系統技能的 web_console 位址（各腳本也接受 `--url`） |
@@ -300,7 +306,7 @@ python3 web_console.py
 8. **小模型對 `modify_memory --skill` 的判斷不可靠**：該綁技能還是寫全域常判斷錯；框架只把最糟的錯誤（自綁、綁不存在的技能）擋成可恢復的 `[ERROR]`。
 9. **`/make_skill` 的草稿品質受模型限制**：哪些值該參數化、索引描述是否讓之後的模型選得到，都是草擬模型的判斷；框架保證「錯不會傳下去」（對不上就退回原值、漏填照原值納入、預覽列出每項修正），最終靠使用者檢查。可用 `AGENT_SKILL_MODEL` 換較大的模型。
 10. **JSON 協議下的空白回覆**：模型在字串裡用英文雙引號時會發生，屬機率性；框架自動重試一次並在提示詞禁用英文雙引號，重試仍空白時如實顯示。
-11. **組合技能的輸出容易超過工具回傳門檻**：多步驟總輸出常超過 500 tokens，主模型只收到成功／失敗判定（各步輸出仍完整顯示給使用者），需要重點時開 `/summarize on`。重播驗證只驗證會不會 `[PASS]`、不比對內容，且會真的執行有副作用的步驟。
+11. **任務導向摘要受摘要模型與輸入上限限制**：擷取得對不對取決於 `SUMMARY_MODEL`（預設同主模型）；原始輸出超過 16000 字只讀頭尾，中間的內容只剩腳本自帶的統計（如 `ROS2_topic_echo` 的欄位變化）可依靠；主模型看不到原文，只能靠摘要裡的「未涵蓋」提示換參數重查。每次超過門檻多一次模型呼叫、同模型時與主對話序列執行，觀察型技能幾乎每次都會觸發。組合技能的多步驟總輸出也走同一條路；重播驗證只驗證會不會 `[PASS]`、不比對內容，且會真的執行有副作用的步驟。
 12. **調度系統技能依賴 web_console 的版本**：`semantic_map` 需要 `/api/topology` 端點，舊版 web_console 會回 404；OverPending 的時序常數（`threshold_ovp_sec`、`threshold_recovery_sec`）以 distribute 的設定為準，規格裡的「約 10 秒」是預設值。
 
 ---
@@ -309,15 +315,15 @@ python3 web_console.py
 
 ### 7.1 讓 AI 自己把檢索範圍縮小
 
-`search_text`／`find_file`／`list_dir` 已是精準檢索的雛形，但大量結果的處理仍是「超過門檻就換成成功／失敗判定」。更根本的做法是在規格文件與 `AGENT.md` 裡要求模型先縮小路徑、關鍵字具體、必要時分批查詢；幾乎零成本，效果依賴模型是否遵守。
+`search_text`／`find_file`／`list_dir` 已是精準檢索的雛形，但大量結果的處理仍是「超過門檻就交給獨立 session 擷取」，擷取只會留下與當前目的相關的部分，撈得越多丟得越多。更根本的做法是在規格文件與 `AGENT.md` 裡要求模型先縮小路徑、關鍵字具體、必要時分批查詢；幾乎零成本，效果依賴模型是否遵守。
 
 ### 7.2 自我進化第二階段：需要新程式碼的技能
 
 第一階段（2.10）只支援「既有步驟的序列」。第二階段是讓較大的模型草擬腳本到 `drafts/`，harness 以軌跡中的實際案例當測試 oracle 反覆執行、餵回錯誤讓它修正，通過且經使用者審核後才註冊；也可在 Plan 模式所有步驟完成時主動詢問「要做成技能嗎」，並把修正過程中的失敗嘗試自動寫成該技能的 `memory/<name>.md`。
 
-### 7.3 精準檢索 vs. 獨立 session 摘要，該用哪個不應只看 token 量
+### 7.3 回到原始輸出重新抽取（re-query），而不是只能重跑工具
 
-目前超過門檻時用哪種降維純粹是全域開關，與內容特性無關。搜尋型技能撈出大量結果時，更好的處理可能是引導模型用更精確的關鍵字重查；長篇日誌則適合語意摘要。可依技能類型（或規格文件的 metadata）決定 `_content_for_context()` 的策略。
+任務導向摘要只回答「這一步的目的」；主模型事後想從同一份輸出確認別的事（摘要的「未涵蓋」提到的部分），現在只能換參數重新執行工具——對觀察型技能就是再等一次 `--duration`。原始輸出其實 harness 都拿過：下一步是把超過門檻的原始輸出存到 `logs/tool_results/<id>.txt`，摘要附註帶上 id，並加一個 `recall_result <id> "<問題>"` 技能，用新的問題對**原始文字**再開一次獨立 session 抽取——這正是「回到原始上下文重新抽取」而不是「摘要的摘要」。同一個道理也適用於滾動摘要：`compress_context_to_file()` 目前是「上一份摘要 + 新片段 → 新摘要」的滾動式壓縮，細節會逐輪流失；歸檔時若連同被壓掉的原始訊息一起存（`logs/summary_*.json` 現在只存摘要），日後就能以「原始訊息 + 當前任務」重新抽取。
 
 ### 7.4 `Memory.md` 的內化與整併
 
@@ -331,7 +337,7 @@ python3 web_console.py
 
 ## 8. 長期願景（概念性）：AGV/AMR 車隊調度場景延伸
 
-> 以下內容由使用者提供，是一份完整的概念性系統規格文件，描述這個 harness 未來若要往「AGV/AMR 車隊調度決策輔助」場景擴展時的目標架構，**不是目前程式碼已經實作的東西**，也不會逐項對應到現有模組。之所以收錄在這裡，是因為文中的「多 Session 分割摘要（Map-Reduce Summarization）」機制，正是 2.5 節的上下文壓縮與 7.3 節的工具回傳摘要方向的一個具體、更大規模的參照範例：現在的 `compress_context_to_file()` / `summarize_tool_result()` 都是單一 session 的摘要，而這份文件描述的是當語意資料量大到連單一摘要 session 都塞不下時，如何先分塊、平行摘要、再彙整（Map → Reduce）。以下保留原文結構，僅調整標題階層以嵌入本文件。
+> 以下內容由使用者提供，是一份完整的概念性系統規格文件，描述這個 harness 未來若要往「AGV/AMR 車隊調度決策輔助」場景擴展時的目標架構，**不是目前程式碼已經實作的東西**，也不會逐項對應到現有模組。之所以收錄在這裡，是因為文中的「多 Session 分割摘要（Map-Reduce Summarization）」機制，正是 2.5 節的上下文壓縮與任務導向摘要、7.3 節的重新抽取方向的一個具體、更大規模的參照範例：現在的 `compress_context_to_file()` / `summarize_tool_result()` 都是單一 session 的摘要，而這份文件描述的是當語意資料量大到連單一摘要 session 都塞不下時，如何先分塊、平行摘要、再彙整（Map → Reduce）。以下保留原文結構，僅調整標題階層以嵌入本文件。
 
 ### 8.1 設計背景與安全邊界 (Safety & Control Boundaries)
 

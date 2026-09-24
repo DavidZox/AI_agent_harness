@@ -72,9 +72,8 @@ class SkillAgent:
 
         # =========================
         # 📌 這一輪任務最原始的使用者敘述
-        # 給獨立摘要 session（summarize_tool_result）在沒有 sticky_objective
-        # 或 current_plan 可用時，當作「原始問題」聚焦摘要內容用，見
-        # _build_task_anchor_text。每次使用者送出新任務時更新，/clear 時清空。
+        # 給獨立摘要 session（summarize_tool_result）當「使用者的目標」聚焦依據之一（與 sticky_objective、
+        # current_plan 一起，見 _build_task_anchor_text）。每次使用者送出新任務時更新，/clear 時清空。
         # =========================
         self.current_task = None
 
@@ -91,6 +90,7 @@ class SkillAgent:
         self._compress_state_lock = threading.Lock()
         self._notices = []                    # 背景壓縮完成／失敗的通知，下一次互動時顯示
         self.last_compression = None          # 最近一次壓縮的統計（檔名、則數、摘要 token 數）
+        self.last_tool_summary = None         # 最近一次工具回傳任務導向摘要的統計（structured／input_tokens／omitted_chars…）
 
         # =========================
         # 🧩 操作軌跡與 make_skill（見檔尾 SKILL_MODEL / MAKE_SKILL_SCHEMA 說明）
@@ -219,6 +219,8 @@ class SkillAgent:
                 marker = next((mk for mk in HARNESS_MARKERS if content.startswith(mk)), None)
                 if marker:
                     role = f"harness {marker}"
+                    # 工具結果第二行的框架句（tool_result_message）是給主模型的提醒，不進摘要
+                    content = "\n".join(ln for ln in content.splitlines() if not ln.startswith(TOOL_RESULT_FRAME))
             elif role == 'assistant':
                 # 回覆協議的 JSON：只保留給使用者的文字與這輪的 action，thought 與 JSON 語法不進摘要
                 parsed = parse_agent_reply(content)
@@ -521,36 +523,98 @@ class SkillAgent:
             return waited
         return self.compress_context_to_file()
 
-    def summarize_tool_result(self, result, tool_tokens):
-        """比照 compress_context_to_file 的作法：開一個獨立、乾淨的一次性
-        session（自己的 system/user prompt，不接觸 self.messages），專門
-        把過大的工具回傳內容摘要成精簡版，摘要完就丟棄，不會留在主對話裡。
+    def _last_assistant_step(self):
+        """最近一則 assistant 回覆解析成 {thought, reply, action}：這一步「為什麼執行、執行了什麼」。
+        CLI／Web 都在 run_tool 之前就把該則回覆加進 self.messages，所以摘要時最後一則 assistant 就是下這個工具的那一輪。
+        給獨立摘要 session 當第二層聚焦依據（第一層是使用者的目標，見 _build_task_anchor_text）；沒有就回 None。"""
+        for m in reversed(self.messages):
+            if m['role'] != 'assistant':
+                continue
+            parsed = parse_agent_reply(m['content'])
+            if parsed["valid"]:
+                return {"thought": parsed["thought"], "reply": parsed["reply"], "action": parsed["action"]}
+            return {"thought": "", "reply": parsed["reply"], "action": None}
+        return None
 
-        這樣主 session 拿到的是「有意義的摘要」而不是單純的成功／失敗判定，
-        同時不會因為把原始大量輸出直接塞進主上下文而干擾主 session 的推理。
+    @staticmethod
+    def _clip_tool_output(result, max_chars=None):
+        """原始輸出超過獨立 session 的輸入上限時保留頭尾（開頭多半是狀態列與統計、結尾是最後狀態），
+        中間以說明行取代並告知省略了多少字元。回傳 (text, omitted_chars)。"""
+        max_chars = TOOL_SUMMARY_INPUT_MAX_CHARS if max_chars is None else max_chars
+        if len(result) <= max_chars:
+            return result, 0
+        head = int(max_chars * 0.6)
+        tail = max_chars - head
+        omitted = len(result) - head - tail
+        return (f"{result[:head]}\n\n…（原始輸出過長，此處省略中間 {omitted} 字元；以下是結尾部分）…\n\n{result[-tail:]}", omitted)
 
-        這個獨立 session 看不到主對話，因此另外附上 _build_task_anchor_text()
-        取得的「使用者原始問題敘述」錨點，讓摘要聚焦在使用者真正在意的地方，
-        避免因為不知道任務重點是什麼，而摘掉其實關鍵的資訊。
-        """
+    @staticmethod
+    def _render_tool_summary(data):
+        """把 TOOL_SUMMARY_SCHEMA 的 JSON 排成固定結構的純文字（回答／相關事實／錯誤／未涵蓋）。"""
+        if not isinstance(data, dict):
+            raise TypeError("tool summary JSON 不是物件")
+
+        def items(key):
+            v = data.get(key) or []
+            if not isinstance(v, list):
+                v = [v]
+            return [str(x).strip() for x in v if str(x).strip()]
+
+        lines = [f"回答：{str(data.get('answer') or '').strip() or '（摘要模型沒有給出回答）'}", "相關事實："]
+        lines += [f"- {f}" for f in items("facts")] or ["- （原始輸出中沒有與任務直接相關的事實）"]
+        errors = items("errors")
+        if errors:
+            lines.append("錯誤／異常：")
+            lines += [f"- {e}" for e in errors]
+        not_covered = str(data.get("not_covered") or "").strip()
+        if not_covered and not_covered.rstrip("。.") not in ("無", "沒有", "none", "None", "N/A", "n/a"):
+            lines.append(f"未涵蓋：{not_covered}")
+        return "\n".join(lines)
+
+    def summarize_tool_result(self, result, tool_tokens, step=None):
+        """任務導向摘要（Task-Oriented Summarization）：開一個獨立、乾淨的一次性 session（自己的 system/user
+        prompt，不接觸 self.messages），把超過門檻的工具回傳擷取成主對話用得上的重點，摘要完就丟棄。
+
+        跟通用摘要的差別在「帶著問題讀原文」——獨立 session 同時收到兩層聚焦依據：
+        1. 使用者的目標（_build_task_anchor_text：Objective、這一輪任務的原始敘述、已核准的計畫）；
+        2. 這一步的目的（_last_assistant_step：決策 AI 剛才的 thought／reply 與執行的 action）。
+        規則要求名稱與數值照抄、不推測、不給建議，並用 not_covered 明說原始輸出沒有涵蓋什麼，主模型才知道
+        該換參數重查而不是憑空補上。結構以 format=TOOL_SUMMARY_SCHEMA 強制，解析失敗退回模型原文。
+        原始輸出超過 TOOL_SUMMARY_INPUT_MAX_CHARS 時只讀頭尾（_clip_tool_output），並在給主模型的附註標明。
+        step 可由呼叫端指定（測試用），預設取最近一則 assistant 回覆。"""
         anchor = self._build_task_anchor_text()
+        step = step if step is not None else (self._last_assistant_step() or {})
+        step_lines = []
+        if step.get("action"):
+            step_lines.append(f"執行的工具：{action_text(step['action'])}")
+        if step.get("thought"):
+            step_lines.append(f"決策 AI 執行前的想法：{step['thought']}")
+        if step.get("reply"):
+            step_lines.append(f"決策 AI 對使用者的說明：{step['reply']}")
+        step_text = "\n".join(step_lines) or "（沒有取得這一步的說明，請以使用者的目標為依據）"
+        clipped, omitted = self._clip_tool_output(result)
 
-        system_prompt = """你是一位專業的資料摘要助手。
-你的任務是把一段指令執行後的原始輸出，摘要成精簡但保留關鍵資訊的版本，
-交給另一個負責決策的 AI 使用，那個 AI 不會看到原始內容，只會看到你的摘要。
-
-你會同時收到「使用者原始的任務／問題敘述」，這是你摘要時的聚焦依據：
-跟這個任務有關、會影響下一步決策的資訊要優先保留。
+        system_prompt = f"""你是一個「資訊過濾器」：把一支工具（腳本）執行後的完整原始輸出，依「使用者的目標」與「這一步的目的」擷取成精簡的重點，交給另一個負責決策的 AI。那個 AI 看不到原始輸出，只看得到你的擷取結果。
 
 規則：
-- 必須保留：成功或失敗、關鍵數值、錯誤訊息、檔案／路徑名稱、數量等會影響下一步決策的資訊
-- 可以捨棄：跟使用者任務無關的重複樣板文字、無關的排版細節
-- 直接輸出摘要內容，不要加上「以下是摘要」之類的前言，也不要加你自己的建議
-- 盡量控制在 200 字以內
+1. 只保留與使用者目標或這一步目的直接相關的事實、數值、名稱、錯誤；樣板文字、排版、重複內容、與任務無關的欄位一律捨棄。
+2. 名稱與數值一律照抄原文：topic／node／容器／檔案／路徑／站點／任務 id、數值與單位、錯誤訊息，都不要改寫、四捨五入或概括成「一些」「若干」。
+3. 只陳述原始輸出裡有的內容，不要推測、補充背景或給建議；原始輸出沒有的就寫進 not_covered。
+4. 這一步的目的若在原始輸出裡找不到答案，answer 要直接寫「輸出中沒有…」，並在 not_covered 說明缺什麼。
+5. 原始輸出若標示「省略中間 N 字元」，被省略的部分不可假設，要寫進 not_covered。
+6. 涉及門檻比較或計數（是否低於／高於某值、第幾則開始、哪個最新）時，逐一核對原文，在 facts 引用判斷依據（序號、原文數值或時間），只在核對過的依據上下結論；無法確定就寫進 not_covered，不要猜。
+7. 精簡：answer 一句話（含關鍵數值或名稱）；facts 每項一句、不超過 60 字；全部合計不超過 {TOOL_SUMMARY_MAX_CHARS} 字。
+
+輸出 JSON 物件：
+- answer：一句話直接回答這一步的目的。
+- facts：與任務相關的事實清單（名稱、數值照抄）。
+- errors：原始輸出中的錯誤／警告／異常，照抄原文；沒有就空陣列。
+- not_covered：原始輸出沒有涵蓋、或因篇幅被省略而無法確認的部分；沒有就寫「無」。
 """
         user_prompt = (
-            f"使用者原始的任務／問題敘述：\n{anchor}\n\n"
-            f"以下是需要摘要的原始工具輸出（原始約 {tool_tokens} tokens）：\n\n{result}"
+            f"【使用者的目標】\n{anchor}\n\n"
+            f"【這一步的目的（決策 AI 為什麼執行這個工具）】\n{step_text}\n\n"
+            f"【工具的完整原始輸出（約 {tool_tokens} tokens{'，過長已保留頭尾' if omitted else ''}）】\n{clipped}"
         )
 
         res = ollama.chat(
@@ -559,14 +623,27 @@ class SkillAgent:
                 {'role': 'system', 'content': system_prompt},
                 {'role': 'user', 'content': user_prompt},
             ],
-            options={'temperature': 0.2, 'num_ctx': NUM_CTX},
+            format=TOOL_SUMMARY_SCHEMA,
+            options={'temperature': 0.2, 'num_ctx': NUM_CTX, 'num_predict': TOOL_SUMMARY_MAX_PREDICT},
             think=False,
         )
-        summary = res['message']['content'].strip()
-        return (
-            f"[tool result - AI 摘要]\n{summary}\n\n"
-            f"(原始輸出約 {tool_tokens} tokens，完整內容已顯示在剛才的系統回傳訊息中)"
+        raw = res['message']['content'].strip()
+        try:
+            body = self._render_tool_summary(json.loads(raw))
+            structured = True
+        except (ValueError, TypeError):
+            body, structured = raw, False
+        self.last_tool_summary = {
+            'structured': structured, 'input_tokens': tool_tokens, 'omitted_chars': omitted,
+            'summary_tokens': self.count_tokens(body), 'model': self.summary_model,
+        }
+        status = "失敗（[ERROR]）" if result.lstrip().startswith("[ERROR]") else "成功"
+        note = (
+            f"（原始輸出約 {tool_tokens} tokens，超過門檻 {TOOL_RESULT_TOKEN_THRESHOLD}；以上由獨立 session 依使用者目標與"
+            f"這一步的目的從完整輸出擷取{'，過長部分只讀了頭尾' if omitted else ''}，完整內容已顯示給使用者。"
+            f"你看不到原始輸出：「未涵蓋」或需要其他資訊時，換更精確的參數重新執行工具，不要憑空補上。）"
         )
+        return f"{TOOL_SUMMARY_TAG}\n執行結果：{status}\n{body}\n{note}"
 
     def load_long_term_memory(self, max_lines=30):
         if not os.path.exists(self.memory_file):
@@ -657,46 +734,20 @@ class SkillAgent:
             """
 
     def _build_task_anchor_text(self):
-        """決定要交給獨立摘要 session（summarize_tool_result）當作「使用者
-        原始問題敘述」的錨點文字，讓摘要能聚焦在使用者真正在意的事情上，
-        而不是對原始輸出做通用、不知道重點是什麼的精簡（容易先丟掉其實
-        關鍵的資訊）。
-
-        優先序：
-        - sticky_objective：使用者主動設定、最高優先的任務錨點，本來就
-          持續保留在 system prompt 裡，直接拿來用即可
-        - current_plan：已核准的計畫本身就是原始任務拆解出的步驟清單；
-          額外附上目前最新一則 assistant 回應（此回應是 AI 依計畫產生的，
-          內容自然反映了目前執行到哪一步），讓摘要 session 能聚焦在「這
-          一步」，而不是整份計畫
-        - 兩者都沒有：退回這一輪任務使用者最原始輸入的文字（current_task）
-        - 兩者都有：兩段一起給，不需要互斥判斷
-        """
+        """獨立摘要 session 的第一層聚焦依據「使用者的目標」：
+        - sticky_objective：使用者主動設定、最高優先的任務錨點（本來就常駐 system prompt）
+        - current_task：這一輪任務使用者最原始的輸入文字（每次新任務更新，/clear 清空）
+        - current_plan：已核准的計畫（原始任務拆解出的步驟清單）
+        有幾層就給幾層，不互斥。第二層「這一步的目的」（決策 AI 的 thought／reply／action）由 _last_assistant_step
+        另外提供，這裡不再夾帶最近一則回覆。"""
         parts = []
         if self.sticky_objective:
-            parts.append(f"【使用者設定的最高優先 Objective】\n{self.sticky_objective}")
-
+            parts.append(f"使用者設定的最高優先 Objective：{self.sticky_objective}")
+        if self.current_task:
+            parts.append(f"這一輪任務的原始敘述：{self.current_task}")
         if self.current_plan:
-            last_assistant = next(
-                (m['content'] for m in reversed(self.messages) if m['role'] == 'assistant'),
-                None,
-            )
-            if last_assistant:
-                parsed = parse_agent_reply(last_assistant)
-                if parsed["valid"]:
-                    last_assistant = parsed["reply"] + (f"\n[action] {action_text(parsed['action'])}" if parsed["action"] else "")
-            plan_section = f"【使用者已核准的任務計畫（依步驟拆解逐步執行）】\n{self.current_plan}"
-            if last_assistant:
-                plan_section += (
-                    "\n\n【AI 剛才針對目前這一步的回應，可看出目前執行到哪一步】\n"
-                    f"{last_assistant}"
-                )
-            parts.append(plan_section)
-
-        if parts:
-            return "\n\n".join(parts)
-
-        return self.current_task or "(未取得使用者原始任務敘述)"
+            parts.append(f"使用者已核准的任務計畫（逐步執行中）：\n{self.current_plan}")
+        return "\n".join(parts) if parts else "(未取得使用者原始任務敘述)"
 
     def get_system_prompt(self):
 
@@ -1734,10 +1785,13 @@ class SkillAgent:
 
 def _append_discarded_tool_result(agent):
     """使用者選擇不把工具結果加入上下文時，仍需告知 AI「工具已執行完畢」，
-    避免它誤以為指令根本沒被處理而重複嘗試。"""
+    避免它誤以為指令根本沒被處理而重複嘗試。同樣包上系統回傳的框架句。"""
     agent.messages.append({
         'role': 'user',
-        'content': "[tool result]\nTool execution completed, but the result was discarded by user request."
+        'content': tool_result_message(
+            "工具已執行完畢，但使用者選擇不把結果加入上下文（結果只有使用者看到）。請依此繼續，不要重複執行同一個指令。",
+            (agent._last_assistant_step() or {}).get("action"),
+        ),
     })
 
 def _run_plan_flow(agent, user_task):
@@ -1999,6 +2053,29 @@ MAKE_SKILL_SCHEMA = {
 # 使用者角色但實為工具回傳的訊息前綴（見 _split_for_compression 的配對規則）
 TOOL_RESULT_PREFIXES = ("[tool result]", "【系統執行結果】")
 
+# 工具結果訊息第二行的框架句開頭（tool_result_message）。壓縮摘要渲染時以它辨認並去掉框架句。
+TOOL_RESULT_FRAME = "【系統回傳】"
+
+
+def tool_result_message(content, action=None):
+    """把工具結果包成進主對話的 user 訊息（CLI 三種模式、Web、捨棄通知統一用這個）。
+    第一行固定 [tool result]（HARNESS_MARKERS 判定、壓縮切點、軌跡都認它），第二行是框架句：明說這是系統執行
+    上一輪 action 的結果、不是使用者提供的、不要感謝使用者。
+
+    為什麼寫在每一則裡而不是只寫在 AGENT.md：工具結果只能以 user 角色進入主對話——實測 Ollama 的 gemma4 模板會把
+    role=tool 的訊息整個丟掉（模型完全看不到內容）；而 AGENT.md 的 Harness Messages 規則對 4B 模型不夠，實測仍回
+    「感謝您提供的語義地圖」。影像分析結果（web_console._run_vision_subsession）用的是同一招。
+    action 可給 parse_reply 的 action dict 或指令字串，只取腳本檔名放進框架句方便模型對應。"""
+    label = ""
+    if isinstance(action, dict) and action.get("command"):
+        label = os.path.basename(str(action["command"]).strip())
+    elif isinstance(action, str) and action.strip():
+        label = os.path.basename(action.strip().split()[0])
+    what = f"你上一輪 action（{label}）" if label else "你上一輪 action"
+    frame = (f"{TOOL_RESULT_FRAME}以下是系統執行{what}的結果，由系統自動產生、不是使用者提供的（使用者也看到同一份）。"
+             "回覆時稱「執行結果」或「系統回傳」，不要感謝使用者、不要說「您提供的」。")
+    return f"[tool result]\n{frame}\n{content}"
+
 # 融合摘要的 JSON schema：交給 Ollama 的 format= 做結構化輸出，再由 _render_summary_markdown 排版。
 SUMMARY_SCHEMA = {
     "type": "object",
@@ -2027,12 +2104,38 @@ SUMMARY_SCHEMA = {
 DEFAULT_CHARS_PER_TOKEN = 1.9
 MIN_CHARS_PER_TOKEN, MAX_CHARS_PER_TOKEN = 1.0, 6.0
 
-# 單一工具回傳內容的 token 門檻：超過此值時，不會把完整原始內容塞進 AI 的
-# 上下文（避免一次搜尋/列目錄的大量輸出把 context 灌爆、干擾推理），而是
-# 改用精簡的「成功／失敗」摘要餵給 AI，讓它的推理流程保持穩定；完整內容
-# 仍會顯示給使用者（CLI 印出、或 web_console 的系統/工具回傳面板）。
-# 約 1000 字元。（舊值 250 是「字元÷4」尺度，換成真實尺度即為 500。）
+# 單一工具回傳內容的 token 門檻：超過此值時，不把完整原始內容塞進主對話（避免一次搜尋／列目錄／
+# topic 擷取的大量輸出把 context 灌爆、干擾推理），而是交給獨立的摘要 session（summarize_tool_result）
+# 拿「完整原始輸出 + 使用者目標 + 這一步的目的」做任務導向擷取，主對話只收到重點；完整內容仍會顯示給
+# 使用者（CLI 印出、或 web_console 的系統/工具回傳面板）。約 1000 字元。
+# （舊值 250 是「字元÷4」尺度，換成真實尺度即為 500。）
 TOOL_RESULT_TOKEN_THRESHOLD = 500
+
+# 🧠 任務導向摘要（Task-Oriented Summarization）：超過門檻的工具回傳一律走這條路，沒有腳本自帶的豁免
+# （舊版 [PASS][digest] 讓分析型輸出放寬到 1500 tokens 直接進主對話，等於由腳本決定什麼重要——已移除，
+# 腳本改回傳完整資訊，重要與否交給知道任務的獨立 session 判斷）。唯一例外是技能規格文件（SKILL_DOC_PREFIX）。
+# 預設開啟；/summarize off 或 AGENT_TOOL_SUMMARY=0 改回只給成功／失敗判定（不多花一次模型呼叫）。
+TOOL_SUMMARY_DEFAULT = os.environ.get("AGENT_TOOL_SUMMARY", "1").strip().lower() not in ("0", "off", "false", "no")
+# summarize_tool_result() 產生的內容固定以這個標籤開頭：CLI 據此印出、Web 據此推 🧠 卡片，讓使用者看到主對話實際收到的內容。
+TOOL_SUMMARY_TAG = "[tool result - 任務導向摘要]"
+# 獨立 session 一次最多讀多少原始輸出（字元）：超過就保留頭尾、明確告知中間省略了多少（見 _clip_tool_output）。
+# 16000 字 ≈ 8500 tokens，加上 system prompt 與錨點仍遠低於 NUM_CTX；小記憶體設備可用環境變數調低。
+TOOL_SUMMARY_INPUT_MAX_CHARS = int(os.environ.get("AGENT_TOOL_SUMMARY_INPUT_CHARS", "16000"))
+TOOL_SUMMARY_MAX_CHARS = 400      # 摘要長度目標（字，寫進 prompt）；門檻 500 tokens ≈ 950 字，摘要要明顯小於它才有意義
+TOOL_SUMMARY_MAX_PREDICT = 1200   # 摘要輸出的 num_predict 硬上限；被截斷時 JSON 解析失敗會退回原文
+
+# 任務導向摘要的結構（Ollama format=）：answer 一句話回答這一步的目的、facts 照抄的相關事實、errors 錯誤原文、
+# not_covered 原始輸出沒有／被省略而無法確認的部分——讓主模型知道「摘要裡沒有」不等於「輸出裡沒有」。
+TOOL_SUMMARY_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "answer": {"type": "string"},
+        "facts": {"type": "array", "items": {"type": "string"}},
+        "errors": {"type": "array", "items": {"type": "string"}},
+        "not_covered": {"type": "string"},
+    },
+    "required": ["answer", "facts", "errors", "not_covered"],
+}
 
 # run_tool 載入技能規格文件時回傳字串的固定開頭。規格文件是「按需載入」機制的核心，
 # 內容（尤其是實際腳本路徑與參數格式）必須完整進入上下文，因此 _content_for_context
@@ -2046,21 +2149,10 @@ def is_skill_doc_result(result):
     return bool(result) and result.lstrip().startswith(SKILL_DOC_PREFIX)
 
 
-# 腳本輸出以 "[PASS][digest]" 開頭代表「這已經是為模型整理過的分析摘要」（例如觀察一段時間的變化清單、
-# 語義地圖對應、topic 一段時間的欄位統計）。這類輸出的價值就在內容本身，套用一般工具回傳的 500 tokens
-# 門檻換成「指令已成功執行」會讓模型拿不到分析依據；因此放寬到 DIGEST_TOKEN_THRESHOLD 才精簡。
-# 腳本仍有責任把摘要控制在這個範圍內（超過就跟一般輸出一樣被精簡）。
-DIGEST_MARKER = "[PASS][digest]"
-DIGEST_TOKEN_THRESHOLD = 1500
-
-
-def is_digest_result(result):
-    return bool(result) and result.lstrip().startswith(DIGEST_MARKER)
-
-
 def is_exempt_result(result, tool_tokens):
-    """規格文件一律放行；digest 在放寬門檻內放行。CLI／Web 的 ⚠️ 標記與 _content_for_context 共用這個判斷。"""
-    return is_skill_doc_result(result) or (is_digest_result(result) and tool_tokens <= DIGEST_TOKEN_THRESHOLD)
+    """不套用工具回傳門檻的結果：只有技能規格文件。所有腳本輸出（包括分析型的 --watch／--duration／語義地圖）
+    都走同一套規則——超過門檻就交給獨立 session 做任務導向擷取。CLI／Web 的 ⚠️ 標記與 _content_for_context 共用這個判斷。"""
+    return is_skill_doc_result(result)
 
 # 單一工具腳本的總逾時（秒）：harness 的最後防線。各腳本自身應設定更短的逾時
 # （容器類腳本可調的上限 570 秒就是為了低於這個值），這裡只處理腳本本身卡死
@@ -2068,16 +2160,14 @@ def is_exempt_result(result, tool_tokens):
 # （CLI 與 Web Console 都在同一條執行緒上等待工具）被無限期卡住。
 TOOL_EXEC_TIMEOUT = 600
 
-def _content_for_context(result, tool_tokens, agent=None, use_summary=False):
-    """決定要餵給 AI 上下文的內容：正常大小就原封不動放進去。超過
-    TOOL_RESULT_TOKEN_THRESHOLD 時有兩種精簡方式：
+def _content_for_context(result, tool_tokens, agent=None, use_summary=True):
+    """決定要餵給主對話的內容。門檻內、或技能規格文件：原封不動。超過 TOOL_RESULT_TOKEN_THRESHOLD 時：
 
-    - use_summary=False（預設）：原本的行為，只回傳成功／失敗的判定，
-      不需要額外呼叫模型，穩定、零延遲。
-    - use_summary=True 且提供 agent：改用 agent.summarize_tool_result()
-      開一個獨立 session 做語意摘要，讓主 session 拿到的不只是成功/失敗，
-      還有內容重點。此為可選功能，摘要 session 若失敗會自動退回成功/失敗
-      判定，不會讓主 session 的推理流程中斷。
+    - use_summary=True（預設）且提供 agent：交給 agent.summarize_tool_result()——一個獨立、乾淨的一次性
+      session，拿完整原始輸出 + 使用者目標 + 這一步的目的做任務導向擷取，主對話收到的是跟任務有關的重點。
+      所有工具回傳同一套規則，沒有腳本自帶的豁免。
+    - use_summary=False（/summarize off）、沒有 agent、或摘要 session 失敗：退回只給成功／失敗判定——零延遲，
+      但模型拿不到內容，只能換更精確的參數重查。
     """
     if tool_tokens <= TOOL_RESULT_TOKEN_THRESHOLD or is_exempt_result(result, tool_tokens):
         return result
@@ -2086,15 +2176,24 @@ def _content_for_context(result, tool_tokens, agent=None, use_summary=False):
         try:
             return agent.summarize_tool_result(result, tool_tokens)
         except Exception as e:
-            print(f"⚠️ 摘要 session 執行失敗，改用精簡成功/失敗判定：{e}")
+            print(f"⚠️ 獨立摘要 session 執行失敗，改用成功/失敗判定：{e}")
 
     status = "失敗" if result.lstrip().startswith("[ERROR]") else "成功"
     return (
         f"[tool result - 已精簡]\n"
-        f"指令已{status}執行（原始輸出約 {tool_tokens} tokens，超過門檻 "
-        f"{TOOL_RESULT_TOKEN_THRESHOLD}）。完整內容已顯示在剛才的系統回傳訊息中，"
-        f"未直接加入上下文，以維持推理穩定。"
+        f"指令已{status}執行（原始輸出約 {tool_tokens} tokens，超過門檻 {TOOL_RESULT_TOKEN_THRESHOLD}，"
+        f"且獨立摘要 session 未啟用或失敗，內容未加入上下文）。完整內容已顯示給使用者；你看不到它，"
+        f"需要內容時請換更精確的參數重新執行工具，不要憑空補上結果。"
     )
+
+
+def _context_content_for_cli(agent, result, tool_tokens, use_summary):
+    """CLI 用：算出要餵給主對話的內容；若是獨立 session 的任務導向摘要就印出來，
+    讓使用者看到主對話實際收到什麼（Web Console 以 🧠 卡片顯示同一份內容）。"""
+    content = _content_for_context(result, tool_tokens, agent=agent, use_summary=use_summary)
+    if content.startswith(TOOL_SUMMARY_TAG):
+        print(f"\n🧠 獨立 session 任務導向摘要（主對話實際收到的內容）:\n{'-'*30}\n{content}\n{'-'*30}")
+    return content
 
 def after_turn_compression(agent, parallel, notify):
     """回合結束後的軟水位檢查（CLI 與 Web Console 共用）。
@@ -2169,7 +2268,7 @@ def main():
     agent.reset_conversation()
     auto_mode = False
     hybrid_mode = False  # 👈 新增狀態
-    tool_summary_mode = False  # 👈 工具回傳超過門檻時，是否改用獨立 session 做語意摘要
+    tool_summary_mode = TOOL_SUMMARY_DEFAULT  # 👈 工具回傳超過門檻時交給獨立 session 做任務導向摘要（預設開；/summarize off 改成只給成功／失敗）
     parallel_cal = PARALLEL_CAL_DEFAULT  # 👈 軟水位壓縮改在背景執行緒做（需 Ollama 有 ≥2 個 parallel slot 才真的平行）
     pending_skill_blocks = []  # 👈 /skill <名稱> 手動載入的技能規格，隨下一則新任務訊息一起送出
     plan_mode = False  # 👈 開啟後，下一個新任務先規劃、經使用者核准後才執行；核准即自動退出
@@ -2223,11 +2322,11 @@ def main():
                 continue
             if user_msg.lower() == '/summarize on':
                 tool_summary_mode = True
-                print("🧠 已開啟工具回傳摘要模式（超過門檻的結果會由獨立 session 摘要後再交給主對話）")
+                print("🧠 已開啟工具回傳的任務導向摘要（預設）：超過門檻的結果由獨立 session 依使用者目標與這一步的目的擷取重點後再交給主對話")
                 continue
             if user_msg.lower() == '/summarize off':
                 tool_summary_mode = False
-                print("🧠 已關閉工具回傳摘要模式（超過門檻的結果改回精簡成功/失敗判定）")
+                print("🧠 已關閉工具回傳的任務導向摘要：超過門檻的結果只給主對話成功/失敗判定（不多花一次模型呼叫）")
                 continue
             if user_msg.lower() == '/parallel_cal on':
                 parallel_cal = True
@@ -2358,7 +2457,8 @@ def main():
                     print(f"🧰 Tool Tokens: {tool_tokens}")
                     if tool_tokens > TOOL_RESULT_TOKEN_THRESHOLD and not is_exempt_result(result, tool_tokens):
                         print(f"⚠️ 此工具回傳約 {tool_tokens} tokens，超過門檻 {TOOL_RESULT_TOKEN_THRESHOLD}，"
-                              f"加入上下文時將改用精簡摘要。")
+                              + ("加入上下文前將交由獨立 session 依目前任務擷取重點。" if tool_summary_mode
+                                 else "加入上下文時只保留成功／失敗判定（/summarize on 可改為獨立 session 摘要）。"))
                 else:
                     print("✅ 無工具需要執行")
 
@@ -2376,7 +2476,7 @@ def main():
 
                 # 1. Auto Mode
                 if auto_mode:
-                    agent.messages.append({'role': 'user', 'content': f"[tool result]\n{_content_for_context(result, tool_tokens, agent=agent, use_summary=tool_summary_mode)}"})
+                    agent.messages.append({'role': 'user', 'content': tool_result_message(_context_content_for_cli(agent, result, tool_tokens, tool_summary_mode), parsed["action"])})
                     print("♻️ Auto Continue 中...")
                     continue
 
@@ -2384,7 +2484,7 @@ def main():
                 if hybrid_mode:
                     choice = input("\n🤔 Hybrid Mode - 加入上下文？(y/n): ").lower()
                     if choice == 'y':
-                        agent.messages.append({'role': 'user', 'content': f"[tool result]\n{_content_for_context(result, tool_tokens, agent=agent, use_summary=tool_summary_mode)}"})
+                        agent.messages.append({'role': 'user', 'content': tool_result_message(_context_content_for_cli(agent, result, tool_tokens, tool_summary_mode), parsed["action"])})
                         continue
                     else:
                         _append_discarded_tool_result(agent)
@@ -2395,7 +2495,7 @@ def main():
                 # 3. Manual Mode
                 choice = input("\n是否將系統結果加入上下文？(y/n/stop): ").lower()
                 if choice == 'y':
-                    agent.messages.append({'role': 'user', 'content': f"【系統執行結果】:\n{_content_for_context(result, tool_tokens, agent=agent, use_summary=tool_summary_mode)}"})
+                    agent.messages.append({'role': 'user', 'content': tool_result_message(_context_content_for_cli(agent, result, tool_tokens, tool_summary_mode), parsed["action"])})
                 elif choice == 'stop':
                     break
                 else:

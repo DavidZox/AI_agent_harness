@@ -2,7 +2,7 @@
 機器人（座標最近的站、前往的站、所在路段）與 work package 當前派工的站對到每個站點。
 
 資料全部問 web_console：GET /api/topology（拓譜圖 + semantics.yaml）與 WebSocket /api/ws 一幀快照，不讀任何地圖檔，
-所以看到的永遠是 web_console 目前載入的場域。不帶參數＝全部站點的精簡總覽（開頭 [PASS][digest]）；帶關鍵字或站點代號＝
+所以看到的永遠是 web_console 目前載入的場域。不帶參數＝全部站點的總覽；帶關鍵字或站點代號＝
 該站／路段的完整說明與連接路段；--stations／--robots 只列站點或機器人清單（/api/stations、/api/robots）。共用層見 _rmf_common.py。
 """
 import json
@@ -49,10 +49,10 @@ def map_mode(base_url, query=None):
     nodes, edges = topo["nodes"], topo["edges"]
     sem_nodes = sum(1 for n in nodes if n.get("has_semantic"))
     sem_edges = sum(1 for e in edges if e.get("has_semantic"))
-    head = f"[PASS][digest] 語義地圖：{len(nodes)} 站、{len(edges)} 邊，有語意名稱／說明的站 {sem_nodes}、邊 {sem_edges}（web_console /api/topology + 即時快照）{live_note}"
+    head = f"[PASS] 語義地圖：{len(nodes)} 站、{len(edges)} 邊，有語意名稱／說明的站 {sem_nodes}、邊 {sem_edges}（web_console /api/topology + 即時快照）{live_note}"
 
     if not query:
-        # 精簡版：站點=語意名稱 一行、有東西的站點另列，避免 30 幾站逐行超過工具回傳門檻
+        # 總覽：站點=語意名稱 一行列完、有東西的站點另列；細節用關鍵字查（超過門檻時由 harness 的獨立 session 依任務擷取）
         pairs = [f"{n['name']}={n.get('label')}" if n.get("label") and n.get("label") != n["name"] else n["name"] for n in nodes]
         lines = [head, "站點（代號=語意名稱）：" + "、".join(pairs)]
         busy = [f"{station_text(name, topo)}：{'；'.join(items)}" for name, items in per_station.items()]

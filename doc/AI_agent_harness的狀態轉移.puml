@@ -53,9 +53,9 @@ rectangle State6 #FFD580 [
   **6. Result（處理工具回傳）**
   * 同步狀態標記 [CWD_CHANGED]／[TARGET_CONTAINER]，
     記一筆操作軌跡（logs/trajectory.jsonl）。
-  * 超過 500 tokens 精簡成成功／失敗
-    （[PASS][digest] 放寬到 1500；
-    /summarize on 改由獨立 session 摘要）。
+  * 超過 500 tokens → 獨立 session 依
+    使用者目標＋這一步的目的擷取重點
+    （/summarize off 改成只給成功／失敗）。
   * manual：等使用者 y／n；hybrid：詢問後都續推；
     auto：直接帶入下一輪（Web 最多 25 輪）。
 ]

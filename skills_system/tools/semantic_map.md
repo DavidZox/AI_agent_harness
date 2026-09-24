@@ -19,7 +19,7 @@ web_console `GET /api/topology`（拓譜圖 + semantics.yaml 的語意名稱、�
 `EXECUTE: scripts/semantic_map_cmd.py --robots`
 
 # 回傳
-`[PASS][digest] 語義地圖：N 站、M 邊…` + 清單或該站詳情。`--stations`／`--robots`：`[PASS] 目前場域的…`。失敗 `[ERROR] 原因`。
+`[PASS] 語義地圖：N 站、M 邊…` + 清單或該站詳情。`--stations`／`--robots`：`[PASS] 目前場域的…`。失敗 `[ERROR] 原因`。
 
 # 異常
 * 找不到關鍵字：訊息列出現有站點，改用代號或其他關鍵字。

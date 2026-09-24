@@ -1,10 +1,12 @@
-"""ROS2_topic_echo：讀取 topic 的一筆訊息（--once），或以 --duration 秒 擷取一段時間並整理變化。
+"""ROS2_topic_echo：讀取 topic 的一筆訊息（--once），或以 --duration 秒 擷取一段時間。
 
 一筆訊息只是瞬間；使用者想知道「一段時間內有沒有變化、頻率多少、數值範圍」時，用 --duration：
 容器內以 `timeout --preserve-status -s INT <秒> ros2 topic echo <topic>` 收集這段時間的所有訊息（輸出上限
 MAX_CAPTURE_BYTES 避免高頻 topic 灌爆），宿主機端把 YAML 文件（以 --- 分隔）逐則解析、攤平成 a.b.c 欄位，
-回報則數、頻率、第一則與最後一則原文、每個欄位的變化（數值 min→max、字串有幾種不同值、固定不變的欄位），
-讓 Agent 拿到的是可分析的摘要而不是幾百則原始訊息。
+回報則數、頻率、每個欄位的變化（數值 min→max、字串有幾種不同值、固定不變的欄位），再附上全部原始訊息
+（超過 MAX_RAW_OUTPUT_CHARS 時保留頭尾並註明省略幾則；統計仍涵蓋全部）。腳本回傳的是完整資訊，
+「哪些重要」不在這裡決定：輸出超過工具回傳門檻時，harness 會交給知道使用者目標與這一步目的的獨立 session
+做任務導向擷取（舊版只回固定格式的 [PASS][digest] 摘要，使用者問到摘要沒涵蓋的欄位或某一則就答不出來）。
 """
 import os
 import re
@@ -24,12 +26,14 @@ MIN_DURATION_SECONDS = 2
 MAX_DURATION_SECONDS = 300
 CAPTURE_GRACE_SECONDS = 20       # ros2 CLI 啟動／discovery 的餘裕，加在 duration 上當作外層逾時
 MAX_CAPTURE_BYTES = 400000
-SAMPLE_CHARS = 320               # 第一則／最後一則原文各保留的字元數（整體回傳要留在工具門檻內）
+MAX_RAW_OUTPUT_CHARS = 12000     # 原始訊息區的篇幅上限：超過就保留最前面與最後面的訊息、註明中間省略幾則（統計仍涵蓋全部）
+MAX_CHANGED_FIELDS = 30          # 欄位變化清單最多列幾個欄位
+MAX_CONSTANT_FIELDS = 15         # 固定不變欄位最多列幾個
 USAGE = (
     "用法: scripts/ROS2_topic_echo_cmd.py [container_name] <topic_name> [timeout_seconds] [--duration 秒]\n"
     "  container_name 可省略＝目前的目標容器（docker_open 選定、或最近一次成功操作的容器）；topic 以 / 開頭。\n"
     f"  不加 --duration：讀一筆就結束；timeout_seconds 預設 {DEFAULT_TIMEOUT_SECONDS} 秒（低頻 topic 請加大），上限 {MAX_TIMEOUT_SECONDS}。\n"
-    f"  --duration 秒（{MIN_DURATION_SECONDS}～{MAX_DURATION_SECONDS}）：持續擷取這段時間的所有訊息並整理變化，適合「觀察一段時間／頻率／有沒有變化」。"
+    f"  --duration 秒（{MIN_DURATION_SECONDS}～{MAX_DURATION_SECONDS}）：持續擷取這段時間的所有訊息，回傳欄位統計與全部原始訊息，適合「觀察一段時間／頻率／有沒有變化」。"
 )
 
 
@@ -115,53 +119,75 @@ def _num(v):
     return f"{v:.4g}"
 
 
+def render_raw_messages(raw_docs, max_chars=MAX_RAW_OUTPUT_CHARS):
+    """全部原始訊息依接收順序列出（--- #序號）。總篇幅超過 max_chars 時保留最前面與最後面各約一半篇幅的訊息，
+    中間以一行註明省略了第幾到第幾則；單則就超過篇幅時截斷該則並註明。回傳 (lines, omitted_count)。"""
+    n = len(raw_docs)
+    items = [f"--- #{k + 1}\n{d}" for k, d in enumerate(raw_docs)]
+    if sum(len(x) + 1 for x in items) <= max_chars:
+        return [f"原始訊息（共 {n} 則，依接收順序）："] + items, 0
+    half = max_chars // 2
+    head, used = [], 0
+    while len(head) < n and used + len(items[len(head)]) + 1 <= half:
+        used += len(items[len(head)]) + 1
+        head.append(items[len(head)])
+    tail, used = [], 0
+    while len(head) + len(tail) < n and used + len(items[n - 1 - len(tail)]) + 1 <= half:
+        used += len(items[n - 1 - len(tail)]) + 1
+        tail.insert(0, items[n - 1 - len(tail)])
+    if not head:  # 第一則就超過一半篇幅：截斷後仍要給（第一則通常最能說明訊息結構）
+        head = [items[0][:half] + "\n…（單則訊息過長，已截斷）"]
+    omitted = n - len(head) - len(tail)
+    if omitted <= 0:
+        return [f"原始訊息（共 {n} 則，依接收順序）："] + head + tail, 0
+    lines = [f"原始訊息（共 {n} 則，依接收順序；篇幅限制只列出前 {len(head)} 則與最後 {len(tail)} 則、"
+             f"中間省略 {omitted} 則，上方欄位統計仍涵蓋全部訊息）："]
+    return lines + head + [f"…（省略第 {len(head) + 1}～{n - len(tail)} 則，共 {omitted} 則）…"] + tail, omitted
+
+
 def summarize_docs(topic, duration, docs, raw_docs):
+    """狀態列 + 欄位統計（涵蓋全部訊息）+ 全部原始訊息。"""
     n = len(docs) if docs else len(raw_docs)
-    lines = [f"[PASS][digest] 觀察 '{topic}' {duration} 秒：收到 {n} 則訊息（約 {n / duration:.2f} Hz）"]
-    if raw_docs:
-        lines.append(f"第一則：\n{raw_docs[0][:SAMPLE_CHARS]}{'…' if len(raw_docs[0]) > SAMPLE_CHARS else ''}")
-        if len(raw_docs) > 1:
-            lines.append(f"最後一則：\n{raw_docs[-1][:SAMPLE_CHARS]}{'…' if len(raw_docs[-1]) > SAMPLE_CHARS else ''}")
-    if not docs:
-        if yaml is None:
-            lines.append("（宿主機沒有 PyYAML，無法逐欄位分析；以上為原文樣本）")
-        return "\n".join(lines)
-    flats = [flatten(d) for d in docs]
-    keys = []
-    for f in flats:
-        for k in f:
-            if k not in keys:
-                keys.append(k)
-    changed, constant = [], []
-    for k in keys[:60]:
-        values = [f.get(k) for f in flats if k in f]
-        if not values:
-            continue
-        distinct = []
-        for v in values:
-            if v not in distinct:
-                distinct.append(v)
-        if len(distinct) <= 1:
-            constant.append(f"{k}={_fmt(values[0])}")
-            continue
-        if all(isinstance(v, (int, float)) and not isinstance(v, bool) for v in values):
-            changed.append(f"{k}：數值 {_num(values[0])} → {_num(values[-1])}（最小 {_num(min(values))}、最大 {_num(max(values))}、{len(distinct)} 種值）")
-        elif all(isinstance(v, list) for v in values):
-            changed.append(f"{k}：數值陣列變動 {len(distinct)} 次（長度 {len(values[-1])}）")
-        else:
-            changed.append(f"{k}：{len(distinct)} 種不同值，最後 = {_fmt(values[-1])}" + (f"（例：{'、'.join(_fmt(v) for v in distinct[:3])}）" if len(distinct) <= 6 else ""))
-    lines.append(f"欄位變化（{len(docs)} 則、{len(keys)} 個欄位）：")
-    lines += [f"- {c}" for c in changed[:20]] if changed else ["- 所有欄位在觀察期間都沒有變化"]
-    if len(changed) > 20:
-        lines.append(f"- …另有 {len(changed) - 20} 個欄位有變化")
-    if constant:
-        text = "；".join(constant[:10])
-        lines.append(f"固定不變：{text}{'；…' if len(constant) > 10 else ''}")
-    return "\n".join(lines)
+    lines = [f"[PASS] 觀察 '{topic}' {duration} 秒：收到 {n} 則訊息（約 {n / duration:.2f} Hz）"]
+    if docs:
+        flats = [flatten(d) for d in docs]
+        keys = []
+        for f in flats:
+            for k in f:
+                if k not in keys:
+                    keys.append(k)
+        changed, constant = [], []
+        for k in keys[:80]:
+            values = [f.get(k) for f in flats if k in f]
+            if not values:
+                continue
+            distinct = []
+            for v in values:
+                if v not in distinct:
+                    distinct.append(v)
+            if len(distinct) <= 1:
+                constant.append(f"{k}={_fmt(values[0])}")
+                continue
+            if all(isinstance(v, (int, float)) and not isinstance(v, bool) for v in values):
+                changed.append(f"{k}：數值 {_num(values[0])} → {_num(values[-1])}（最小 {_num(min(values))}、最大 {_num(max(values))}、{len(distinct)} 種值）")
+            elif all(isinstance(v, list) for v in values):
+                changed.append(f"{k}：數值陣列變動 {len(distinct)} 次（長度 {len(values[-1])}）")
+            else:
+                changed.append(f"{k}：{len(distinct)} 種不同值，最後 = {_fmt(values[-1])}" + (f"（例：{'、'.join(_fmt(v) for v in distinct[:3])}）" if len(distinct) <= 6 else ""))
+        lines.append(f"欄位變化（{len(docs)} 則、{len(keys)} 個欄位）：")
+        lines += [f"- {c}" for c in changed[:MAX_CHANGED_FIELDS]] if changed else ["- 所有欄位在觀察期間都沒有變化"]
+        if len(changed) > MAX_CHANGED_FIELDS:
+            lines.append(f"- …另有 {len(changed) - MAX_CHANGED_FIELDS} 個欄位有變化")
+        if constant:
+            lines.append(f"固定不變：{'；'.join(constant[:MAX_CONSTANT_FIELDS])}{'；…' if len(constant) > MAX_CONSTANT_FIELDS else ''}")
+    elif yaml is None:
+        lines.append("（宿主機沒有 PyYAML，無法逐欄位統計；以下為原始訊息）")
+    raw_lines, _ = render_raw_messages(raw_docs)
+    return "\n".join(lines + raw_lines)
 
 
 def run_topic_capture(container, topic, duration):
-    """擷取 duration 秒的所有訊息並整理成摘要。"""
+    """擷取 duration 秒的所有訊息：狀態列 + 欄位統計 + 全部原始訊息。"""
     container = (container or "").strip()
     topic = (topic or "").strip()
     if not container or not topic:

@@ -67,7 +67,7 @@ NodeAgent -down-> NodeSkills : action.command＝技能名稱\n→ 回規格文�
 NodeAgent -[#CC6600,bold]down-> NodeSkills : action.command＝腳本路徑\n→ subprocess 執行（cwd／TARGET_CONTAINER）
 NodeSkills -down-> NodeWorld : docker exec／HTTP／檔案操作
 NodeWorld -up-> NodeSkills : 原始輸出
-NodeSkills -[#009933,bold]up-> NodeAgent : [PASS]／[ERROR]／[PASS][digest]\n+ [CWD_CHANGED]／[TARGET_CONTAINER] 狀態標記
+NodeSkills -[#009933,bold]up-> NodeAgent : [PASS]／[ERROR] 完整輸出\n+ [CWD_CHANGED]／[TARGET_CONTAINER] 狀態標記
 NodeAgent -left-> NodeMem : 壓縮歸檔、軌跡、modify_memory 寫入
 NodeMem -right-> NodeAgent : 常駐記憶、最新一份摘要
 
@@ -91,9 +91,10 @@ end note
 
 note left of NodeMem
   **工具回傳門檻：**
-  單次超過 500 tokens 只給模型
-  成功／失敗判定；[PASS][digest]
-  的分析摘要放寬到 1500。
+  單次超過 500 tokens 不進主對話，
+  交給獨立 session（完整輸出 +
+  使用者目標 + 這一步的目的）
+  做任務導向擷取；規格文件例外。
   完整內容永遠顯示給使用者。
 end note
 

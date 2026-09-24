@@ -250,7 +250,7 @@ def parse_timeout(value, default, max_seconds, name="timeout"):
 # 容器技能省略 <container_name> 時就用它——跟工作目錄同一套邏輯（腳本以 current_cwd 執行、相對路徑自然生效）。
 # 腳本成功操作某個容器後，在輸出末行印「[TARGET_CONTAINER] <名稱>」（比照 cd 的 [CWD_CHANGED]），harness 的
 # _sync_state_from_tool_output 會同步；所以目標容器＝最近一次成功操作的容器，docker_open 則是刻意選定／切換用。
-# 標記放末行是為了不破壞 [PASS]／[PASS][digest] 的開頭判定；與目前目標相同時不印，避免每次都多一行噪音。
+# 標記放末行是為了不破壞 [PASS]／[ERROR] 的開頭判定；與目前目標相同時不印，避免每次都多一行噪音。
 TARGET_CONTAINER_ENV = "TARGET_CONTAINER"
 TARGET_CONTAINER_MARKER = "[TARGET_CONTAINER]"
 NO_TARGET_HINT = ("沒有指定容器，目前也沒有目標容器：請先用 docker_containers 查看名稱，再用 docker_open <名稱> 選定目標容器"
