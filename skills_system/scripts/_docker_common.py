@@ -17,6 +17,10 @@
    這個前綴判定成功／失敗），並把常見的 docker / ros2 錯誤翻成可直接採取行動
    的說明，後面附上清理過雜訊的 stderr 與部分 stdout 供診斷。
 
+4. 目標容器（比照當前工作目錄）：harness 以環境變數 TARGET_CONTAINER 傳入目前的目標容器，
+   腳本省略 <container_name> 時用它（resolve_container）；成功操作某容器後在輸出末行印
+   [TARGET_CONTAINER] <名稱>（with_target_marker），harness 據此同步狀態，見檔尾。
+
 回傳慣例：(ok: bool, stdout: str, error_message: str)
   ok=True  -> stdout 為指令輸出，error_message 為空字串
   ok=False -> error_message 以 [ERROR] 開頭；stdout 可能含逾時／失敗前的部分輸出
@@ -24,6 +28,7 @@
 腳本由 Agent 以 `python3 scripts/<name>_cmd.py` 執行，sys.path[0] 即為本目錄，
 因此各腳本可直接 `import _docker_common`。
 """
+import os
 import subprocess
 
 # 沒有 tty 時 bash -ic 一定會印出的雜訊，對診斷沒有幫助，一律過濾
@@ -238,3 +243,53 @@ def parse_timeout(value, default, max_seconds, name="timeout"):
     if not 1 <= seconds <= max_seconds:
         return None, f"[ERROR] {name} 需介於 1～{max_seconds} 秒（上限低於系統總逾時 600 秒），收到: {seconds}"
     return seconds, None
+
+
+# ---------------------------------------------------------------- 目標容器（比照當前工作目錄）
+# harness（Agent_Runner.run_tool）把目前的目標容器放在環境變數 TARGET_CONTAINER 傳給每支腳本，
+# 容器技能省略 <container_name> 時就用它——跟工作目錄同一套邏輯（腳本以 current_cwd 執行、相對路徑自然生效）。
+# 腳本成功操作某個容器後，在輸出末行印「[TARGET_CONTAINER] <名稱>」（比照 cd 的 [CWD_CHANGED]），harness 的
+# _sync_state_from_tool_output 會同步；所以目標容器＝最近一次成功操作的容器，docker_open 則是刻意選定／切換用。
+# 標記放末行是為了不破壞 [PASS]／[PASS][digest] 的開頭判定；與目前目標相同時不印，避免每次都多一行噪音。
+TARGET_CONTAINER_ENV = "TARGET_CONTAINER"
+TARGET_CONTAINER_MARKER = "[TARGET_CONTAINER]"
+NO_TARGET_HINT = ("沒有指定容器，目前也沒有目標容器：請先用 docker_containers 查看名稱，再用 docker_open <名稱> 選定目標容器"
+                  "（之後可省略容器名稱），或直接把容器名稱放在第一個參數。")
+LIST_TIMEOUT_SECONDS = 15
+
+
+def current_target_container():
+    return (os.environ.get(TARGET_CONTAINER_ENV) or "").strip()
+
+
+def list_container_names(timeout=LIST_TIMEOUT_SECONDS):
+    """所有容器（含未運行）的名稱清單；docker 不可用時回 (None, error)。"""
+    ok, out, err = run_docker(["docker", "ps", "-a", "--format", "{{.Names}}"], timeout, what="查詢容器清單 (docker ps -a)")
+    if not ok:
+        return None, err
+    return [n.strip() for n in out.splitlines() if n.strip()], None
+
+
+def match_container(name, names):
+    """名稱比對：完全相同 > 唯一的子字串符合；對不到或多個符合回 None（docker exec 只認完整名稱）。"""
+    if name in names:
+        return name
+    matches = [n for n in names if name in n]
+    return matches[0] if len(matches) == 1 else None
+
+
+def resolve_container(name, usage=None):
+    """決定這次要操作的容器，回傳 (container, error)：name 非空就用它（docker exec 只認完整名稱，不做猜測）；
+    空 → 目前的目標容器；兩者皆空 → [ERROR] 提示先用 docker_open 選定。"""
+    name = (name or "").strip() or current_target_container()
+    if name:
+        return name, None
+    return None, f"[ERROR] {NO_TARGET_HINT}" + (f"\n{usage}" if usage else "")
+
+
+def with_target_marker(output, container):
+    """成功輸出附上目標容器標記（末行），讓 harness 把它設為目前的目標容器；與目前目標相同時不附。"""
+    container = (container or "").strip()
+    if not container or container == current_target_container():
+        return output
+    return f"{output.rstrip()}\n{TARGET_CONTAINER_MARKER} {container}"

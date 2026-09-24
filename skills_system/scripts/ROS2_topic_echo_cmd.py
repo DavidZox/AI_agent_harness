@@ -11,7 +11,7 @@ import re
 import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from _docker_common import ros2_exec, pass_or_empty, parse_timeout
+from _docker_common import ros2_exec, pass_or_empty, parse_timeout, resolve_container, with_target_marker
 
 try:
     import yaml
@@ -26,7 +26,8 @@ CAPTURE_GRACE_SECONDS = 20       # ros2 CLI 啟動／discovery 的餘裕，加�
 MAX_CAPTURE_BYTES = 400000
 SAMPLE_CHARS = 320               # 第一則／最後一則原文各保留的字元數（整體回傳要留在工具門檻內）
 USAGE = (
-    "用法: scripts/ROS2_topic_echo_cmd.py <container_name> <topic_name> [timeout_seconds] [--duration 秒]\n"
+    "用法: scripts/ROS2_topic_echo_cmd.py [container_name] <topic_name> [timeout_seconds] [--duration 秒]\n"
+    "  container_name 可省略＝目前的目標容器（docker_open 選定、或最近一次成功操作的容器）；topic 以 / 開頭。\n"
     f"  不加 --duration：讀一筆就結束；timeout_seconds 預設 {DEFAULT_TIMEOUT_SECONDS} 秒（低頻 topic 請加大），上限 {MAX_TIMEOUT_SECONDS}。\n"
     f"  --duration 秒（{MIN_DURATION_SECONDS}～{MAX_DURATION_SECONDS}）：持續擷取這段時間的所有訊息並整理變化，適合「觀察一段時間／頻率／有沒有變化」。"
 )
@@ -198,14 +199,23 @@ def parse_cli(argv):
             return None, None, None, None, f"[ERROR] --duration 需介於 {MIN_DURATION_SECONDS}～{MAX_DURATION_SECONDS} 秒，收到: {args[i + 1]!r}\n{USAGE}"
         duration = value
         del args[i:i + 2]
-    if len(args) < 2:
-        return None, None, None, None, f"[ERROR] 參數不足。\n{USAGE}"
-    if args[0].startswith("-") or args[1].startswith("-"):
-        return None, None, None, None, f"[ERROR] 參數順序錯誤：前兩個位置參數必須是 <container_name> <topic_name>（收到 {args[0]!r} {args[1]!r}），除了 --duration 沒有其他選項。\n{USAGE}"
-    timeout, err = parse_timeout(args[2] if len(args) > 2 else None, DEFAULT_TIMEOUT_SECONDS, MAX_TIMEOUT_SECONDS, name="timeout_seconds")
+    bad = [a for a in args if a.startswith("-")]
+    if bad:
+        return None, None, None, None, f"[ERROR] 不認識的選項 {bad[0]!r}：位置參數依序是 [container_name] <topic_name> [timeout_seconds]，除了 --duration 沒有其他選項。\n{USAGE}"
+    if not args:
+        return None, None, None, None, f"[ERROR] 參數不足，需要 topic 名稱。\n{USAGE}"
+    # 判斷第一個參數是容器還是 topic：只有一個參數、第一個以 / 開頭（topic 名稱）、或形如「<topic> <秒數>」時，容器省略＝目標容器
+    if len(args) == 1 or args[0].startswith("/") or (len(args) == 2 and args[1].isdigit()):
+        container, rest = "", args
+    else:
+        container, rest = args[0], args[1:]
+    container, err = resolve_container(container, USAGE)
+    if err:
+        return None, None, None, None, err
+    timeout, err = parse_timeout(rest[1] if len(rest) > 1 else None, DEFAULT_TIMEOUT_SECONDS, MAX_TIMEOUT_SECONDS, name="timeout_seconds")
     if err:
         return None, None, None, None, f"{err}\n{USAGE}"
-    return args[0], args[1], timeout, duration, None
+    return container, rest[0], timeout, duration, None
 
 
 if __name__ == "__main__":
@@ -214,7 +224,8 @@ if __name__ == "__main__":
         if err:
             print(err)
             sys.exit(0)
-        print(run_topic_capture(container, topic, duration) if duration else run_topic_echo(container, topic, timeout))
+        out = run_topic_capture(container, topic, duration) if duration else run_topic_echo(container, topic, timeout)
+        print(out if out.lstrip().startswith("[ERROR]") else with_target_marker(out, container))
     except Exception as e:
         print(f"[ERROR] ROS2_topic_echo 未預期的例外: {e}", file=sys.stderr)
         sys.exit(1)

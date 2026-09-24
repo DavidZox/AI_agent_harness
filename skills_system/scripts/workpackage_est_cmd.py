@@ -50,6 +50,7 @@ USAGE = (
     "用法:\n"
     "  發送: scripts/workpackage_est_cmd.py <task_id|auto> <站點1,站點2,...> [--amr 機器人] [--type regular|charge|park]\n"
     "        [--level normal|middle|emergency] [--weight 整數] [--loop [輪數]] [--desc 描述1,描述2,...] [--ros2 容器名稱] [--dry-run]\n"
+    "        循環：--loop（後面不接數字）＝無限循環直到手動刪除；--loop 3＝跑 3 輪；不加 --loop＝只跑一輪\n"
     "        站點可寫代號（a3）或語意名稱（加工線通道-6），會自動對應成代號\n"
     "  取消: --cancel <task_id>；--cancel-overpending <任務id> [--wait 秒]（不在逾時區時等它進來再刪）\n"
     "  查詢: --status [task_id] [--watch 秒]（持續觀察並整理變化）｜--map [關鍵字或站點代號]（語義地圖＋目前佈局）｜--stations｜--robots\n"
@@ -64,6 +65,14 @@ _VALUE_OPTS = {"--amr": "amr", "--type": "type", "--level": "level", "--weight":
                "--wait": "wait", "--watch": "watch"}
 _FLAG_OPTS = {"--dry-run": "dry_run", "--stations": "stations_mode", "--robots": "robots_mode"}
 _OPTIONAL_VALUE_OPTS = {"--status": ("status_mode", "status"), "--map": ("map_mode", "map_query")}
+# 循環：orchestrtor 的 loop_count None＝循環到手動刪除、正整數＝跑 N 輪（web 介面也是「留空＝無限」）。
+# 小模型表達「無限循環」的寫法很多（--loop 不接數字、--loop 0、--loop 無限、--forever…），全部收下；
+# 實測舊措辭「不接＝循環到取消」被讀成「不加 --loop」而送出單輪任務，所以規格與 USAGE 改成正面寫法。
+_LOOP_FLAGS = ("--loop", "--loops", "--loop-count", "--repeat", "--cycle")
+_INFINITE_FLAGS = ("--infinite", "--forever", "--endless", "--loop-forever", "--infinite-loop")
+_INFINITE_WORDS = {"0", "-1", "inf", "infinite", "infinity", "forever", "endless", "always", "unlimited", "none", "null",
+                   "true", "yes", "on", "∞", "無限", "無限循環", "不停", "永久", "一直", "是"}
+_NO_LOOP_WORDS = {"false", "no", "off", "否", "不"}
 
 
 # ---------------------------------------------------------------- 參數
@@ -93,13 +102,21 @@ def parse_args(argv):
                 i += 2
             else:
                 i += 1
-        elif tok == "--loop":
-            opts["loop"] = True
-            if i + 1 < len(argv) and argv[i + 1].isdigit():
-                opts["loop_count"] = int(argv[i + 1])
-                i += 2
-            else:
-                i += 1
+        elif tok in _LOOP_FLAGS or tok in _INFINITE_FLAGS:
+            # 無限循環：--loop 不接數字（或接 0／無限／forever 等字眼）、或 --forever 這類旗標；--loop N＝跑 N 輪
+            opts["loop"], opts["loop_count"] = True, None
+            i += 1
+            if tok in _LOOP_FLAGS and i < len(argv) and not argv[i].startswith("--"):
+                val = argv[i].strip().lower()
+                if val.isdigit() and int(val) > 0:
+                    opts["loop_count"] = int(val)
+                    i += 1
+                elif val in _INFINITE_WORDS:
+                    i += 1
+                elif val in _NO_LOOP_WORDS:
+                    opts["loop"] = False
+                    i += 1
+                # 其他 token（例如站點清單）不是輪數，留給位置參數
         elif tok.startswith("--"):
             return None, f"[ERROR] 不認識的選項 {tok}。\n{USAGE}"
         else:
@@ -492,8 +509,6 @@ def build_payload(opts, topo=None):
         return None, None, f"[ERROR] --weight 必須是整數（0＝依類型與等級自動計算），收到: {opts['weight']!r}。"
     if weight < 0:
         return None, None, "[ERROR] --weight 不可為負數。"
-    if opts["loop_count"] is not None and opts["loop_count"] <= 0:
-        return None, None, "[ERROR] --loop 後面的輪數必須是正整數（不接數字＝循環到手動刪除）。"
     amr = (opts["amr"] or "").strip()
     for name, value in (("task_id", task_id), ("--amr", amr), *[("站點", s) for s in stations]):
         if "," in value:
@@ -505,16 +520,27 @@ def build_payload(opts, topo=None):
     }, notes, None
 
 
+def loop_text(pkg):
+    if not pkg["loop"]:
+        return "否（只跑一輪）"
+    return f"是（{pkg['loop_count']} 輪）" if pkg["loop_count"] else "是（無限，直到手動刪除）"
+
+
+def headline(pkg, verb):
+    """回傳第一行：把使用者最會核對的幾件事（站數、循環設定、機器人）寫在最前面。整段回傳要控制在工具門檻
+    （500 tokens）內——舊版約 570 tokens 會被精簡成「指令已成功執行」，模型看不到 loop: 否，也就無法自我修正。"""
+    amr = pkg["assign_amr"] or "交給 distribute 挑"
+    return f"[PASS] work package「{pkg['task_id']}」{verb}：{len(pkg['stops'])} 站，循環：{loop_text(pkg)}，機器人：{amr}"
+
+
 def describe(pkg, topo=None):
     stations = [station_text(s["station"], topo) for s in pkg["stops"]]
-    loop = ("是（%s）" % (f"{pkg['loop_count']} 輪" if pkg["loop_count"] else "直到手動刪除")) if pkg["loop"] else "否"
-    return (f"task_id: {pkg['task_id']}\nstops: {' → '.join(stations)}（{len(stations)} 站）\n"
-            f"assign_amr: {pkg['assign_amr'] or '（空，交給 distribute 挑機器人）'}｜task_type: {pkg['task_type']}｜"
-            f"level: {pkg['level']}｜weight: {pkg['weight'] if pkg['weight'] else '0（依類型與等級自動計算）'}｜loop: {loop}")
+    return (f"stops: {' → '.join(stations)}\n"
+            f"task_type: {pkg['task_type']}｜level: {pkg['level']}｜weight: {pkg['weight'] if pkg['weight'] else '0（自動計算）'}｜"
+            f"loop: {loop_text(pkg)}")
 
 
-FOLLOW_UP = ("後續：orchestrtor 會依序把每一站派給 distribute，完成判斷靠機器人回報 /{rid}/task_exec_fin；沒有機器人可承接時停在當前站等待。"
-             "用 --status <task_id> 看進度、--status --watch 秒 觀察一段時間、--cancel <task_id> 撤銷。")
+FOLLOW_UP = "後續：--status <task_id> 看進度、--status --watch 秒 觀察一段時間、--cancel <task_id> 撤銷；沒有機器人可承接時停在當前站等待（⏳），不是錯誤。"
 
 
 def send_http(base_url, pkg, notes, topo):
@@ -537,8 +563,10 @@ def send_http(base_url, pkg, notes, topo):
         if data.get("count") != 1 or not isinstance(echoed, dict) or echoed.get("task_id") != pkg["task_id"]:
             note = "\n⚠️ web_console 的回應內容與送出的 work package 對不上，請用 --status 確認是否真的收到。"
     mapped = f"站點名稱對應：{'；'.join(notes)}\n" if notes else ""
-    return (f"[PASS] work package 已送出（HTTP {status}，web_console 已轉發到 {TOPIC}）\n{mapped}{describe(pkg, topo)}\n"
-            f"payload: {json.dumps(pkg, ensure_ascii=False)}\nweb_console 回應: {text[:600]}{note}\n{FOLLOW_UP}")
+    # web_console 的回應只是把 payload 回顯一次，摘要成 status／count 即可（整段回傳要留在工具門檻內）
+    reply = f"status={data.get('status')}, count={data.get('count')}" if isinstance(data, dict) else text[:200]
+    return (f"{headline(pkg, f'已送出（HTTP {status}，web_console 已轉發到 {TOPIC}）')}\n{mapped}{describe(pkg, topo)}\n"
+            f"payload: {json.dumps(pkg, ensure_ascii=False)}\nweb_console 回應: {reply}{note}\n{FOLLOW_UP}")
 
 
 def ros2_pub_command(pkg):
@@ -558,7 +586,7 @@ def send_ros2(container, pkg, notes):
     if not ok:
         return err
     mapped = f"站點名稱對應：{'；'.join(notes)}\n" if notes else ""
-    return (f"[PASS] work package 已直接發布到 {TOPIC}（容器 {container}，未經 web_console）\n{mapped}{describe(pkg)}\n"
+    return (f"{headline(pkg, f'已直接發布到 {TOPIC}（容器 {container}，未經 web_console）')}\n{mapped}{describe(pkg)}\n"
             f"payload: {json.dumps(pkg, ensure_ascii=False)}\nros2 輸出: {(out or '').strip()[:300]}\n{FOLLOW_UP}")
 
 
@@ -827,7 +855,7 @@ def main(argv):
     if opts["dry_run"]:
         target = f"ros2（容器 {opts['ros2']}）：{ros2_pub_command(pkg)}" if opts["ros2"] else f"POST {base_url}{SEND_PATH}"
         mapped = f"站點名稱對應：{'；'.join(notes)}\n" if notes else ""
-        return f"[PASS] dry-run：以下內容尚未送出\n{mapped}{describe(pkg, topo)}\npayload: {json.dumps(pkg, ensure_ascii=False)}\n目標: {target}\n拿掉 --dry-run 即可真正送出。"
+        return f"{headline(pkg, 'dry-run（尚未送出）')}\n{mapped}{describe(pkg, topo)}\npayload: {json.dumps(pkg, ensure_ascii=False)}\n目標: {target}\n拿掉 --dry-run 即可真正送出。"
     if opts["ros2"]:
         return send_ros2(opts["ros2"], pkg, notes)
     return send_http(base_url, pkg, notes, topo)

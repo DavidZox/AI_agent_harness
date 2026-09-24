@@ -2,17 +2,18 @@ import os
 import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from _docker_common import ros2_exec, pass_or_empty
+from _docker_common import ros2_exec, pass_or_empty, resolve_container, with_target_marker
 
 # ROS2 探索（discovery）通常幾秒內完成；daemon 冷啟動時會慢一點
 TIMEOUT_SECONDS = 30
+USAGE = "用法: scripts/ROS2_topic_list_cmd.py [container_name]（省略＝目前的目標容器）"
 
 
 def run_ros2_topic_list(container_name):
     """在指定的 Docker 容器內執行 `ros2 topic list`（bash -ic + ROS2 環境 fallback）。"""
-    container_name = (container_name or "").strip()
-    if not container_name:
-        return "[ERROR] 請提供容器名稱。用法: scripts/ROS2_topic_list_cmd.py <container_name>"
+    container_name, err = resolve_container(container_name, USAGE)   # 省略＝目標容器
+    if err:
+        return err
 
     ok, out, err = ros2_exec(
         container_name, "ros2 topic list", TIMEOUT_SECONDS,
@@ -20,7 +21,7 @@ def run_ros2_topic_list(container_name):
     )
     if not ok:
         return err
-    return pass_or_empty(out, "目前沒有任何 topic 被發布")
+    return with_target_marker(pass_or_empty(out, "目前沒有任何 topic 被發布"), container_name)
 
 
 if __name__ == "__main__":

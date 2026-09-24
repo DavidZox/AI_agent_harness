@@ -25,6 +25,12 @@ class SkillAgent:
         # 預設工作目錄以程式所在位置為準，不寫死機器特定路徑
         self.current_cwd = self.script_dir
         self.container_cwd = ""
+        # 目標容器：容器相關技能預設操作的容器，預設空。跟工作目錄同一套機制——run_tool 以環境變數
+        # TARGET_CONTAINER 傳給腳本（省略容器名稱時用它），腳本成功操作某容器後在輸出末行印
+        # [TARGET_CONTAINER] <名稱>，_sync_state_from_tool_output 同步回來（比照 cd 的 [CWD_CHANGED]）。
+        # 所以它等於「最近一次成功操作的容器」；docker_open 用來刻意選定／切換。system prompt 的
+        # Current Agent State 讓模型直接用、不再問使用者要看哪個容器；Web Console 狀態列顯示。
+        self.target_container = ""
 
         self.messages = []
         self.max_history = max_history
@@ -708,7 +714,9 @@ class SkillAgent:
         memory_content = self.load_long_term_memory()
         history_summary = self.rolling_summary or "No history summary yet."
 
-        status_prompt = f"\n\n## Current Agent State\n- CURRENT_WORKING_DIRECTORY: {self.current_cwd}\nCURRENT_CONTAINER_DIRECTORY: {self.container_cwd}"
+        status_prompt = (f"\n\n## Current Agent State\n- CURRENT_WORKING_DIRECTORY: {self.current_cwd}\n"
+                         f"- CURRENT_CONTAINER_DIRECTORY: {self.container_cwd}\n"
+                         f"- CURRENT_TARGET_CONTAINER: {self.target_container or '（未設定：需要容器時先用 docker_containers 查、docker_open 選定）'}")
 
         return f"""
                 {profile}
@@ -929,6 +937,9 @@ class SkillAgent:
             # 抓取 [CONTAINER_CWD] 標記的下一行作為路徑
             if line.startswith("[CONTAINER_CWD]") and i + 1 < len(lines):
                 self.container_cwd = lines[i + 1].strip()
+            # 目標容器：容器技能成功操作某容器後印在末行（見 _docker_common.with_target_marker）
+            if line.startswith("[TARGET_CONTAINER]"):
+                self.target_container = line[len("[TARGET_CONTAINER]"):].strip()
 
     def run_tool(self, ai_response):
         """依 AI 回覆 JSON 的 action 欄位執行（ai_response 可以是原始 JSON 字串或 parse_reply 的結果）。
@@ -990,7 +1001,9 @@ class SkillAgent:
             # 將目前的容器路徑作為環境變數注入，讓 docker_run.py 讀取
             env = os.environ.copy()
             env["CONTAINER_CWD"] = self.container_cwd
-            cwd_before, container_before = self.current_cwd, self.container_cwd  # 軌跡記錄用：執行「前」的狀態
+            env["TARGET_CONTAINER"] = self.target_container  # 容器技能省略容器名稱時的預設（比照 cwd）
+            # 軌跡記錄用：執行「前」的狀態
+            cwd_before, container_before, target_before = self.current_cwd, self.container_cwd, self.target_container
 
             try:
                 res = subprocess.run(
@@ -1006,7 +1019,7 @@ class SkillAgent:
                     f"[ERROR] 工具 {script_name} 執行逾時（超過 {TOOL_EXEC_TIMEOUT} 秒），已被系統強制終止。"
                     f"這是 harness 的最後防線，各腳本自身應有更短的逾時；若經常觸發請檢查該腳本。"
                 )
-                self._record_trajectory(script_name, clean_args, output_text, cwd_before, container_before)
+                self._record_trajectory(script_name, clean_args, output_text, cwd_before, container_before, target_before)
                 return output_text
 
             if res.returncode == 0:
@@ -1019,7 +1032,7 @@ class SkillAgent:
                 if not output_text.startswith("[ERROR]"):
                     output_text = f"[ERROR] 腳本 {script_name} 異常結束（exit code {res.returncode}）:\n{output_text}"
             self._sync_state_from_tool_output(output_text)
-            self._record_trajectory(script_name, clean_args, output_text, cwd_before, container_before)
+            self._record_trajectory(script_name, clean_args, output_text, cwd_before, container_before, target_before)
             return output_text
 
         except Exception as e:
@@ -1055,7 +1068,7 @@ class SkillAgent:
             mapping.setdefault(s, skill)
         return mapping
 
-    def _record_trajectory(self, script_name, args, output_text, cwd, container_cwd):
+    def _record_trajectory(self, script_name, args, output_text, cwd, container_cwd, target_container=""):
         """run_tool 每執行一支腳本（成功、失敗、逾時都算；找不到腳本的猜測不算）記一筆。"""
         status = "ERROR" if output_text.lstrip().startswith("[ERROR]") else "PASS"
         self.trajectory_seq += 1
@@ -1069,6 +1082,7 @@ class SkillAgent:
             "command": self._format_execute(script_name, args),
             "cwd": cwd,
             "container_cwd": container_cwd,
+            "target_container": target_container,
             "status": status,
             "output_head": output_text[:TRAJECTORY_OUTPUT_HEAD],
             "task": (self.current_task or "")[:200],
@@ -1376,7 +1390,7 @@ class SkillAgent:
                 used.update(n for n in self._PLACEHOLDER_RE.findall(a) if n in examples)
             steps_out.append({
                 "step_id": r["id"], "skill": r.get("skill"), "script": r["script"], "purpose": step_purpose,
-                "args": args, "original_args": list(r["args"]), "cwd": r.get("cwd"), "container_cwd": r.get("container_cwd"),
+                "args": args, "original_args": list(r["args"]), "cwd": r.get("cwd"), "container_cwd": r.get("container_cwd"), "target_container": r.get("target_container"),
             })
         if not steps_out:
             warnings.append("模型把所有步驟都排除了，改為全部納入（可在修改意見指明要拿掉哪幾步）")
@@ -1387,7 +1401,7 @@ class SkillAgent:
                     "step_id": r["id"], "skill": r.get("skill"), "script": r["script"],
                     "purpose": f"執行 {r['skill']}" if r.get("skill") else f"執行 {r['script']}",
                     "args": list(r["args"]), "original_args": list(r["args"]),
-                    "cwd": r.get("cwd"), "container_cwd": r.get("container_cwd"),
+                    "cwd": r.get("cwd"), "container_cwd": r.get("container_cwd"), "target_container": r.get("target_container"),
                 })
         unused = [p["name"] for p in params if p["name"] not in used]
         if unused:
@@ -1576,6 +1590,7 @@ class SkillAgent:
         cwd = first.get("cwd") if first.get("cwd") and os.path.isdir(first["cwd"]) else self.current_cwd
         env = os.environ.copy()
         env["CONTAINER_CWD"] = first.get("container_cwd") or self.container_cwd
+        env["TARGET_CONTAINER"] = first.get("target_container") or self.target_container
         try:
             res = subprocess.run([sys.executable, script] + argv, capture_output=True, text=True,
                                  cwd=cwd, env=env, timeout=TOOL_EXEC_TIMEOUT)

@@ -2,7 +2,7 @@
 type: Tool
 title: 建立容器環境
 description: 以指定映像檔建立並啟動容器。
-version: 1.2.0
+version: 1.3.0
 dependencies: ["docker"]
 ---
 
@@ -17,7 +17,7 @@ dependencies: ["docker"]
 `EXECUTE: scripts/docker_est_cmd.py ros2_humble`
 
 # 回傳
-成功：`[PASS] 容器 '<name>' 已在背景啟動（ID: ...）`。失敗：`[ERROR] ... 失敗（exit code N）: 原因`。
+成功：`[PASS] 容器 '<name>' 已在背景啟動（ID: ...），並設為目前的目標容器`（末行 `[TARGET_CONTAINER] <name>`，之後容器技能可省略名稱）。失敗：`[ERROR] ... 失敗（exit code N）: 原因`。
 
 # 異常
 * 同名容器已存在：改用 `docker_open` 進入，勿重試建立。

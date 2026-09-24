@@ -173,6 +173,11 @@ Enter 才送出（避免誤點 /clear）；選技能等同 /skill <名稱>：規
 出現 📘 chip，下一則訊息送出時附在後面，AI 就能直接依規格裡的腳本路徑執行，省掉一輪
 「先載規格」。chip 可個別移除；slash 指令、計畫回應、工具決策不會消耗它。
 
+標題列的 cwd 是 AI 目前的工作目錄（change_dir 切換）；container 是目前的**目標容器**：預設空白，AI 成功操作某個
+容器後（docker_open 選定、docker_est 建立、或 docker_runcmd／ROS2_* 用了某個容器）自動帶入，之後容器技能可以
+省略容器名稱，AI 也不會再問你要看哪個容器；要換容器直接跟 AI 說（它會用 docker_open 切換，或直接用新名稱操作）。
+/clear 不會清掉它，跟 cwd 一樣。
+
 不切換 auto／hybrid 時，預設為「手動模式」：每次工具執行完都會等待你確認
 是否要把結果加入上下文，畫面下方會出現決策按鈕。
 
@@ -274,6 +279,7 @@ def build_stats():
         "current_plan": agent.current_plan or None,
         "current_cwd": agent.current_cwd,
         "container_cwd": agent.container_cwd,
+        "target_container": agent.target_container,
         "objective": agent.sticky_objective or None,
         "total_user_tokens": agent.total_user_tokens,
         "total_ai_tokens": agent.total_ai_tokens,
@@ -835,6 +841,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
   <div id="status">
     <span id="stat-mode">mode: manual</span>
     <span id="stat-cwd">cwd: -</span>
+    <span id="stat-container" title="目前的目標容器：預設空白；AI 成功操作某個容器後自動帶入，之後容器技能可省略名稱。要換容器直接跟 AI 說。">container: -</span>
     <span id="stat-tokens">tokens: -</span>
     <span id="stat-attach"></span>
   </div>
@@ -957,6 +964,7 @@ function updateStatus(stats) {
   document.getElementById('stat-mode').textContent =
     'mode: ' + stats.mode + (stats.parallel_cal ? ' · parallel_cal' : '');
   document.getElementById('stat-cwd').textContent = 'cwd: ' + stats.current_cwd;
+  document.getElementById('stat-container').textContent = 'container: ' + (stats.target_container || '-');
   const tokensEl = document.getElementById('stat-tokens');
   tokensEl.textContent =
     `tokens: user ${stats.total_user_tokens} / ai ${stats.total_ai_tokens} / tool ${stats.total_tool_tokens}` +

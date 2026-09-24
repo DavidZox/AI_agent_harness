@@ -8,7 +8,7 @@ make_skill 把一段使用者引導 Agent「做對了」的操作軌跡編譯成
 2. 依序以 python3 執行既有技能的腳本（與 harness 的 run_tool 相同：同一個 cwd、同一組環境變數），
    任一步輸出以 [ERROR] 開頭或非零結束即停止，不再執行後面的步驟。
 3. 步驟之間同步狀態：change_dir 類腳本印出的 [CWD_CHANGED] 會改變後續步驟的 cwd，
-   [CONTAINER_CWD] 會更新後續步驟的環境變數；這些標記行原樣保留在總輸出裡，harness 也會同步。
+   [CONTAINER_CWD]／[TARGET_CONTAINER] 會更新後續步驟的環境變數；這些標記行原樣保留在總輸出裡，harness 也會同步。
 4. 逾時：單步 STEP_TIMEOUT_SECONDS，全部合計 TOTAL_TIMEOUT_SECONDS（低於 harness 的 600 秒總逾時），
    各底層腳本自己更短的逾時仍然有效。
 5. 回傳沿用專案慣例：成功以 [PASS] 開頭並附各步驟輸出（中間步驟截短、最後一步保留較多），
@@ -67,6 +67,9 @@ def _sync_state(text, cwd, env):
         if line.startswith("[CONTAINER_CWD]") and i + 1 < len(lines):
             env = dict(env)
             env["CONTAINER_CWD"] = lines[i + 1].strip()
+        if line.startswith("[TARGET_CONTAINER]"):   # 前一步選定／操作的容器，後續省略容器名稱的步驟接著用
+            env = dict(env)
+            env["TARGET_CONTAINER"] = line[len("[TARGET_CONTAINER]"):].strip()
     return cwd, env
 
 

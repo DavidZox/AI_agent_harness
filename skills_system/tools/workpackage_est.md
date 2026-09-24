@@ -1,8 +1,8 @@
 ---
 type: Tool
 title: 工作包：發送／取消／查詢／語義地圖（任務協調器）
-description: 對 orchestrtor 發送多站點 work package、取消 work package、刪除 OverPending 任務、觀察執行狀態、讀語義地圖並對應目前機器人與工作包位置。
-version: 2.2.0
+description: 對 orchestrtor 發送多站點 work package（可設 N 輪或無限循環）、取消 work package、刪除 OverPending 任務、觀察執行狀態、讀語義地圖並對應目前機器人與工作包位置。
+version: 2.3.0
 dependencies: ["fih_rmf_system web_console (port 8020)", "或 ROS2 容器內的 ros2 CLI（--ros2 僅發送）"]
 ---
 
@@ -14,18 +14,20 @@ dependencies: ["fih_rmf_system web_console (port 8020)", "或 ROS2 容器內的 
 取消：`--cancel <task_id>`；`--cancel-overpending <任務id> [--wait 秒]`
 查詢：`--status [task_id] [--watch 秒]`；`--map [關鍵字或站點代號]`；`--stations`；`--robots`（各模式可加 `--url 位址`）
 * `task_id` 須唯一（重複的被忽略），`auto` 自動產生。站點寫代號（a3）或語意名稱（加工線通道-6）皆可，找不到或對應到多站會回 `[ERROR]` 列出候選。
-* 預設：`--amr` 空＝交給 distribute 挑；`--type regular`；`--level normal`；`--weight 0`＝自動算。`--loop` 接正整數＝輪數，不接＝循環到取消。
+* 預設：`--amr` 空＝交給 distribute 挑；`--type regular`；`--level normal`；`--weight 0`＝自動算。
+* **循環**：使用者說「無限循環／一直跑／持續循環／直到叫停」→ 加 `--loop`，後面**不接數字**（`--loop 0`、`--loop 無限`、`--forever` 也可）；「循環 N 次／N 輪」→ `--loop N`；沒提循環就不加 `--loop`（只跑一輪）。回傳第一行會寫出循環設定，請核對是否符合使用者要求。
 * **時間**：一幀快照只是瞬間。使用者提到「觀察一段時間／持續／變化／過程」時用 `--status --watch 秒`（最多 300），會整理站點推進、OverPending 進出、機器人狀態變化與事件。
 * **OverPending 會來回**：任務在 raw 等超過約 10 秒才進 OverPending，再約 10 秒又回流 raw；`--cancel-overpending` 只在它「此刻在逾時區」時刪得掉，不在時回報所在佇列並建議加 `--wait 30` 等它進來再刪。
 * `--map` 不帶參數列全部站點（代號｜語意名稱｜目前誰在此／前往／哪個工作包派工中）與機器人位置；帶關鍵字或代號時顯示該站／路段的完整說明與連接路段。
 
 # 範例
-`EXECUTE: scripts/workpackage_est_cmd.py WP001 home,加工線通道-6,a7 --amr tb1`
+`EXECUTE: scripts/workpackage_est_cmd.py WP001 home,加工線通道-6,a7 --amr tb1`（只跑一輪）
+`EXECUTE: scripts/workpackage_est_cmd.py 巡邏 home,a3,a7 --amr tb1 --loop`（無限循環，直到 --cancel）　`EXECUTE: scripts/workpackage_est_cmd.py 巡邏 home,a3,a7 --amr tb1 --loop 3`（跑 3 輪）
 `EXECUTE: scripts/workpackage_est_cmd.py --map 加工線通道`　`EXECUTE: scripts/workpackage_est_cmd.py --status --watch 20`
 `EXECUTE: scripts/workpackage_est_cmd.py --cancel-overpending "WP001::0::0::3" --wait 30`
 
 # 回傳
-成功 `[PASS]`：發送附站點對應、摘要、送出的 JSON、web_console 回應；取消附快照確認；`--status` 每個 work package 一行（狀態、第幾站含語意名稱、工作項、機器人或 ⏳ 等待、循環進度）加 distribute 佇列、機器人、事件；`--watch` 先列變化清單再附最後一幀。失敗 `[ERROR] 原因`。送出成功只代表 orchestrtor 收到。
+成功 `[PASS]`：發送第一行 `work package「id」已送出：N 站，循環：…，機器人：…`，附站點對應、參數、送出的 JSON；取消附快照確認；`--status` 每個 work package 一行（狀態、第幾站含語意名稱、工作項、機器人或 ⏳ 等待、循環進度）加 distribute 佇列、機器人、事件；`--watch` 先列變化清單再附最後一幀。失敗 `[ERROR] 原因`。送出成功只代表 orchestrtor 收到。
 
 # 異常
 * 無法連線／逾時：web_console 未啟動，回報使用者；發送可改 `--ros2 容器名稱`，勿原樣重試。HTTP 503：稍候重試一次。HTTP 422／參數錯誤：依訊息修正。

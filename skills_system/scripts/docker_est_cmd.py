@@ -2,7 +2,7 @@ import os
 import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from _docker_common import run_docker
+from _docker_common import run_docker, with_target_marker
 
 # docker run -d 對本機已有的映像檔幾秒就完成；若需從 registry 拉取會久一點，
 # 但仍需要上限，否則沒有網路時 Agent 會卡住。
@@ -23,7 +23,8 @@ def execute(image_name):
     if not ok:
         return err
     container_id = out.strip()[:12]
-    return f"[PASS] 容器 '{container_name}' 已在背景啟動（ID: {container_id}）。"
+    # 新建的容器順理成章成為目前的目標容器（比照 docker_open），之後容器技能可省略名稱
+    return with_target_marker(f"[PASS] 容器 '{container_name}' 已在背景啟動（ID: {container_id}），並設為目前的目標容器。", container_name)
 
 
 if __name__ == "__main__":

@@ -2,15 +2,16 @@ import os
 import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from _docker_common import ros2_exec, pass_or_empty
+from _docker_common import ros2_exec, pass_or_empty, resolve_container, with_target_marker
 
 TIMEOUT_SECONDS = 30
+USAGE = "用法: scripts/ROS2_node_list_cmd.py [container_name]（省略＝目前的目標容器）"
 
 
 def run_node_list(container):
-    container = (container or "").strip()
-    if not container:
-        return "[ERROR] 請提供容器名稱。用法: scripts/ROS2_node_list_cmd.py <container_name>"
+    container, err = resolve_container(container, USAGE)   # 省略＝目標容器
+    if err:
+        return err
 
     ok, out, err = ros2_exec(
         container, "ros2 node list", TIMEOUT_SECONDS,
@@ -18,7 +19,7 @@ def run_node_list(container):
     )
     if not ok:
         return err
-    return pass_or_empty(out, "目前沒有任何 node 在運行")
+    return with_target_marker(pass_or_empty(out, "目前沒有任何 node 在運行"), container)
 
 
 if __name__ == "__main__":
