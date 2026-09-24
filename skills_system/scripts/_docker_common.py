@@ -38,10 +38,22 @@ KILL_AFTER_SECONDS = 2    # 容器內 timeout 送出 TERM 後多久補 KILL
 
 # ROS2 環境載入 fallback：有些容器的 .bashrc 不會 source ROS 的 setup.bash，
 # 導致 `bash -ic` 找不到 ros2；若 ROS_DISTRO 有設且 setup.bash 存在就補 source。
+# 三段式：(1) shell 沒有 ros2 就 source /opt/ros/<distro>；(2) 靜默 source 第一個找到的 colcon workspace overlay
+# （自訂訊息型別如 fih_rmf_msgs 才 echo 得出來；輸出丟掉，避免 overlay 的 hook 印 banner 污染工具結果）；
+# (3) shell 沒有 ROS_DOMAIN_ID 時，從容器內「正在跑的 ROS 節點」的 /proc/<pid>/environ 複製 ROS_DOMAIN_ID／RMW／
+# CycloneDDS／discovery 相關變數——診斷工具要看到的是節點所在的那個 domain，不是 shell 預設的 0。
+# 實測 fih_rmf_system 容器：節點以 ROS_DOMAIN_ID=98 啟動，但 bash -ic 既沒有 ros2 也沒有 domain，
+# 只 source /opt/ros 會讓 ros2 topic list 空白、echo 回 "does not appear to be published yet"。
 ROS2_ENV_FALLBACK = (
     'command -v ros2 >/dev/null 2>&1 || '
     '{ [ -n "$ROS_DISTRO" ] && [ -f "/opt/ros/$ROS_DISTRO/setup.bash" ] '
     '&& source "/opt/ros/$ROS_DISTRO/setup.bash"; }; '
+    'for _ws in /workspaces/*/install/setup.bash "$HOME"/*_ws/install/setup.bash /root/*_ws/install/setup.bash /opt/*_ws/install/setup.bash; do '
+    '[ -f "$_ws" ] && { source "$_ws" >/dev/null 2>&1; break; }; done; '
+    'if [ -z "$ROS_DOMAIN_ID" ]; then for _e in /proc/[0-9]*/environ; do '
+    'if tr "\\0" "\\n" < "$_e" 2>/dev/null | grep -q "^ROS_DOMAIN_ID="; then '
+    'while IFS= read -r _kv; do export "$_kv"; done < <(tr "\\0" "\\n" < "$_e" 2>/dev/null | grep -E "^(ROS_DOMAIN_ID|RMW_IMPLEMENTATION|CYCLONEDDS_URI|ROS_AUTOMATIC_DISCOVERY_RANGE|ROS_LOCALHOST_ONLY|ROS_STATIC_PEERS)="); '
+    'break; fi; done; fi; '
 )
 
 

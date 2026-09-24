@@ -17,6 +17,7 @@ RMF_WEB_CONSOLE_URL 或技能的 --url 指到這裡。
 import base64
 import hashlib
 import json
+import socket
 import struct
 import sys
 import threading
@@ -27,9 +28,28 @@ from urllib.parse import unquote, urlparse, parse_qs
 LOCK = threading.Lock()
 RECEIVED = []            # 收到的 work package（dict），依序
 CANCELLED = set()        # 被 DELETE 的 package_id
-OVERPENDING = [{"id": "OVP-DEMO::0::0::1", "wait": 12.3}]   # 預放一筆可刪的 OverPending 任務
+OVERPENDING = [{"id": "OVP-DEMO::0::0::1", "wait": 12.3}]   # 預放一筆一直待在 OverPending 的任務（可刪）
+# 模擬 distribute 的逾時區來回：這筆任務每 8 秒一輪，前 4 秒在 raw、後 4 秒在 OverPending，刪掉後消失
+CYCLE_TASK = "CYCLE-DEMO::0::0::9"
+CYCLE_PERIOD = 8.0
+REMOVED = set()
+START = time.time()
 ROBOTS = ["tb1", "tb2", "tb3", "tb4", "tb5"]
-STATIONS = ["home", "a0", "a3", "a4", "a6", "a7", "a8"]
+# 拓譜圖節點（與真的 /api/topology 同欄位）：部分有語意名稱／說明（semantics.yaml）
+NODES = [
+    {"id": 0, "name": "home", "label": "充電待命區", "description": "【拓譜代號 home】機器人待命與充電位置。", "has_semantic": True, "x": 0.0, "y": 0.0},
+    {"id": 1, "name": "a0", "label": "加工線通道-6", "description": "【拓譜代號 a0／角色：轉角銜接點】監視器 CAM-N00 判讀地面有少量切屑。", "has_semantic": True, "x": 2.0, "y": 0.0},
+    {"id": 2, "name": "a3", "label": "組裝線區-1", "description": "【拓譜代號 a3】組裝線第一個取料點。", "has_semantic": True, "x": 4.0, "y": 0.0},
+    {"id": 3, "name": "a4", "label": "a4", "description": "", "has_semantic": False, "x": 6.0, "y": 0.0},
+    {"id": 4, "name": "a6", "label": "a6", "description": "", "has_semantic": False, "x": 6.0, "y": 2.0},
+    {"id": 5, "name": "a7", "label": "組裝線區-2", "description": "【拓譜代號 a7】卸料點，旁有輸送帶。", "has_semantic": True, "x": 4.0, "y": 2.0},
+    {"id": 6, "name": "a8", "label": "a8", "description": "", "has_semantic": False, "x": 2.0, "y": 2.0},
+]
+EDGES = [
+    {"id": 34, "start_id": 1, "end_id": 2, "label": "加工線通道：a0↔a3", "description": "【路段 a0→a3】主要雙向通道。", "has_semantic": True, "points": [[2, 0], [4, 0]]},
+    {"id": 35, "start_id": 2, "end_id": 5, "label": "", "description": "", "has_semantic": False, "points": [[4, 0], [4, 2]]},
+]
+STATIONS = [n["name"] for n in NODES]
 STEP = [0]
 WS_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
 
@@ -67,15 +87,26 @@ def snapshot():
                 "items_done": 0, "items_total": 1, "updated_at": time.time(),
             })
         ovp = list(OVERPENDING)
+        raw = []
+        if CYCLE_TASK not in REMOVED:
+            phase = (time.time() - START) % CYCLE_PERIOD
+            if phase < CYCLE_PERIOD / 2:
+                raw.append({"id": CYCLE_TASK, "age": round(phase, 1)})
+            else:
+                ovp.append({"id": CYCLE_TASK, "wait": round(phase - CYCLE_PERIOD / 2, 1)})
     processing = [{"id": p["current_item"]["item_id"], "type": "regular", "robot": p["current_item"]["robot_id"],
                    "station": p["current_item"]["station"]} for p in packages if p["current_item"]["robot_id"]]
     return {
         "step_counter": STEP[0], "state": "IDLE",
         "events": [f"[{time.strftime('%H:%M:%S')}] mock distribute 運作中"],
-        "buffer_tasks": [], "raw_tasks": [], "overpending_tasks": ovp, "processing_tasks": processing,
+        "buffer_tasks": [], "raw_tasks": raw, "overpending_tasks": ovp, "processing_tasks": processing,
         "robots": {rid: {"state": "duty" if any(p["robot"] == rid for p in processing) else "standby", "real_state": "IDLE",
                          "last_task_id": next((p["id"] for p in processing if p["robot"] == rid), "None"),
-                         "status": "ONLINE" if rid in ("tb1", "tb2") else "OFFLINE", "delay": 0.3} for rid in ROBOTS},
+                         "status": "ONLINE" if rid in ("tb1", "tb2") else "OFFLINE", "delay": 0.3,
+                         # tb1 停在 a3 旁、正前往 a7；tb2 在 home；其他離線無座標
+                         "x": {"tb1": 4.2, "tb2": 0.1}.get(rid), "y": {"tb1": 0.1, "tb2": -0.2}.get(rid), "theta": 0.0,
+                         "current_edge": "a3->a7" if rid == "tb1" else None,
+                         "target_id": "a7" if rid == "tb1" else ("home" if rid == "tb2" else None)} for rid in ROBOTS},
         "params": {},
         "orchestrtor": {"step_counter": STEP[0], "events": [f"[{time.strftime('%H:%M:%S')}] mock orchestrtor 運作中"] +
                         [f"📦 收到 work package {p['package_id']}" for p in packages[-3:]], "packages": packages},
@@ -95,20 +126,29 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def _websocket(self):
-        """最小 WebSocket 伺服端：握手 → 推一幀快照 → close。"""
+        """最小 WebSocket 伺服端：握手後比照真的 web_console 每 0.5 秒推一幀快照，直到客戶端關閉（最多 120 秒）。"""
         key = self.headers.get("Sec-WebSocket-Key", "")
         accept = base64.b64encode(hashlib.sha1((key + WS_GUID).encode()).digest()).decode()
         self.wfile.write(("HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n"
                           f"Sec-WebSocket-Accept: {accept}\r\n\r\n").encode())
-        payload = json.dumps(snapshot(), ensure_ascii=False).encode("utf-8")
-        n = len(payload)
-        header = b"\x81" + (bytes([n]) if n < 126 else (b"\x7e" + struct.pack("!H", n) if n < 65536 else b"\x7f" + struct.pack("!Q", n)))
-        self.wfile.write(header + payload)
-        self.wfile.flush()
-        time.sleep(0.2)
+        self.connection.settimeout(0.05)
+        deadline = time.time() + 120
         try:
-            self.wfile.write(b"\x88\x00")
-        except OSError:
+            while time.time() < deadline:
+                payload = json.dumps(snapshot(), ensure_ascii=False).encode("utf-8")
+                n = len(payload)
+                header = b"\x81" + (bytes([n]) if n < 126 else (b"\x7e" + struct.pack("!H", n) if n < 65536 else b"\x7f" + struct.pack("!Q", n)))
+                self.wfile.write(header + payload)
+                self.wfile.flush()
+                # 客戶端送 close 幀（0x88）或斷線就結束；沒資料則繼續推
+                try:
+                    data = self.connection.recv(64)
+                    if not data or (data and data[0] & 0x0F == 8):
+                        break
+                except socket.timeout:
+                    pass
+                time.sleep(0.5)
+        except (BrokenPipeError, ConnectionResetError, OSError):
             pass
         self.close_connection = True
 
@@ -120,6 +160,8 @@ class Handler(BaseHTTPRequestHandler):
             return self._json({"robots": ROBOTS})
         if path == "/api/stations":
             return self._json({"stations": [{"id": s, "label": s} for s in STATIONS]})
+        if path == "/api/topology":
+            return self._json({"nodes": NODES, "edges": EDGES, "image": None})
         if path == "/api/received":
             with LOCK:
                 return self._json({"received": RECEIVED, "cancelled": sorted(CANCELLED), "overpending": OVERPENDING})
@@ -137,6 +179,10 @@ class Handler(BaseHTTPRequestHandler):
             tid = unquote(path[len("/api/overpending_tasks/"):])
             with LOCK:
                 OVERPENDING[:] = [t for t in OVERPENDING if t["id"] != tid]
+                if tid == CYCLE_TASK:
+                    phase = (time.time() - START) % CYCLE_PERIOD
+                    if phase >= CYCLE_PERIOD / 2:      # 只有此刻真的在 OverPending 才刪得掉（比照 distribute）
+                        REMOVED.add(tid)
             print(f"🗑️ 要求刪除 OverPending 任務: {tid}", flush=True)
             return self._json({"status": "success", "task_id": tid})
         self._json({"detail": "Not Found"}, 404)

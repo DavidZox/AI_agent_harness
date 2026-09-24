@@ -48,6 +48,7 @@ from Agent_Runner import (
     MIN_COMPRESS_TOKENS,
     PARALLEL_CAL_DEFAULT,
     is_skill_doc_result,
+    is_exempt_result,
 )
 
 # 📷 多模態影像：附圖走 vision library 的獨立視覺 sub-session（見 _run_vision_subsession），
@@ -478,7 +479,7 @@ def run_turn(events):
             tool_tokens = agent.count_tokens(result)
             agent.total_tool_tokens += tool_tokens
             # 規格文件載入不受門檻限制（_content_for_context 會完整放行），不標 ⚠️
-            oversized = tool_tokens > TOOL_RESULT_TOKEN_THRESHOLD and not is_skill_doc_result(result)
+            oversized = tool_tokens > TOOL_RESULT_TOKEN_THRESHOLD and not is_exempt_result(result, tool_tokens)
             events.append({
                 "channel": "tool",
                 "text": result,

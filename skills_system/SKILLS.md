@@ -24,12 +24,12 @@
 
 ## ROS2套件
 - [ROS2_topic_list](tools/ROS2_topic_list.md) — 在容器內使用查詢 topic 列表
-- [ROS2_topic_echo](tools/ROS2_topic_echo.md) — 指定 topic 名稱進行 echo 命令，獲得 topic 詳細資訊
+- [ROS2_topic_echo](tools/ROS2_topic_echo.md) — 讀取指定 topic 的一筆訊息，或 --duration 擷取一段時間整理欄位變化與頻率
 - [ROS2_node_list](tools/ROS2_node_list.md) — 在容器內使用查詢 node 列表
 - [ROS2_node_info](tools/ROS2_node_info.md) — 指定 node 名稱進行 info 命令，獲得 node 詳細資訊
 
 ## 調度系統
-- [workpackage_est](tools/workpackage_est.md) — 對任務協調器 orchestrtor 發送多站點 work package（機器人、類型、等級、權重、循環）、取消 work package、刪除 OverPending 任務、查詢執行狀態與場域站點／機隊
+- [workpackage_est](tools/workpackage_est.md) — 對任務協調器 orchestrtor 發送多站點 work package（站點可用語意名稱）、取消、刪除 OverPending 任務、觀察執行狀態一段時間、讀語義地圖對應目前機器人與工作包位置
 
 ## 記憶修改
 - [modify_memory](tools/modify_memory.md) — 寫入經驗記憶：預設全域常駐；加 `--skill <技能名稱>` 綁定該技能，只在載入其規格時出現

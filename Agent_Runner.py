@@ -2033,6 +2033,23 @@ def is_skill_doc_result(result):
     """result 是否為 run_tool 載入規格文件的回傳（而非腳本執行結果）。"""
     return bool(result) and result.lstrip().startswith(SKILL_DOC_PREFIX)
 
+
+# 腳本輸出以 "[PASS][digest]" 開頭代表「這已經是為模型整理過的分析摘要」（例如觀察一段時間的變化清單、
+# 語義地圖對應、topic 一段時間的欄位統計）。這類輸出的價值就在內容本身，套用一般工具回傳的 500 tokens
+# 門檻換成「指令已成功執行」會讓模型拿不到分析依據；因此放寬到 DIGEST_TOKEN_THRESHOLD 才精簡。
+# 腳本仍有責任把摘要控制在這個範圍內（超過就跟一般輸出一樣被精簡）。
+DIGEST_MARKER = "[PASS][digest]"
+DIGEST_TOKEN_THRESHOLD = 1500
+
+
+def is_digest_result(result):
+    return bool(result) and result.lstrip().startswith(DIGEST_MARKER)
+
+
+def is_exempt_result(result, tool_tokens):
+    """規格文件一律放行；digest 在放寬門檻內放行。CLI／Web 的 ⚠️ 標記與 _content_for_context 共用這個判斷。"""
+    return is_skill_doc_result(result) or (is_digest_result(result) and tool_tokens <= DIGEST_TOKEN_THRESHOLD)
+
 # 單一工具腳本的總逾時（秒）：harness 的最後防線。各腳本自身應設定更短的逾時
 # （容器類腳本可調的上限 570 秒就是為了低於這個值），這裡只處理腳本本身卡死
 # （例如程序內無法中斷的重運算、讀取無回應的裝置）的情況，避免整個 Agent
@@ -2050,7 +2067,7 @@ def _content_for_context(result, tool_tokens, agent=None, use_summary=False):
       還有內容重點。此為可選功能，摘要 session 若失敗會自動退回成功/失敗
       判定，不會讓主 session 的推理流程中斷。
     """
-    if tool_tokens <= TOOL_RESULT_TOKEN_THRESHOLD or is_skill_doc_result(result):
+    if tool_tokens <= TOOL_RESULT_TOKEN_THRESHOLD or is_exempt_result(result, tool_tokens):
         return result
 
     if use_summary and agent is not None:
@@ -2327,7 +2344,7 @@ def main():
                     agent.total_tool_tokens += tool_tokens
                     print(f"\n🚀 系統回傳:\n{'-'*30}\n{result}\n{'-'*30}")
                     print(f"🧰 Tool Tokens: {tool_tokens}")
-                    if tool_tokens > TOOL_RESULT_TOKEN_THRESHOLD and not is_skill_doc_result(result):
+                    if tool_tokens > TOOL_RESULT_TOKEN_THRESHOLD and not is_exempt_result(result, tool_tokens):
                         print(f"⚠️ 此工具回傳約 {tool_tokens} tokens，超過門檻 {TOOL_RESULT_TOKEN_THRESHOLD}，"
                               f"加入上下文時將改用精簡摘要。")
                 else:
