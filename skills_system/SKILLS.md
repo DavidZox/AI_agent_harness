@@ -31,7 +31,11 @@
 - [ROS2_node_info](tools/ROS2_node_info.md) — 指定 node 名稱進行 info 命令，獲得 node 詳細資訊
 
 ## 調度系統
-- [workpackage_est](tools/workpackage_est.md) — 對任務協調器 orchestrtor 發送多站點 work package（站點可用語意名稱；可設 N 輪或無限循環）、取消、刪除 OverPending 任務、觀察執行狀態一段時間、讀語義地圖對應目前機器人與工作包位置
+- [workpackage_send](tools/workpackage_send.md) — 對任務協調器 orchestrtor 發送多站點 work package（站點可用語意名稱；可設 N 輪或無限循環）
+- [workpackage_status](tools/workpackage_status.md) — 查 work package 執行狀態：一幀快照，或 --watch 觀察一段時間並整理變化
+- [workpackage_cancel](tools/workpackage_cancel.md) — 取消（刪除）一個 work package，orchestrtor 停止派下一站
+- [overpending_cancel](tools/overpending_cancel.md) — 刪除卡在 distribute OverPending 逾時區的單站任務；不在逾時區時可等它進來再刪
+- [semantic_map](tools/semantic_map.md) — 語義地圖：站點代號／語意名稱／說明／路段，對應目前機器人與工作包位置；也可只列站點或機器人
 
 ## 記憶修改
 - [modify_memory](tools/modify_memory.md) — 寫入經驗記憶：預設全域常駐；加 `--skill <技能名稱>` 綁定該技能，只在載入其規格時出現

@@ -1958,7 +1958,7 @@ TRAJECTORY_OUTPUT_HEAD = 300          # 每筆軌跡保留的輸出開頭字元�
 DEFAULT_SKILL_CATEGORY = "自建技能"   # 模型選的分類不在 SKILLS.md 裡時的落點（沒有這個段落會自動建立）
 SKILL_NAME_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_]{1,40}$")
 # 會改變狀態（建容器、送工單、寫記憶、切換目錄／容器）的技能：組合技能含這些步驟時，預覽會提醒「重播驗證會真的執行」
-NON_READONLY_SKILLS = {"docker_est", "workpackage_est", "modify_memory", "change_dir", "docker_open"}
+NON_READONLY_SKILLS = {"docker_est", "workpackage_send", "workpackage_cancel", "overpending_cancel", "modify_memory", "change_dir", "docker_open"}
 
 # 技能草稿的 JSON schema（Ollama format=）：欄位意義見 SkillAgent._make_skill_prompts，驗證見 _normalize_skill_draft。
 MAKE_SKILL_SCHEMA = {

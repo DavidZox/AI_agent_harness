@@ -1,6 +1,6 @@
 """fih_rmf_system web_console 的離線替身（純標準庫，不需 FastAPI／uvicorn／ROS2）。
 
-模擬 workpackage_est 會用到的全部端點，讓技能可以在沒有機器人系統的機器上測試：
+模擬工作包技能群（workpackage_send／status／cancel、overpending_cancel、semantic_map）會用到的全部端點，讓技能可以在沒有機器人系統的機器上測試：
   POST   /api/send_tasks              body 為 TaskRequest 陣列 → {"status","count","details":[每筆的 JSON 字串]}
                                       （details 比照 FastAPIBridgeNode.publish_as_string 發布到 incoming_work_packages 的 JSON）
   DELETE /api/work_packages/{id}      → {"status": "success", "package_id": id}（之後快照中該 package 消失）
