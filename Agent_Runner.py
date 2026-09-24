@@ -919,10 +919,7 @@ class SkillAgent:
         return raw_token
 
     def _parse_script_args(self, script_name, remainder):
-        """依腳本類型解析參數字串。manage_skill 的參數含 `|` 分隔符，需保留原始字串；
-        其餘技能才用 shlex 依空白／引號拆分成參數列表。"""
-        if "manage_skill" in script_name:
-            return [remainder.strip()] if remainder else []
+        """把 action.args 字串以 shlex 依空白／引號拆成參數列表（含空白的參數用雙引號包住）。"""
         try:
             return shlex.split(remainder)
         except Exception:

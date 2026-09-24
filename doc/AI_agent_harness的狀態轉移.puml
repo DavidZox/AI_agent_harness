@@ -1,0 +1,120 @@
+@startuml
+' --- 樣式精準控制 ---
+skinparam RectangleWidthMax 350
+skinparam ranksep 50
+skinparam nodesep 60
+skinparam shadowing false
+skinparam defaultFontName "Microsoft JhengHei"
+
+title AI_agent_harness 一回合的狀態機：從使用者訊息到回合結束
+
+rectangle State1 #D1E5F0 [
+  **1. Input（收到使用者訊息）**
+  * slash 指令（/auto、/plan on、/skill…）
+    由 harness 直接處理，不進模型。
+  * 有附圖：先由獨立視覺 session 產生文字，
+    以 [vision result] 附在訊息後。
+  * /plan on 時改走規劃流程（右側）。
+]
+
+rectangle State2 #F5F5F5 [
+  **2. Prompt（組 system prompt、硬水位檢查）**
+  * AGENT.md + SKILLS.md + Memory.md
+    + 最新滾動摘要 + Current Agent State。
+  * 上下文超過硬水位（NUM_CTX×75%）
+    → 先同步壓縮再呼叫模型。
+]
+
+rectangle State3 #FFE6CC [
+  **3. Reply（模型回 JSON）**
+  * {thought, reply, action}，Ollama format= 強制。
+  * 非合法 JSON → 顯示原文、本輪不執行。
+  * 空白回覆（reply 空、action null）
+    → 帶暫時提醒自動重試一次。
+]
+
+rectangle State4 #FFF2CC [
+  **4. Dispatch（只看 action）**
+  * null → 回合結束（→ 7）。
+  * 技能名稱（tools/<name>.md 存在）
+    → 注入規格 + 經驗記憶，不執行 → 回 3。
+  * 腳本路徑 → 執行（→ 5）；找不到腳本
+    → [ERROR] 提示先載規格 → 回 3。
+]
+
+rectangle State5 #D5E8D4 [
+  **5. Execute（subprocess 執行腳本）**
+  * cwd＝工作目錄、env TARGET_CONTAINER＝目標容器。
+  * 腳本自帶逾時；harness 600 秒最後防線。
+  * 非零 exit code 補 [ERROR]、沒輸出給明確訊息。
+]
+
+rectangle State6 #FFD580 [
+  **6. Result（處理工具回傳）**
+  * 同步狀態標記 [CWD_CHANGED]／[TARGET_CONTAINER]，
+    記一筆操作軌跡（logs/trajectory.jsonl）。
+  * 超過 500 tokens 精簡成成功／失敗
+    （[PASS][digest] 放寬到 1500；
+    /summarize on 改由獨立 session 摘要）。
+  * manual：等使用者 y／n；hybrid：詢問後都續推；
+    auto：直接帶入下一輪（Web 最多 25 輪）。
+]
+
+rectangle State7 #E1D5E7 [
+  **7. End of turn（回合結束）**
+  * 顯示最終 reply。
+  * 上下文超過軟水位（NUM_CTX×60%）且可壓內容夠多
+    → 舊訊息與上一份摘要融合成新摘要、歸檔 logs/
+    （/parallel_cal on 時在背景執行緒）。
+  * 下一個新任務送出時自動清除已核准的計畫。
+]
+
+rectangle StatePlan #F8CECC [
+  **Plan 模式（/plan on 後的下一個新任務）**
+  * 模型只產出步驟清單，harness 不呼叫 run_tool。
+  * y 核准 → 計畫注入 system prompt、自動退出
+    Plan 模式、軌跡記起點 → 進入 2 執行。
+  * n 取消／其他文字＝修改意見重新規劃。
+]
+
+rectangle StateSkill #ECECEC [
+  **/make_skill（回合之外）**
+  * 取上一個起點之後的成功步驟與失敗嘗試，
+    模型只填 JSON（參數化、目的、注意事項）。
+  * harness 驗證、依範本產生規格／組合腳本／索引行，
+    使用者核准（可先重播驗證）才註冊。
+]
+
+' --- 邏輯流向 ---
+State1 -down-> State2
+State2 -down-> State3
+State3 -down-> State4
+State4 -[#CC6600,bold]down-> State5 : **腳本路徑**
+State4 -[#3366CC]right-> State3 : 技能名稱：規格已注入\n（不執行）
+State5 -down-> State6
+State6 -[#009933,bold]up-> State3 : 結果加入上下文\n（auto／y／hybrid）
+State4 -[#CC0000,bold]left-> State7 : **action null**
+State6 -[#CC0000]left-> State7 : manual 的 n／stop
+State1 -right-> StatePlan : /plan on
+StatePlan -[#009933,bold]down-> State2 : **核准**
+State7 -[#999999]down-> StateSkill : 做對之後 /make_skill
+
+note right of State4
+  **狀態轉移單一來源：**
+  只有 action 欄位驅動轉移；
+  reply／thought 裡的指令文字、
+  複述的規格、舉例都不算。
+  這一點靠程式碼保證，
+  不依賴模型自律。
+end note
+
+note left of State6
+  **狀態同步：**
+  change_dir 印 [CWD_CHANGED]、
+  容器技能印 [TARGET_CONTAINER]，
+  harness 讀到就更新，下一輪的
+  system prompt 與腳本 env 即生效；
+  /clear 不清這兩個狀態。
+end note
+
+@enduml

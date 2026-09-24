@@ -1,0 +1,100 @@
+@startuml
+' --- 樣式精準控制 ---
+skinparam RectangleWidthMax 350
+skinparam ranksep 60
+skinparam nodesep 70
+skinparam shadowing false
+skinparam defaultFontName "Microsoft JhengHei"
+
+title AI_agent_harness 核心邏輯架構：技能索引 + 按需載入規格 + 只執行既有腳本
+
+rectangle NodeUser #F5F5F5 [
+  **使用者介面**
+  * Agent_Runner.py：終端機 CLI。
+  * web_console.py：純標準庫網頁（NDJSON 串流），
+    標題列顯示 mode／cwd／container／tokens。
+  * slash 指令：/auto /hybrid /plan /make_skill
+    /skill /trajectory /compress /summarize…
+]
+
+rectangle NodeAgent #D1E5F0 [
+  **SkillAgent（Agent_Runner.py，唯一核心）**
+  * 組 system prompt：AGENT.md + SKILLS.md 索引
+    + Memory.md + 滾動摘要 + Current Agent State
+    （工作目錄、目標容器、Objective、已核准計畫）。
+  * 解析回覆 JSON，只看 action 決定要不要動。
+  * 雙水位線上下文壓縮、操作軌跡、/make_skill。
+]
+
+rectangle NodeLLM #FFE6CC [
+  **本地模型（Ollama gemma4:e4b）**
+  * 每輪固定回 JSON {thought, reply, action}
+    （Ollama format= JSON schema 強制）。
+  * 不寫程式：只能填技能名稱，
+    或規格文件標明的腳本路徑。
+]
+
+rectangle NodeSkills #D5E8D4 [
+  **skills_system/（技能系統）**
+  * SKILLS.md：名稱 + 一行描述，常駐提示詞。
+  * tools/<name>.md：OKF 規格，按需載入
+    （自動附上 memory/<name>.md 經驗記憶）。
+  * scripts/<name>_cmd.py：實際執行，
+    stdout 以 [PASS]／[ERROR] 開頭。
+]
+
+rectangle NodeWorld #FFF2CC [
+  **被操作的環境**
+  * 宿主機檔案系統（ls／grep／find／cat／cd）。
+  * Docker 容器與容器內 ROS2（_docker_common.py：
+    timeout 包住、補齊 ROS 環境與 ROS_DOMAIN_ID）。
+  * fih_rmf_system web_console :8020
+    （_rmf_common.py：HTTP／WebSocket／語義地圖）。
+]
+
+rectangle NodeMem #E1D5E7 [
+  **記憶與紀錄**
+  * Memory.md（全域常駐）／
+    skills_system/memory/<name>.md（綁技能）。
+  * logs/summary_*.md + .json（滾動摘要歸檔）、
+    logs/trajectory.jsonl（操作軌跡）。
+]
+
+NodeUser -down-> NodeAgent : 自然語言任務／slash 指令
+NodeAgent -right-> NodeLLM : system prompt + 對話歷史
+NodeLLM -left-> NodeAgent : {thought, reply, action}
+NodeAgent -down-> NodeSkills : action.command＝技能名稱\n→ 回規格文件（這輪不執行）
+NodeAgent -[#CC6600,bold]down-> NodeSkills : action.command＝腳本路徑\n→ subprocess 執行（cwd／TARGET_CONTAINER）
+NodeSkills -down-> NodeWorld : docker exec／HTTP／檔案操作
+NodeWorld -up-> NodeSkills : 原始輸出
+NodeSkills -[#009933,bold]up-> NodeAgent : [PASS]／[ERROR]／[PASS][digest]\n+ [CWD_CHANGED]／[TARGET_CONTAINER] 狀態標記
+NodeAgent -left-> NodeMem : 壓縮歸檔、軌跡、modify_memory 寫入
+NodeMem -right-> NodeAgent : 常駐記憶、最新一份摘要
+
+note right of NodeLLM
+  **兩階段按需載入（progressive disclosure）：**
+  系統沒有「技能名稱 → 腳本」對照表。
+  模型填技能名稱只會拿到規格書，
+  必須讀到規格裡的真實腳本路徑
+  才執行得了；reply 裡的任何指令
+  文字都不會被執行。
+end note
+
+note bottom of NodeWorld
+  **安全邊界：**
+  模型不產生程式碼、不直接下控制指令，
+  能做的只有既有腳本。Plan 模式的確認
+  關卡靠程式路徑保證（規劃階段不呼叫
+  run_tool）；會改變狀態的技能列在
+  NON_READONLY_SKILLS，重播前提醒。
+end note
+
+note left of NodeMem
+  **工具回傳門檻：**
+  單次超過 500 tokens 只給模型
+  成功／失敗判定；[PASS][digest]
+  的分析摘要放寬到 1500。
+  完整內容永遠顯示給使用者。
+end note
+
+@enduml
