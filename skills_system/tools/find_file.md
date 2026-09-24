@@ -1,8 +1,8 @@
 ---
 type: Tool
 title: 檔案名稱搜尋
-description: 只搜尋「檔案名稱」本身。
-version: 1.0.0
+description: 只搜尋「檔案名稱」本身；標頭算好找到幾個並附最新修改的檔案。
+version: 1.1.0
 dependencies: []
 ---
 
@@ -21,6 +21,9 @@ dependencies: []
 
 # 範例 (Examples)
 * 尋找 Modelfile：`EXECUTE: scripts/find_file_cmd.py "Modelfile" .`
+
+# 回傳
+`[PASS] 找到 N 個檔名含「關鍵字」的項目（搜尋 <path>）:`，第二行 `最新修改：路徑（時間）；其次：…`（結果 ≤300 個時），之後每行一個路徑。數量與最新由腳本算好，直接引用，不要自己數。找不到：`[PASS] 找不到…（0 個）`。
 
 # 異常處理 (Edge Cases)
 * 搜尋路徑為 `/` 時阻斷。

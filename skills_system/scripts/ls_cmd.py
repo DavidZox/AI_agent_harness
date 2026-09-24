@@ -1,67 +1,149 @@
-import sys
+"""list_dir：列出目錄清單（純 Python，不再包 ls）。
+
+數值交給腳本算、不交給模型數：標頭給「共 N 項（檔案／目錄各幾個）」，永遠附一行「最新修改」；--filter 只列名稱含關鍵字的
+項目並在標頭給數量；--newest N 依修改時間新→舊只列前 N 項。舊版的 ls 旗標（-la、-h）照樣接受但忽略。
+每行：權限、大小（bytes）、修改時間、名稱（目錄加 /、連結加 @）。逾時 5 秒（掛載裝置無回應時）。
+"""
 import os
-import subprocess
 import shlex
+import signal
+import stat
+import sys
+import time
 
-TIMEOUT_SECONDS = 5  # 列目錄很快；超過代表目錄過大或掛載裝置無回應
+TIMEOUT_SECONDS = 5
+DEFAULT_NEWEST = 5
+NEWEST_MENTION = 3       # 「最新修改」行最多提到幾個
+USAGE = ("用法: scripts/ls_cmd.py [path] [--filter 關鍵字] [--newest [N]]\n"
+         "  path 預設目前工作目錄；--filter 只列名稱含關鍵字的項目（不分大小寫）並在標頭計數；"
+         f"--newest 依修改時間新→舊只列前 N 項（預設 {DEFAULT_NEWEST}）。")
 
-def execute(args_str):
-    # 預設的基礎指令組合
-    base_cmd = ["ls", "-laF"]
-    clean_args = []
 
-    # --- AI Generated Code / CLI Executor ---
+def parse_args(argv):
+    """回傳 (path, keyword, newest, error)。argv 可以是 list 或整串字串。"""
+    if isinstance(argv, str):
+        argv = shlex.split(argv)
+    path, keyword, newest = ".", None, None
+    args = list(argv)
+    i = 0
+    while i < len(args):
+        a = args[i]
+        if a == "--filter":
+            if i + 1 >= len(args):
+                return None, None, None, f"[ERROR] --filter 後面需要關鍵字。\n{USAGE}"
+            keyword = args[i + 1]
+            i += 2
+            continue
+        if a == "--newest":
+            newest = DEFAULT_NEWEST
+            if i + 1 < len(args) and args[i + 1].isdigit():
+                newest = max(1, int(args[i + 1]))
+                i += 1
+            i += 1
+            continue
+        if a.startswith("--"):
+            return None, None, None, f"[ERROR] 不認識的選項 {a}。\n{USAGE}"
+        if a.startswith("-") and len(a) > 1:
+            i += 1          # 舊版 ls 旗標（-la、-h 等）：忽略
+            continue
+        path = a
+        i += 1
+    return path, keyword, newest, None
+
+
+def _fmt_time(ts):
+    return time.strftime("%Y-%m-%d %H:%M", time.localtime(ts))
+
+
+def scan(path):
+    entries = []
+    with os.scandir(path) as it:
+        for e in it:
+            try:
+                st = e.stat(follow_symlinks=False)
+            except OSError:
+                continue
+            entries.append({
+                "name": e.name, "is_dir": e.is_dir(follow_symlinks=False), "is_link": e.is_symlink(),
+                "size": st.st_size, "mtime": st.st_mtime, "mode": stat.filemode(st.st_mode),
+            })
+    return entries
+
+
+def _display_name(e):
+    return e["name"] + ("/" if e["is_dir"] else "@" if e["is_link"] else "")
+
+
+def newest_line(entries):
+    """「最新修改：A（時間）；其次：B（時間）、C（時間）」——以列出的項目為範圍，優先只算檔案，沒有檔案才算目錄。"""
+    files = [e for e in entries if not e["is_dir"]] or list(entries)
+    if not files:
+        return None
+    ranked = sorted(files, key=lambda e: e["mtime"], reverse=True)[:NEWEST_MENTION]
+    line = f"最新修改：{_display_name(ranked[0])}（{_fmt_time(ranked[0]['mtime'])}）"
+    if len(ranked) > 1:
+        line += "；其次：" + "、".join(f"{_display_name(e)}（{_fmt_time(e['mtime'])}）" for e in ranked[1:])
+    return line
+
+
+def render(path, entries, keyword=None, newest=None):
+    total = len(entries)
+    n_dirs = sum(1 for e in entries if e["is_dir"])
+    head = f"[PASS] 目錄列表 ({path})：共 {total} 項（{total - n_dirs} 個檔案、{n_dirs} 個目錄）"
+    shown = entries
+    if keyword:
+        kw = keyword.lower()
+        shown = [e for e in entries if kw in e["name"].lower()]
+        head += f"；名稱含「{keyword}」的 {len(shown)} 項"
+    if newest:
+        shown = sorted(shown, key=lambda e: e["mtime"], reverse=True)[:newest]
+        head += f"；依修改時間新→舊只列前 {len(shown)} 項"
+    else:
+        shown = sorted(shown, key=lambda e: e["name"].lower())
+    lines = [head]
+    if not shown:
+        lines.append("（沒有符合的項目）" if keyword else "（空目錄）")
+        return "\n".join(lines)
+    nl = newest_line(shown)
+    if nl:
+        lines.append(nl)
+    lines += [f"{e['mode']} {e['size']:>10} {_fmt_time(e['mtime'])} {_display_name(e)}" for e in shown]
+    return "\n".join(lines)
+
+
+def _timeout_handler(signum, frame):
+    raise TimeoutError
+
+
+def execute(argv):
+    path, keyword, newest, err = parse_args(argv)
+    if err:
+        return err
+    if not os.path.exists(path):
+        return f"[ERROR] 無法讀取目錄: {path} 不存在（目前工作目錄 {os.getcwd()}）"
+    if not os.path.isdir(path):
+        return f"[ERROR] 無法讀取目錄: {path} 不是目錄（看檔案內容請用 view_file）"
+    if hasattr(signal, "SIGALRM"):
+        signal.signal(signal.SIGALRM, _timeout_handler)
+        signal.alarm(TIMEOUT_SECONDS)
     try:
-        if args_str and args_str.strip():
-            # 使用 shlex.split 安全地拆分字串（例如 "-la /opt" 拆成 ['-la', '/opt']）
-            parsed_args = shlex.split(args_str)
+        entries = scan(path)
+    except TimeoutError:
+        return (f"[ERROR] 目錄列表逾時（超過 {TIMEOUT_SECONDS} 秒），目標目錄可能過大，"
+                f"或位於無回應的網路／掛載裝置上，請改指定較小的子目錄。")
+    except PermissionError:
+        return f"[ERROR] 無法讀取目錄: 沒有權限讀取 {path}"
+    except OSError as e:
+        return f"[ERROR] 無法讀取目錄: {e}"
+    finally:
+        if hasattr(signal, "SIGALRM"):
+            signal.alarm(0)
+    return render(path, entries, keyword, newest)
 
-            # 過濾掉已經內建的重複參數，避免變成 ls -laF -la
-            for arg in parsed_args:
-                if arg.startswith('-'):
-                    # 提取非重複的參數字元（例如如果輸入 -la，我們只補上不重複的，或直接跳過）
-                    # 這裡為了彈性，如果使用者輸入了 -h 等新參數則保留，若是 -la 或 -l 則忽略
-                    stripped = arg.lstrip('-')
-                    remaining = "".join([c for c in stripped if c not in "lafF"])
-                    if remaining:
-                        clean_args.append(f"-{remaining}")
-                else:
-                    clean_args.append(arg)
-            
-            # 組合最終指令
-            final_cmd = base_cmd + clean_args
-        else:
-            final_cmd = base_cmd
-
-        # 執行指令
-        result = subprocess.run(
-            final_cmd, 
-            stdout=subprocess.PIPE, 
-            stderr=subprocess.PIPE, 
-            text=True, 
-            timeout=TIMEOUT_SECONDS
-        )
-        
-        # 取得目前顯示的相對或絕對路徑名稱
-        display_path = clean_args[0] if (clean_args and not clean_args[0].startswith('-')) else "."
-        
-        if result.returncode == 0:
-            return f"[PASS] 目錄列表 ({display_path}):\n{result.stdout}"
-        else:
-            return f"[ERROR] 無法讀取目錄: {result.stderr.strip()}"
-            
-    except subprocess.TimeoutExpired:
-        return (f"[ERROR] 目錄列表逾時（超過 {TIMEOUT_SECONDS} 秒），"
-                f"目標目錄可能過大，或位於無回應的網路／掛載裝置上，請改指定較小的子目錄。")
-    except Exception as e:
-        return f"[ERROR] 執行異常: {str(e)}"
-    # -------------------------
 
 if __name__ == "__main__":
     try:
-        # 將 sys.argv[1:] 後面所有的參數重新用空白接起來處理
-        input_str = " ".join(sys.argv[1:]) if len(sys.argv) > 1 else ""
-        print(execute(input_str))
+        print(execute(sys.argv[1:]))
     except Exception as e:
-        print(f"Error: {e}", file=sys.stderr)
+        print(f"[ERROR] list_dir 未預期的例外: {e}", file=sys.stderr)
         sys.exit(1)

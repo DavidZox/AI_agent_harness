@@ -1,7 +1,34 @@
 import sys
 import os
+import stat
 import subprocess
 import shlex
+import time
+
+NEWEST_STAT_LIMIT = 300   # 結果超過這麼多個就不逐一 stat（避免拖慢），只給數量
+
+
+def newest_line(paths):
+    """「最新修改：A（時間）；其次：B、C」——只算一般檔案，數值由腳本算、模型照抄。"""
+    if len(paths) > NEWEST_STAT_LIMIT:
+        return None
+    stamped = []
+    for p in paths:
+        try:
+            st = os.stat(p)
+        except OSError:
+            continue
+        if stat.S_ISREG(st.st_mode):
+            stamped.append((st.st_mtime, p))
+    if not stamped:
+        return None
+    stamped.sort(reverse=True)
+    fmt = lambda t: time.strftime("%Y-%m-%d %H:%M", time.localtime(t))
+    line = f"最新修改：{stamped[0][1]}（{fmt(stamped[0][0])}）"
+    if len(stamped) > 1:
+        line += "；其次：" + "、".join(f"{p}（{fmt(t)}）" for t, p in stamped[1:3])
+    return line
+
 
 def execute(args_str):
     if not args_str or args_str.strip() == "":
@@ -56,9 +83,12 @@ def execute(args_str):
         if result.returncode == 0:
             output = result.stdout.strip()
             if output:
-                return f"[PASS] 找到符合的檔案路徑:\n{output}"
+                paths = output.splitlines()
+                head = f"[PASS] 找到 {len(paths)} 個檔名含「{search_pattern}」的項目（搜尋 {target_path}）:"
+                nl = newest_line(paths)
+                return "\n".join([head] + ([nl] if nl else []) + paths)
             else:
-                return f"[PASS] 找不到檔名包含 \"{search_pattern}\" 的檔案。"
+                return f"[PASS] 找不到檔名包含 \"{search_pattern}\" 的檔案（0 個，搜尋 {target_path}）。"
         else:
             return f"[ERROR] Find 執行錯誤: {result.stderr.strip()}"
             

@@ -107,6 +107,8 @@ Web Console 另有 `MAX_AUTO_ITERATIONS = 25`：Auto 模式連續執行工具超
 
 **工具回傳的任務導向摘要（預設開啟；`/summarize off` 或 `AGENT_TOOL_SUMMARY=0` 關閉）**：超過門檻的工具回傳一律由 `summarize_tool_result()` 開一個獨立、乾淨的一次性 session 處理，這是「原始上下文 + 當前問題」式的壓縮（context-aware compression），不是通用摘要。獨立 session 收到三樣東西：完整原始輸出（超過 `TOOL_SUMMARY_INPUT_MAX_CHARS` 時保留頭尾並標明省略）、**使用者的目標**（`_build_task_anchor_text()`：Objective、這一輪任務的原始敘述、已核准的計畫）、**這一步的目的**（`_last_assistant_step()`：決策模型剛才的 `thought`／`reply` 與執行的 `action`——在 agent 迴圈裡，比使用者的原話更精確的「當前問題」）。prompt 把它定位成資訊過濾器：只留與目標直接相關的事實，名稱與數值照抄、不推測、不給建議，並用 `not_covered` 明說原始輸出沒有涵蓋什麼。輸出以 `format=TOOL_SUMMARY_SCHEMA`（answer／facts／errors／not_covered）強制結構，排成「執行結果／回答／相關事實／錯誤／未涵蓋」加一段附註（告訴主模型它看不到原文、需要其他資訊就換參數重查），解析失敗退回模型原文，session 失敗退回成功／失敗判定。CLI 印出「🧠 獨立 session 任務導向摘要」、Web 以紫色 🧠 卡片顯示，兩者都是主對話實際收到的內容。**沒有腳本自帶的豁免**：`ROS2_topic_echo --duration` 等分析型技能改成回傳完整資訊（統計 + 全部原始訊息），什麼重要由知道任務的獨立 session 決定。代價是每次超過門檻多一次模型呼叫（同模型時與主對話序列執行）。
 
+**數值交給腳本算，摘要只做過濾**：實測 gemma4:e4b 對「哪個檔案最新」「幾個 topic 含 costmap」這類比較／計數題 0/5 答對，開 `think=True` 也只有 2/5 且一次 17 秒；26b 開推論才 3/3，但一次 35～60 秒。所以比較、計數、排序、門檻判斷全部放進腳本：`list_dir` 標頭給數量與「最新修改」、`--filter`／`--newest`；`find_file`／`search_text` 標頭給數量；`ROS2_topic_list`／`ROS2_node_list` 的 `--filter` 計數；`ROS2_topic_echo --where 欄位<值` 算出幾則符合、第一則符合的序號與值。摘要 prompt 規定腳本算好的數字直接照抄、不得重數或推翻；各規格文件要求模型遇到這類問題改用對應選項。摘要 session 維持 `think=False`。
+
 **訊息則數視窗停用**：`SkillAgent(max_history=None)` 是預設，上下文大小只由 token 門檻決定，舊內容一律摘要歸檔而不是無聲丟棄；`max_history` 只保留為可選保險絲。
 
 ### 2.6 三種執行模式
@@ -166,9 +168,9 @@ Web Console 另有 `MAX_AUTO_ITERATIONS = 25`：Auto 模式連續執行工具超
 
 | 技能 | 做什麼 | 腳本 | 重點 |
 | :--- | :--- | :--- | :--- |
-| `list_dir` | 列出目錄清單 | `ls_cmd.py` | |
-| `search_text` | 在檔案內容中 grep 關鍵字 | `grep_cmd.py` | `AGENT.md` 禁止對 `/` 遞迴搜尋，範圍限制在工作目錄或子目錄 |
-| `find_file` | 只搜尋檔名 | `find_file_cmd.py` | |
+| `list_dir` | 列出目錄清單 | `ls_cmd.py` | 純 Python 列表：標頭算好「共 N 項（檔案／目錄）」、永遠附「最新修改：A；其次：B、C」；`--filter 關鍵字` 計數、`--newest N` 依修改時間排序。舊 ls 旗標忽略 |
+| `search_text` | 在檔案內容中 grep 關鍵字 | `grep_cmd.py` | 標頭算好「共 N 筆命中，分布在 M 個檔案」；`AGENT.md` 禁止對 `/` 遞迴搜尋，範圍限制在工作目錄或子目錄 |
+| `find_file` | 只搜尋檔名 | `find_file_cmd.py` | 標頭算好「找到 N 個」＋「最新修改」一行（結果 ≤300 個時逐一 stat） |
 | `change_dir` | 切換工作目錄 | `cd_cmd.py` | 印 `[CWD_CHANGED]` 讓 harness 同步（2.4） |
 | `view_file` | 查看檔案內容 | `cat_cmd.py` | 技能規格不用它，`action.command` 填技能名稱即載入 |
 
@@ -181,8 +183,8 @@ Web Console 另有 `MAX_AUTO_ITERATIONS = 25`：Auto 模式連續執行工具超
 | `docker_est` | 以映像檔建容器並常駐（`tail -f /dev/null`） | `docker_est_cmd.py` | 新容器成為目標容器 |
 | `docker_open` | 選定目標容器並驗證連線 | `docker_open_cmd.py` | 部分名稱唯一符合即可，多個符合列候選；末行 `[TARGET_CONTAINER]` |
 | `docker_runcmd` | 容器內執行 shell 指令 | `docker_runcmd_cmd.py` | `[--timeout 秒]`（1～570）`[容器] "指令"`，容器可省略 |
-| `ROS2_topic_list` / `ROS2_node_list` | 列 topic／node | `ROS2_topic_list_cmd.py`、`ROS2_node_list_cmd.py` | `[容器]` 可省略 |
-| `ROS2_topic_echo` | 讀一筆訊息，或 `--duration 秒`（2～300）擷取一段時間 | `ROS2_topic_echo_cmd.py` | 一段時間模式回 `[PASS]`：則數、頻率、每個欄位的數值範圍／字串種類／固定不變清單（PyYAML 攤平，String 內的 JSON 也解開），後面附全部原始訊息（超過 12000 字保留頭尾並註明省略幾則）；幾乎必超過門檻，由獨立 session 依這一步的目的擷取 |
+| `ROS2_topic_list` / `ROS2_node_list` | 列 topic／node | `ROS2_topic_list_cmd.py`、`ROS2_node_list_cmd.py` | `[容器]` 可省略；標頭算好總數，`--filter 關鍵字`（可重複）只列符合的並給數量（`_docker_common.count_and_filter`） |
+| `ROS2_topic_echo` | 讀一筆訊息，或 `--duration 秒`（2～300）擷取一段時間 | `ROS2_topic_echo_cmd.py` | 一段時間模式回 `[PASS]`：則數、頻率、每個欄位的數值範圍／字串種類／固定不變清單（PyYAML 攤平，String 內的 JSON 也解開），後面附全部原始訊息（超過 12000 字保留頭尾並註明省略幾則）；`--where 欄位<值`（可重複）由腳本判斷「N 則中 K 則符合；第一則符合 #k（值）；前一則不符合（值）」；幾乎必超過門檻，由獨立 session 依這一步的目的擷取 |
 | `ROS2_node_info` | node 詳細資訊 | `ROS2_node_info_cmd.py` | `[容器] <node>`，node 以 `/` 開頭 |
 
 共通：在容器內以 coreutils `timeout` 包住指令，逾時真的終止容器內程序而不是只殺宿主機端的 `docker exec`；常見 docker／ros2 錯誤翻成可行動的說明；ROS2 指令用 `bash -ic` 並由 `ROS2_ENV_FALLBACK` 補齊環境——shell 沒有 `ros2` 就 source `/opt/ros/<distro>`，再靜默 source 第一個找到的 colcon overlay，shell 沒有 `ROS_DOMAIN_ID` 時從容器內正在跑的 ROS 節點的 `/proc/<pid>/environ` 複製 domain／RMW／CycloneDDS／discovery 變數（fih_rmf_system 的節點跑在 domain 98，不補齊會看到空的 topic 列表）。
@@ -306,7 +308,7 @@ python3 web_console.py
 8. **小模型對 `modify_memory --skill` 的判斷不可靠**：該綁技能還是寫全域常判斷錯；框架只把最糟的錯誤（自綁、綁不存在的技能）擋成可恢復的 `[ERROR]`。
 9. **`/make_skill` 的草稿品質受模型限制**：哪些值該參數化、索引描述是否讓之後的模型選得到，都是草擬模型的判斷；框架保證「錯不會傳下去」（對不上就退回原值、漏填照原值納入、預覽列出每項修正），最終靠使用者檢查。可用 `AGENT_SKILL_MODEL` 換較大的模型。
 10. **JSON 協議下的空白回覆**：模型在字串裡用英文雙引號時會發生，屬機率性；框架自動重試一次並在提示詞禁用英文雙引號，重試仍空白時如實顯示。
-11. **任務導向摘要受摘要模型與輸入上限限制**：擷取得對不對取決於 `SUMMARY_MODEL`（預設同主模型）；原始輸出超過 16000 字只讀頭尾，中間的內容只剩腳本自帶的統計（如 `ROS2_topic_echo` 的欄位變化）可依靠；主模型看不到原文，只能靠摘要裡的「未涵蓋」提示換參數重查。每次超過門檻多一次模型呼叫、同模型時與主對話序列執行，觀察型技能幾乎每次都會觸發。組合技能的多步驟總輸出也走同一條路；重播驗證只驗證會不會 `[PASS]`、不比對內容，且會真的執行有副作用的步驟。
+11. **任務導向摘要受摘要模型與輸入上限限制**：擷取得對不對取決於 `SUMMARY_MODEL`（預設同主模型）；需要比較或計數的問題要靠腳本選項先算好（2.5「數值交給腳本算」），摘要模型自己數會錯；原始輸出超過 16000 字只讀頭尾，中間的內容只剩腳本自帶的統計（如 `ROS2_topic_echo` 的欄位變化）可依靠；主模型看不到原文，只能靠摘要裡的「未涵蓋」提示換參數重查。每次超過門檻多一次模型呼叫、同模型時與主對話序列執行，觀察型技能幾乎每次都會觸發。組合技能的多步驟總輸出也走同一條路；重播驗證只驗證會不會 `[PASS]`、不比對內容，且會真的執行有副作用的步驟。
 12. **調度系統技能依賴 web_console 的版本**：`semantic_map` 需要 `/api/topology` 端點，舊版 web_console 會回 404；OverPending 的時序常數（`threshold_ovp_sec`、`threshold_recovery_sec`）以 distribute 的設定為準，規格裡的「約 10 秒」是預設值。
 
 ---

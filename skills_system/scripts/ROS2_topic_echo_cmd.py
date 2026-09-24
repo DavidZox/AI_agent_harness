@@ -30,11 +30,83 @@ MAX_RAW_OUTPUT_CHARS = 12000     # 原始訊息區的篇幅上限：超過就保
 MAX_CHANGED_FIELDS = 30          # 欄位變化清單最多列幾個欄位
 MAX_CONSTANT_FIELDS = 15         # 固定不變欄位最多列幾個
 USAGE = (
-    "用法: scripts/ROS2_topic_echo_cmd.py [container_name] <topic_name> [timeout_seconds] [--duration 秒]\n"
+    "用法: scripts/ROS2_topic_echo_cmd.py [container_name] <topic_name> [timeout_seconds] [--duration 秒] [--where 欄位<值]...\n"
     "  container_name 可省略＝目前的目標容器（docker_open 選定、或最近一次成功操作的容器）；topic 以 / 開頭。\n"
     f"  不加 --duration：讀一筆就結束；timeout_seconds 預設 {DEFAULT_TIMEOUT_SECONDS} 秒（低頻 topic 請加大），上限 {MAX_TIMEOUT_SECONDS}。\n"
-    f"  --duration 秒（{MIN_DURATION_SECONDS}～{MAX_DURATION_SECONDS}）：持續擷取這段時間的所有訊息，回傳欄位統計與全部原始訊息，適合「觀察一段時間／頻率／有沒有變化」。"
+    f"  --duration 秒（{MIN_DURATION_SECONDS}～{MAX_DURATION_SECONDS}）：持續擷取這段時間的所有訊息，回傳欄位統計與全部原始訊息，適合「觀察一段時間／頻率／有沒有變化」。\n"
+    "  --where 欄位<值（可重複，只能與 --duration 一起用）：由腳本判斷幾則符合、第一則符合的序號與值；運算子 < <= > >= == !=，"
+    "欄位用攤平後的名稱（如 voltage、data.step_counter）。"
 )
+
+# ---------------------------------------------------------------- --where 門檻判斷（數值交給腳本算，模型照抄）
+_OPS = {"<=": lambda a, b: a <= b, ">=": lambda a, b: a >= b, "==": lambda a, b: a == b,
+        "!=": lambda a, b: a != b, "<": lambda a, b: a < b, ">": lambda a, b: a > b}
+_WHERE_RE = re.compile(r"^\s*([^\s<>=!]+)\s*(<=|>=|==|!=|<|>)\s*(.+?)\s*$")
+
+
+def parse_where(expr):
+    """'voltage<24' → {"field","op","value","text"}；大小比較的值必須是數值。回傳 (cond, error)。"""
+    m = _WHERE_RE.match(expr or "")
+    if not m:
+        return None, (f"[ERROR] --where 條件格式應為 欄位<值、欄位>=值、欄位==值（例如 voltage<24、data.status==RUNNING），收到 {expr!r}")
+    field, op, val = m.groups()
+    val = val.strip().strip('"').strip("'")
+    try:
+        num = float(val)
+    except ValueError:
+        num = None
+    if op in ("<", "<=", ">", ">=") and num is None:
+        return None, f"[ERROR] --where {expr!r}：大小比較需要數值，收到 {val!r}"
+    return {"field": field, "op": op, "value": num if num is not None else val, "text": f"{field}{op}{val}"}, None
+
+
+def _fmt_val(v):
+    return _num(v) if isinstance(v, (int, float)) and not isinstance(v, bool) else _fmt(v)
+
+
+def _ranges(indices):
+    """[17,18,19,20,25] → '17～20、25'。"""
+    out, start, prev = [], None, None
+    for i in indices + [None]:
+        if start is None:
+            start = prev = i
+            continue
+        if i is not None and i == prev + 1:
+            prev = i
+            continue
+        out.append(f"{start}～{prev}" if prev != start else f"{start}")
+        start = prev = i
+    return "、".join(out)
+
+
+def render_where(cond, flats):
+    """一行結論：N 則中幾則符合、第一則符合 #k（值）、前一則不符合的值、序號分佈。序號與原始訊息的 #序號一致。"""
+    n = len(flats)
+    if not any(cond["field"] in f for f in flats):
+        keys = sorted({k for f in flats for k in f})
+        return f"條件 {cond['text']}：找不到欄位「{cond['field']}」（可用欄位：{', '.join(keys[:25])}{'…' if len(keys) > 25 else ''}）"
+    matched = []
+    for i, f in enumerate(flats, 1):
+        if cond["field"] not in f:
+            continue
+        v = f[cond["field"]]
+        if isinstance(cond["value"], float):
+            if isinstance(v, bool) or not isinstance(v, (int, float)):
+                continue
+            ok = _OPS[cond["op"]](float(v), cond["value"])
+        else:
+            ok = _OPS[cond["op"]](str(v), str(cond["value"]))
+        if ok:
+            matched.append(i)
+    if not matched:
+        return f"條件 {cond['text']}：{n} 則中 0 則符合"
+    first = matched[0]
+    parts = [f"條件 {cond['text']}：{n} 則中 {len(matched)} 則符合",
+             f"第一則符合 #{first}（{cond['field']}={_fmt_val(flats[first - 1].get(cond['field']))}）"]
+    if first > 1:
+        parts.append(f"前一則 #{first - 1} 不符合（{cond['field']}={_fmt_val(flats[first - 2].get(cond['field']))}）")
+    parts.append("之後連續符合到最後一則" if matched == list(range(first, n + 1)) else f"符合的序號：{_ranges(matched)}")
+    return "；".join(parts)
 
 
 def run_topic_echo(container, topic, timeout=DEFAULT_TIMEOUT_SECONDS):
@@ -145,8 +217,8 @@ def render_raw_messages(raw_docs, max_chars=MAX_RAW_OUTPUT_CHARS):
     return lines + head + [f"…（省略第 {len(head) + 1}～{n - len(tail)} 則，共 {omitted} 則）…"] + tail, omitted
 
 
-def summarize_docs(topic, duration, docs, raw_docs):
-    """狀態列 + 欄位統計（涵蓋全部訊息）+ 全部原始訊息。"""
+def summarize_docs(topic, duration, docs, raw_docs, wheres=None):
+    """狀態列 + 欄位統計（涵蓋全部訊息）+ --where 門檻判斷 + 全部原始訊息。"""
     n = len(docs) if docs else len(raw_docs)
     lines = [f"[PASS] 觀察 '{topic}' {duration} 秒：收到 {n} 則訊息（約 {n / duration:.2f} Hz）"]
     if docs:
@@ -180,14 +252,18 @@ def summarize_docs(topic, duration, docs, raw_docs):
             lines.append(f"- …另有 {len(changed) - MAX_CHANGED_FIELDS} 個欄位有變化")
         if constant:
             lines.append(f"固定不變：{'；'.join(constant[:MAX_CONSTANT_FIELDS])}{'；…' if len(constant) > MAX_CONSTANT_FIELDS else ''}")
+        for cond in (wheres or []):
+            lines.append(render_where(cond, flats))
     elif yaml is None:
         lines.append("（宿主機沒有 PyYAML，無法逐欄位統計；以下為原始訊息）")
+        if wheres:
+            lines.append("（沒有 PyYAML 無法評估 --where 條件）")
     raw_lines, _ = render_raw_messages(raw_docs)
     return "\n".join(lines + raw_lines)
 
 
-def run_topic_capture(container, topic, duration):
-    """擷取 duration 秒的所有訊息：狀態列 + 欄位統計 + 全部原始訊息。"""
+def run_topic_capture(container, topic, duration, wheres=None):
+    """擷取 duration 秒的所有訊息：狀態列 + 欄位統計 + --where 判斷 + 全部原始訊息。"""
     container = (container or "").strip()
     topic = (topic or "").strip()
     if not container or not topic:
@@ -206,30 +282,42 @@ def run_topic_capture(container, topic, duration):
     if not raw_docs:
         return (f"[PASS] 觀察 '{topic}' {duration} 秒：沒有收到任何訊息。可能目前沒有 publisher 在發布、topic 名稱錯誤"
                 f"（請用 ROS2_topic_list 確認）、QoS 不相容，或發布間隔比 {duration} 秒還長。")
-    result = summarize_docs(topic, duration, docs, raw_docs)
+    result = summarize_docs(topic, duration, docs, raw_docs, wheres)
     if len(out) >= MAX_CAPTURE_BYTES - 1:
         result += f"\n（輸出達上限 {MAX_CAPTURE_BYTES} 位元組，實際訊息數可能更多；高頻 topic 請縮短 --duration）"
     return result
 
 
 def parse_cli(argv):
-    """回傳 (container, topic, timeout, duration, error)。"""
+    """回傳 (container, topic, timeout, duration, error, wheres)。wheres 是 parse_where 解析後的條件清單。"""
     args = list(argv)
     duration = None
+    wheres = []
+    while "--where" in args:
+        i = args.index("--where")
+        if i + 1 >= len(args):
+            return None, None, None, None, f"[ERROR] --where 後面需要條件（例如 voltage<24）。\n{USAGE}", []
+        cond, err = parse_where(args[i + 1])
+        if err:
+            return None, None, None, None, f"{err}\n{USAGE}", []
+        wheres.append(cond)
+        del args[i:i + 2]
     if "--duration" in args:
         i = args.index("--duration")
         if i + 1 >= len(args):
-            return None, None, None, None, f"[ERROR] --duration 後面需要秒數。\n{USAGE}"
+            return None, None, None, None, f"[ERROR] --duration 後面需要秒數。\n{USAGE}", []
         value, err = parse_timeout(args[i + 1], None, MAX_DURATION_SECONDS, name="--duration")
         if err or value is None or value < MIN_DURATION_SECONDS:
-            return None, None, None, None, f"[ERROR] --duration 需介於 {MIN_DURATION_SECONDS}～{MAX_DURATION_SECONDS} 秒，收到: {args[i + 1]!r}\n{USAGE}"
+            return None, None, None, None, f"[ERROR] --duration 需介於 {MIN_DURATION_SECONDS}～{MAX_DURATION_SECONDS} 秒，收到: {args[i + 1]!r}\n{USAGE}", []
         duration = value
         del args[i:i + 2]
+    if wheres and not duration:
+        return None, None, None, None, f"[ERROR] --where 只能與 --duration 一起用（要有一段時間的訊息才有得判斷）。\n{USAGE}", []
     bad = [a for a in args if a.startswith("-")]
     if bad:
-        return None, None, None, None, f"[ERROR] 不認識的選項 {bad[0]!r}：位置參數依序是 [container_name] <topic_name> [timeout_seconds]，除了 --duration 沒有其他選項。\n{USAGE}"
+        return None, None, None, None, f"[ERROR] 不認識的選項 {bad[0]!r}：位置參數依序是 [container_name] <topic_name> [timeout_seconds]，選項只有 --duration 與 --where。\n{USAGE}", []
     if not args:
-        return None, None, None, None, f"[ERROR] 參數不足，需要 topic 名稱。\n{USAGE}"
+        return None, None, None, None, f"[ERROR] 參數不足，需要 topic 名稱。\n{USAGE}", []
     # 判斷第一個參數是容器還是 topic：只有一個參數、第一個以 / 開頭（topic 名稱）、或形如「<topic> <秒數>」時，容器省略＝目標容器
     if len(args) == 1 or args[0].startswith("/") or (len(args) == 2 and args[1].isdigit()):
         container, rest = "", args
@@ -237,20 +325,20 @@ def parse_cli(argv):
         container, rest = args[0], args[1:]
     container, err = resolve_container(container, USAGE)
     if err:
-        return None, None, None, None, err
+        return None, None, None, None, err, []
     timeout, err = parse_timeout(rest[1] if len(rest) > 1 else None, DEFAULT_TIMEOUT_SECONDS, MAX_TIMEOUT_SECONDS, name="timeout_seconds")
     if err:
-        return None, None, None, None, f"{err}\n{USAGE}"
-    return container, rest[0], timeout, duration, None
+        return None, None, None, None, f"{err}\n{USAGE}", []
+    return container, rest[0], timeout, duration, None, wheres
 
 
 if __name__ == "__main__":
     try:
-        container, topic, timeout, duration, err = parse_cli(sys.argv[1:])
+        container, topic, timeout, duration, err, wheres = parse_cli(sys.argv[1:])
         if err:
             print(err)
             sys.exit(0)
-        out = run_topic_capture(container, topic, duration) if duration else run_topic_echo(container, topic, timeout)
+        out = run_topic_capture(container, topic, duration, wheres) if duration else run_topic_echo(container, topic, timeout)
         print(out if out.lstrip().startswith("[ERROR]") else with_target_marker(out, container))
     except Exception as e:
         print(f"[ERROR] ROS2_topic_echo 未預期的例外: {e}", file=sys.stderr)

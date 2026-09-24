@@ -225,6 +225,46 @@ def ros2_exec(container, ros2_command, timeout, timeout_hint=None):
     )
 
 
+def parse_filter_args(argv, usage):
+    """`[container_name] [--filter 關鍵字]...` → (container, keywords, error)。關鍵字可重複，不分大小寫的子字串比對。"""
+    container, keywords = "", []
+    args = list(argv)
+    i = 0
+    while i < len(args):
+        a = args[i]
+        if a == "--filter":
+            if i + 1 >= len(args):
+                return None, None, f"[ERROR] --filter 後面需要關鍵字。\n{usage}"
+            keywords.append(args[i + 1])
+            i += 2
+            continue
+        if a.startswith("-"):
+            return None, None, f"[ERROR] 不認識的選項 {a}。\n{usage}"
+        if container:
+            return None, None, f"[ERROR] 只接受一個容器名稱，收到 {container!r} 與 {a!r}（過濾請用 --filter 關鍵字）。\n{usage}"
+        container = a
+        i += 1
+    return container, keywords, None
+
+
+def count_and_filter(stdout, keywords, what, container):
+    """把 ros2 topic/node list 這類「每行一項」的輸出整理成「標頭（總數＋符合關鍵字的數量）＋清單」。
+    數量由腳本算好、模型直接照抄——模型自己數幾十行常常數錯。"""
+    items = [ln.strip() for ln in (stdout or "").splitlines() if ln.strip()]
+    if not items:
+        return f"[PASS] 容器 '{container}' 目前沒有任何 {what}。"
+    head = f"[PASS] 容器 '{container}' 的 {what}：共 {len(items)} 個"
+    if not keywords:
+        return "\n".join([head + "："] + items)
+    kws = [k.lower() for k in keywords]
+    label = "／".join(keywords)
+    hits = [x for x in items if any(k in x.lower() for k in kws)]
+    head += f"，其中含「{label}」的 {len(hits)} 個"
+    if not hits:
+        return f"{head}（沒有符合的；不加 --filter 可列出全部 {len(items)} 個）"
+    return "\n".join([head + "："] + hits)
+
+
 def pass_or_empty(stdout, empty_hint):
     """成功但沒有輸出時，給 Agent 一個明確的 [PASS] 訊息。
     空字串會被 Agent_Runner 誤判成「沒有工具需要執行」，絕對不能回傳空字串。"""

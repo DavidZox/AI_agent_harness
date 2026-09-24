@@ -1,8 +1,8 @@
 ---
 type: Tool
 title: 檔案內容過濾
-description: 在檔案「內部文字」中過濾特定關鍵字。
-version: 1.0.0
+description: 在檔案「內部文字」中過濾特定關鍵字；標頭算好命中筆數與檔案數。
+version: 1.1.0
 dependencies: []
 ---
 
@@ -22,6 +22,9 @@ dependencies: []
 # 範例 (Examples)
 * 搜尋錯誤紀錄：`EXECUTE: scripts/grep_cmd.py "ERROR" .`
 * 搜尋設定值：`EXECUTE: scripts/grep_cmd.py "model" ./skills_system`
+
+# 回傳
+`[PASS] 搜尋結果：共 N 筆命中，分布在 M 個檔案:` 後接 grep 原始輸出（`路徑:行號:內容`）。筆數與檔案數由腳本算好，直接引用。
 
 # 異常處理 (Edge Cases)
 * 搜尋目標為 `/` 時會直接阻斷並回傳安全邊界錯誤。

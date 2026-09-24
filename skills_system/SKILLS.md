@@ -7,9 +7,9 @@
 > **目標容器**：容器技能的 `<container_name>` 可省略＝Current Agent State 的 CURRENT_TARGET_CONTAINER（`docker_open` 選定／切換；成功操作過的容器會自動成為目標）。已有目標時直接用，不要再問使用者要看哪個容器。
 
 ## 系統內建
-- [list_dir](tools/list_dir.md) — 查看指定環境語義單元（目錄）下的檔案清單
-- [search_text](tools/search_text.md) — 在檔案「內部文字」中過濾特定關鍵字
-- [find_file](tools/find_file.md) — 只搜尋「檔案名稱」本身
+- [list_dir](tools/list_dir.md) — 查看目錄清單；標頭算好數量與最新修改，`--filter 關鍵字` 計數、`--newest N` 依修改時間排序
+- [search_text](tools/search_text.md) — 在檔案「內部文字」中過濾特定關鍵字，標頭算好命中筆數與檔案數
+- [find_file](tools/find_file.md) — 只搜尋「檔案名稱」本身，標頭算好找到幾個並附最新修改
 - [change_dir](tools/change_dir.md) — 切換當前工作目錄（注意：後端需維護 CWD 狀態）
 - [view_file](tools/view_file.md) — 查看診斷報告或腳本內容（技能規格文件會由 EXECUTE 自動載入，不用這個）
 
@@ -25,9 +25,9 @@
 - [image_inspect](tools/image_inspect.md) — 對指定路徑的影像檔（截圖、相機快照）依提示詞做視覺模型分析，回傳文字描述
 
 ## ROS2套件
-- [ROS2_topic_list](tools/ROS2_topic_list.md) — 在容器內使用查詢 topic 列表
-- [ROS2_topic_echo](tools/ROS2_topic_echo.md) — 讀取指定 topic 的一筆訊息，或 --duration 擷取一段時間整理欄位變化與頻率
-- [ROS2_node_list](tools/ROS2_node_list.md) — 在容器內使用查詢 node 列表
+- [ROS2_topic_list](tools/ROS2_topic_list.md) — 在容器內查詢 topic 列表，標頭算好總數；`--filter 關鍵字` 只列符合的並計數
+- [ROS2_topic_echo](tools/ROS2_topic_echo.md) — 讀取指定 topic 的一筆訊息，或 --duration 擷取一段時間整理欄位變化與頻率；`--where 欄位<值` 由腳本做門檻判斷
+- [ROS2_node_list](tools/ROS2_node_list.md) — 在容器內查詢 node 列表，標頭算好總數；`--filter 關鍵字` 只列符合的並計數
 - [ROS2_node_info](tools/ROS2_node_info.md) — 指定 node 名稱進行 info 命令，獲得 node 詳細資訊
 
 ## 調度系統
@@ -39,3 +39,6 @@
 
 ## 記憶修改
 - [modify_memory](tools/modify_memory.md) — 寫入經驗記憶：預設全域常駐；加 `--skill <技能名稱>` 綁定該技能，只在載入其規格時出現
+
+## 自建技能
+- [try_deep_search](tools/try_deep_search.md) — 當使用者要求尋找特定關鍵字相關的技能資料夾，並進入該資料夾進行後續操作時使用。

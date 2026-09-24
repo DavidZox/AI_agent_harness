@@ -54,7 +54,13 @@ def execute(args_str):
         )
         
         if result.returncode == 0:
-            return f"[PASS] 搜尋結果:\n{result.stdout}"
+            hits = [ln for ln in result.stdout.splitlines() if ln.strip()]
+            targets = [a for a in clean_args if not a.startswith('-')][1:]   # 第一個非旗標參數是關鍵字，其餘是路徑
+            if targets and all(os.path.isfile(t) for t in targets):
+                n_files = len(targets)           # 只搜單一檔案時 grep 不印檔名前綴，命中行數不能當檔案數
+            else:
+                n_files = len({ln.split(":", 1)[0] for ln in hits})
+            return f"[PASS] 搜尋結果：共 {len(hits)} 筆命中，分布在 {n_files} 個檔案:\n{result.stdout}"
         elif result.returncode == 1:
             return f"[PASS] 找不到符合該關鍵字的內容。"
         else:
