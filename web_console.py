@@ -240,7 +240,7 @@ prompt_eval_count），使用者輸入與工具回傳以每次呼叫後校準的
 並用實際記錄驗證模型的參數化（代回原值必須一致，否則退回原值並提醒）。左欄會顯示草稿預覽，下方
 出現「核准並註冊／重播驗證後註冊／取消」按鈕，也可以直接打字送出修改意見重擬。核准後才會搬進
 tools/ 與 scripts/ 並寫入 SKILLS.md，下一次呼叫 AI 就能用 EXECUTE: <名稱> 載入規格再執行。
-「重播驗證」會用軌跡中的原值實際跑一次草稿腳本，含會改變狀態的步驟（docker_est、workitem_est、
+「重播驗證」會用軌跡中的原值實際跑一次草稿腳本，含會改變狀態的步驟（docker_est、workpackage_est、
 change_dir 等）時預覽會先提醒。只有一步的做對經驗請改用 modify_memory --skill 記憶，不必做技能。""".format(
     threshold=TOOL_RESULT_TOKEN_THRESHOLD, vision_model=VISION_MODEL,
     token_threshold=TOKEN_THRESHOLD, soft_threshold=SOFT_TOKEN_THRESHOLD,

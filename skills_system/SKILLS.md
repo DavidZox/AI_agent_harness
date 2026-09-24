@@ -29,7 +29,7 @@
 - [ROS2_node_info](tools/ROS2_node_info.md) — 指定 node 名稱進行 info 命令，獲得 node 詳細資訊
 
 ## 調度系統
-- [workitem_est](tools/workitem_est.md) — 發送工作項目給調度系統時使用
+- [workpackage_est](tools/workpackage_est.md) — 對任務協調器 orchestrtor 發送多站點 work package（機器人、類型、等級、權重、循環）、取消 work package、刪除 OverPending 任務、查詢執行狀態與場域站點／機隊
 
 ## 記憶修改
 - [modify_memory](tools/modify_memory.md) — 寫入經驗記憶：預設全域常駐；加 `--skill <技能名稱>` 綁定該技能，只在載入其規格時出現
