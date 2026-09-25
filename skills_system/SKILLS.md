@@ -7,9 +7,9 @@
 > **目標容器**：容器技能的 `<container_name>` 可省略＝Current Agent State 的 CURRENT_TARGET_CONTAINER（`docker_open` 選定／切換；成功操作過的容器會自動成為目標）。已有目標時直接用，不要再問使用者要看哪個容器。
 
 ## 系統內建
-- [list_dir](tools/list_dir.md) — 查看目錄清單；標頭算好數量與最新修改，`--filter 關鍵字` 計數、`--newest N` 依修改時間排序
+- [list_dir](tools/list_dir.md) — 查看本機某一層目錄的清單（不含子目錄）；標頭算好數量與最新修改，`--filter 關鍵字` 計數、`--newest N` 找最新修改的檔案
 - [search_text](tools/search_text.md) — 在檔案「內部文字」中過濾特定關鍵字，標頭算好命中筆數與檔案數
-- [find_file](tools/find_file.md) — 只搜尋「檔案名稱」本身，標頭算好找到幾個並附最新修改
+- [find_file](tools/find_file.md) — 依「檔案名稱關鍵字」遞迴搜尋整棵目錄樹，標頭算好找到幾個；要找某目錄裡最新修改的檔案請用 list_dir --newest
 - [change_dir](tools/change_dir.md) — 切換當前工作目錄（注意：後端需維護 CWD 狀態）
 - [view_file](tools/view_file.md) — 查看診斷報告或腳本內容（技能規格文件會由 EXECUTE 自動載入，不用這個）
 

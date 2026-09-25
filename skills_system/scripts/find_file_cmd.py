@@ -30,14 +30,18 @@ def newest_line(paths):
     return line
 
 
-def execute(args_str):
+def execute(args_str, parsed_args=None):
+    """args_str 可以是參數清單（harness 已拆好）或整串字串（舊介面）。"""
+    if isinstance(args_str, list):
+        parsed_args = [a.strip("\"'") for a in args_str if a.strip("\"'")]
+        args_str = " ".join(parsed_args)
     if not args_str or args_str.strip() == "":
         return "[ERROR] 缺少參數。請提供要搜尋的檔案名稱與路徑，例如: \"Modelfile\" ."
     
     # --- AI Generated Code / CLI Executor ---
     try:
-        # 使用 shlex 拆分 Agent 丟進來的原始指令字串
-        parsed_args = shlex.split(args_str)
+        if not isinstance(parsed_args, list):
+            parsed_args = shlex.split(args_str)
         
         # 移除可能不小心混入的 "find" 字眼
         clean_args = [arg for arg in parsed_args if arg.lower() != 'find']
@@ -56,12 +60,10 @@ def execute(args_str):
             else:
                 search_pattern = arg
                 
-        if not search_pattern:
-            # 如果分不出來，就拿最後一個當關鍵字
-            search_pattern = clean_args[-1] if clean_args else ""
-            
         if not search_pattern or search_pattern.strip() == "":
-            return "[ERROR] 無法解析搜尋的檔案名稱關鍵字。"
+            # 只給了路徑、沒給關鍵字（實測模型想「列出全部檔案找最新的」時會這樣叫）：指路，不要把路徑當關鍵字亂搜
+            return ("[ERROR] 缺少檔名關鍵字：find_file 需要「檔名關鍵字 [路徑]」，例如 \"Modelfile\" .；"
+                    "要列出目錄內容或找最新修改的檔案請改用 list_dir（scripts/ls_cmd.py <path> --newest）。")
 
         # 🚨 物理邊界防護：嚴禁對全系統根目錄 '/' 執行搜尋
         if target_path == "/":
@@ -100,8 +102,7 @@ def execute(args_str):
 
 if __name__ == "__main__":
     try:
-        input_str = " ".join(sys.argv[1:]) if len(sys.argv) > 1 else ""
-        print(execute(input_str))
+        print(execute(sys.argv[1:]))
     except Exception as e:
         print(f"Error: {e}", file=sys.stderr)
         sys.exit(1)

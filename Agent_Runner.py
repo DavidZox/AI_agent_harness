@@ -147,7 +147,6 @@ class SkillAgent:
             return max(0, self.last_prompt_tokens + round(delta / self.chars_per_token))
         return round(chars / self.chars_per_token)
 
-    count_context_tokens = context_tokens  # 舊名稱相容
 
     def _record_usage(self, response, sent_messages=None):
         """用 Ollama 回應的精確計量更新校準與狀態：
@@ -177,7 +176,7 @@ class SkillAgent:
     # 🗜️ 上下文壓縮：雙水位線 + 滾動融合摘要（同步與背景兩種執行方式）
     # ------------------------------------------------------------------
     def _is_tool_result_message(self, m):
-        """使用者角色但內容其實是工具回傳（[tool result] / 【系統執行結果】）。
+        """使用者角色但內容其實是工具回傳（[tool result] 開頭）。
         這種訊息要跟前一則 assistant 的 EXECUTE 綁在一起，壓縮切點不能落在兩者之間。"""
         return m['role'] == 'user' and m['content'].lstrip().startswith(TOOL_RESULT_PREFIXES)
 
@@ -1006,11 +1005,13 @@ class SkillAgent:
         return raw_token
 
     def _parse_script_args(self, script_name, remainder):
-        """把 action.args 字串以 shlex 依空白／引號拆成參數列表（含空白的參數用雙引號包住）。"""
+        """把 action.args 字串以 shlex 依空白／引號拆成參數列表（含空白的參數用雙引號包住）。
+        空字串參數（模型常寫成 `. ""`）一律丟掉：沒有任何腳本需要空的位置參數，留著只會變成 [ERROR] 找不到路徑。"""
         try:
-            return shlex.split(remainder)
-        except Exception:
-            return remainder.split()
+            parts = shlex.split(remainder)
+        except Exception:   # 引號不成對（實測模型會送 """）：退回空白切分並去掉殘留的引號
+            parts = [a.strip("\"'") for a in remainder.split()]
+        return [a for a in parts if a != ""]
 
     def _sync_state_from_tool_output(self, output_text):
         """解析工具輸出中的狀態標記，同步更新目前的工作目錄／容器目錄。"""
@@ -1055,10 +1056,18 @@ class SkillAgent:
                 memory_note = f"，附 {n_memory} 則技能經驗記憶" if n_memory else ""
                 print(f"📖 Agent 選擇技能索引: {raw_token}（載入規格文件{memory_note}，尚未執行）")
                 # 回給模型的這段話是兩階段流程裡最關鍵的一句：實測 JSON 協議下小模型載完規格容易停下來解釋規格或
-                # 反問使用者（reply 欄位本身就在邀請它聊天），所以這裡直接下達下一輪該做的事。
-                return (f"{SKILL_DOC_PREFIX} '{raw_token}' 的規格文件。這一輪只是載入規格、還沒有執行任何東西："
-                        f"下一輪請直接依規格繼續使用者原本的任務——action.command 填規格標明的實際腳本路徑（scripts/...）、"
-                        f"args 填參數；不要向使用者解釋規格內容，也不要詢問是否要執行。\n{skill_doc}")
+                # 反問使用者（reply 欄位本身就在邀請它聊天），所以這裡直接下達下一輪該做的事。帶了參數時再明說那些參數
+                # 沒有被執行——實測模型用「docker_open <容器>」載完規格就當作容器已切換，直接做下一步。
+                # 實測（2026-09-25 情境稽核）：只寫「繼續使用者原本的任務」時，模型會跳過這一步直接做下一步（載完 change_dir
+                # 規格就去 ls），所以要明說「下一輪先把這一個技能真正執行一次，之後才做下一步」。
+                if remainder.strip():
+                    next_step = (f"你附的參數「{remainder.strip()}」也沒有被執行、狀態沒有改變。下一輪請先把這個技能真正執行一次："
+                                 f"action.command 填規格標明的實際腳本路徑（scripts/...）、args 填同樣的參數，執行完看到結果後才做下一步；")
+                else:
+                    next_step = ("下一輪請先把這個技能真正執行一次——action.command 填規格標明的實際腳本路徑（scripts/...）、"
+                                 "args 填參數，執行完看到結果後才做使用者任務的下一步；")
+                return (f"{SKILL_DOC_PREFIX} '{raw_token}' 的規格文件（由系統提供）。這一輪只是載入規格、還沒有執行任何東西：{next_step}"
+                        f"不要向使用者解釋規格內容，也不要詢問是否要執行。\n{skill_doc}")
 
             script_name = self._normalize_script_name(raw_token)
             script_path = os.path.join(self.base_path, "scripts", script_name)
@@ -2017,7 +2026,7 @@ SUMMARY_ARCHIVE_KEEP = int(os.environ.get("AGENT_SUMMARY_KEEP", "30"))
 # 摘要模型渲染對話時用它把這些訊息標成 [harness ...] 而不是 [user]，避免把框架的規則記成使用者偏好。
 SKILL_LOADED_MARKER = "[skill loaded]"  # 使用者從選單手動載入的技能規格（附在使用者訊息後面）
 HARNESS_MARKERS = (
-    "[tool result]", "【系統執行結果】", "[vision result]", SKILL_LOADED_MARKER,
+    "[tool result]", "[vision result]", SKILL_LOADED_MARKER,
     "[PLAN_REQUEST]", "[PLAN_REVISION]", "[PLAN_CONFIRMED]", "[PLAN_REJECTED]",
 )
 
@@ -2195,7 +2204,7 @@ MAKE_SKILL_SCHEMA = {
 }
 
 # 使用者角色但實為工具回傳的訊息前綴（見 _split_for_compression 的配對規則）
-TOOL_RESULT_PREFIXES = ("[tool result]", "【系統執行結果】")
+TOOL_RESULT_PREFIXES = ("[tool result]",)
 
 # 工具結果訊息第二行的框架句開頭（tool_result_message）。壓縮摘要渲染時以它辨認並去掉框架句。
 TOOL_RESULT_FRAME = "【系統回傳】"
@@ -2218,7 +2227,8 @@ def tool_result_message(content, action=None):
     what = f"你上一輪 action（{label}）" if label else "你上一輪 action"
     frame = (f"{TOOL_RESULT_FRAME}以下是系統執行{what}的結果，由系統自動產生、不是使用者提供的（使用者也看到同一份）。"
              "回覆時稱「執行結果」或「系統回傳」，不要感謝使用者、不要說「您提供的」。")
-    return f"[tool result]\n{frame}\n{content}"
+    tail = f"{TOOL_RESULT_FRAME}（以上為系統回傳，不是使用者提供的）"   # 結尾再提醒一次：長輸出時開頭那句離模型太遠
+    return f"[tool result]\n{frame}\n{content}\n{tail}"
 
 # 融合摘要的 JSON schema：交給 Ollama 的 format= 做結構化輸出，再由 _render_summary_markdown 排版。
 SUMMARY_SCHEMA = {
@@ -2328,16 +2338,24 @@ def _content_for_context(result, tool_tokens, agent=None, use_summary=True):
 
     if use_summary and agent is not None:
         try:
-            return agent.summarize_tool_result(result, tool_tokens)
+            summary = agent.summarize_tool_result(result, tool_tokens)
+            # 摘要不比原文短時直接給原文：實測 700 tokens 左右的結構化輸出（ros2 node info）會被摘要 session「展開」成
+            # 900 多 tokens，門檻的目的是省上下文，這時原文反而更省、也不會有摘要自己數錯的問題。
+            if agent.count_tokens(summary) < tool_tokens:
+                return summary
+            print(f"ℹ️ 任務導向摘要（≈{agent.count_tokens(summary)} tokens）不比原文（≈{tool_tokens} tokens）短，主對話改收完整原文")
+            return result
         except Exception as e:
             print(f"⚠️ 獨立摘要 session 執行失敗，改用成功/失敗判定：{e}")
 
     status = "失敗" if result.lstrip().startswith("[ERROR]") else "成功"
+    rid = getattr(agent, "last_result_id", None) if agent is not None else None
+    recall = (f"完整原始輸出已存成結果檔 #{rid}：需要內容時由你自己執行 result_grep {rid} <關鍵字> 搜、或 result_view {rid} 看片段"
+              f"（不要叫使用者去搜），不要重新執行同一個工具" if rid else "需要內容時請換更精確的參數重新執行工具")
     return (
         f"{TOOL_REDUCED_TAG}\n"
         f"指令已{status}執行（原始輸出約 {tool_tokens} tokens，超過門檻 {TOOL_RESULT_TOKEN_THRESHOLD}，"
-        f"且獨立摘要 session 未啟用或失敗，內容未加入上下文）。完整內容已顯示給使用者；你看不到它，"
-        f"需要內容時請換更精確的參數重新執行工具，不要憑空補上結果。"
+        f"且獨立摘要 session 未啟用或失敗，內容未加入上下文）。完整內容已顯示給使用者；你看不到它。{recall}，不要憑空補上結果。"
     )
 
 

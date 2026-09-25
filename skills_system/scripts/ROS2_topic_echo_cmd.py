@@ -48,7 +48,8 @@ def parse_where(expr):
     """'voltage<24' → {"field","op","value","text"}；大小比較的值必須是數值。回傳 (cond, error)。"""
     m = _WHERE_RE.match(expr or "")
     if not m:
-        return None, (f"[ERROR] --where 條件格式應為 欄位<值、欄位>=值、欄位==值（例如 voltage<24、data.status==RUNNING），收到 {expr!r}")
+        return None, (f"[ERROR] --where 條件格式應為 欄位<值、欄位>=值、欄位==值（例如 voltage<24、data.status==RUNNING），收到 {expr!r}；"
+                      f"只是想看某個欄位有沒有變化不需要 --where，--duration 的「欄位變化」統計本來就會列出每個欄位的變化")
     field, op, val = m.groups()
     val = val.strip().strip('"').strip("'")
     try:
@@ -122,7 +123,8 @@ def run_topic_echo(container, topic, timeout=DEFAULT_TIMEOUT_SECONDS):
     )
     if not ok:
         return err
-    return pass_or_empty(out, f"'{topic}' 回傳了空訊息")
+    body = pass_or_empty(out, f"'{topic}' 回傳了空訊息")
+    return body if body.startswith("[PASS]") else f"[PASS] '{topic}' 的一筆訊息:\n{body.strip()}"
 
 
 # ---------------------------------------------------------------- 一段時間的擷取與摘要

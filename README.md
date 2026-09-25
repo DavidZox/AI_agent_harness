@@ -14,7 +14,7 @@
 |---|---|
 | `Agent_Runner.py` | 唯一的核心：`SkillAgent`（對話狀態、規格載入、腳本執行、上下文壓縮、操作軌跡、`/make_skill`）＋ CLI |
 | `web_console.py` | 網頁介面，重用 `SkillAgent`；標題列顯示 mode、cwd、目標容器、tokens |
-| `AGENT.md` | 系統提示詞主體：角色、JSON 回覆格式、兩階段執行協議、安全原則、記憶協議（約 2100 tokens 預算） |
+| `AGENT.md` | 系統提示詞主體：角色、JSON 回覆格式、兩階段執行協議、安全原則、記憶協議（約 1850 tokens） |
 | `skills_system/SKILLS.md` | 技能索引（永遠在提示詞裡）；`tools/<name>.md` 規格按需載入；`scripts/<name>_cmd.py` 實際執行 |
 | `Memory.md`／`skills_system/memory/` | 全域常駐記憶／綁定技能的經驗記憶（`modify_memory` 寫入） |
 | `logs/` | 滾動摘要歸檔、操作軌跡 `trajectory.jsonl`、工具結果存檔 `tool_results/`、`/make_skill` 稽核（已 `.gitignore`） |
@@ -64,11 +64,11 @@
 - **`skills_system/tools/<name>.md`**：每個技能一份 OKF 規格（用途、語法、範例、回傳、異常），只在被用到時載入。若有 `skills_system/memory/<name>.md`（`modify_memory --skill` 寫入的經驗記憶），`_load_skill_doc()` 自動附在規格後面的「# 經驗記憶」區塊。
 - **`skills_system/scripts/<name>_cmd.py`**：實際執行的腳本。容器類共用 `_docker_common.py`、工作包類共用 `_rmf_common.py`、組合技能共用 `_composite.py`。
 
-**兩階段派發（progressive disclosure）**：`run_tool()` 拿到 `action` 後，`command` 若對應到存在的 `tools/<name>.md`，就把整份規格（含經驗記憶）當系統回傳注入上下文、不執行；否則把 `command` 當腳本路徑執行。**沒有任何「技能名稱 → 腳本」對照表**，模型必須先讀規格拿到真實路徑才執行得了；猜錯檔名會收到可行動的 `[ERROR]`（檔名若含某個技能名稱，直接提示先載入該技能）。歷史訊息保存模型原始 JSON；壓縮摘要只取 `reply` 與 `[action]`，`thought` 不進摘要。
+**兩階段派發（progressive disclosure）**：`run_tool()` 拿到 `action` 後，`command` 若對應到存在的 `tools/<name>.md`，就把整份規格（含經驗記憶）當系統回傳注入上下文、不執行；否則把 `command` 當腳本路徑執行。**沒有任何「技能名稱 → 腳本」對照表**，模型必須先讀規格拿到真實路徑才執行得了；猜錯檔名會收到可行動的 `[ERROR]`（檔名若含某個技能名稱，直接提示先載入該技能；`scripts/<技能>.py` 這種只差 `_cmd` 的寫法會被 `_normalize_script_name()` 補成正確檔名）。載入規格的回傳開頭明說「這一輪只是載入規格、還沒有執行任何東西」，模型若在技能名稱後附了參數，還會點名那些參數沒有被執行、狀態沒有改變（實測 e4b 用 `docker_open <容器>`、`change_dir <路徑>` 載完規格就當作已切換，直接做下一步）。`action.args` 拆解時丟掉空字串、引號不成對時退回空白切分並去掉殘留引號（實測模型會送 `. ""`、`"""`）；`find_file`／`search_text`／`change_dir` 直接吃拆好的參數清單，不再把參數接成一串重新 shlex。歷史訊息保存模型原始 JSON；壓縮摘要只取 `reply` 與 `[action]`，`thought` 不進摘要。
 
 **手動載入**：Web Console 在輸入框打「/」的選單裡點技能（或 `/skill <名稱>`，CLI 同名指令），`manual_skill_block()` 產生的規格區塊（以 `[skill loaded]` 開頭）會附在下一則訊息後一起送出，省掉一輪「先載規格」；技能清單來自 `list_skills()` 解析 `SKILLS.md`。
 
-**回傳慣例與逾時**：腳本一律由 stdout 回傳，成功以 `[PASS]` 開頭，失敗（含逾時）以 `[ERROR]` 開頭並附原因與建議——`_content_for_context()` 靠這個前綴判定成功／失敗。沒有任何腳本自帶的門檻豁免：分析型輸出（`workpackage_status --watch`、`semantic_map`、`ROS2_topic_echo --duration`）也跟其他輸出一樣回傳完整資訊，超過門檻就交給獨立 session 擷取（舊版 `[PASS][digest]` 讓腳本自己的固定格式摘要放寬到 1500 tokens 直接進主對話，等於由不知道任務的腳本決定什麼重要，已移除）。每支會呼叫外部程序或網路的腳本都有自己的逾時上限（寫在規格裡），`run_tool` 另設 `TOOL_EXEC_TIMEOUT`（600 秒）當最後防線，腳本以非零 exit code 結束時補 `[ERROR]` 前綴、完全沒有輸出時給出明確訊息。
+**回傳慣例與逾時**：腳本一律由 stdout 回傳，成功以 `[PASS]` 開頭（原本直接回原始輸出的 `docker_runcmd`、`ROS2_node_info`、`ROS2_topic_echo` 單筆也加了 `[PASS]` 標頭行；`[CWD_CHANGED]`／`[TARGET_CONTAINER]` 狀態標記放在 `[PASS]` 之後），失敗（含逾時）以 `[ERROR]` 開頭並附原因與建議——`_content_for_context()` 靠這個前綴判定成功／失敗。沒有任何腳本自帶的門檻豁免：分析型輸出（`workpackage_status --watch`、`semantic_map`、`ROS2_topic_echo --duration`）也跟其他輸出一樣回傳完整資訊，超過門檻就交給獨立 session 擷取（舊版 `[PASS][digest]` 讓腳本自己的固定格式摘要放寬到 1500 tokens 直接進主對話，等於由不知道任務的腳本決定什麼重要，已移除）。每支會呼叫外部程序或網路的腳本都有自己的逾時上限（寫在規格裡），`run_tool` 另設 `TOOL_EXEC_TIMEOUT`（600 秒）當最後防線，腳本以非零 exit code 結束時補 `[ERROR]` 前綴、完全沒有輸出時給出明確訊息。
 
 **工具結果如何進主對話**：以 user 角色、經 `tool_result_message()` 包裝——第一行 `[tool result]`（框架訊息判定、壓縮切點都認它），第二行【系統回傳】框架句明說「系統執行你上一輪 action（<腳本>）的結果，不是使用者提供的，不要感謝使用者」，CLI 三種模式、Web、捨棄通知都用同一個包裝。寫在每一則裡而不是只寫在 `AGENT.md`：實測 `AGENT.md` 已有 Harness Messages 規則，gemma4:e4b 仍會回「感謝您提供的語義地圖」；改用 Ollama 的 `tool` 角色也不行，gemma4 的模板會把 `tool` 訊息整個丟掉（模型完全看不到內容），這也是影像分析結果用同一招的原因。壓縮摘要渲染時框架句會被去掉，不佔摘要篇幅。
 
@@ -76,7 +76,7 @@
 
 兩者機制相同：狀態放在 `SkillAgent`（`current_cwd`、`target_container`），顯示在 system prompt 的 Current Agent State 與 Web 標題列，執行腳本時傳給腳本（cwd／環境變數 `TARGET_CONTAINER`），腳本成功改變狀態時在輸出印一行標記，`_sync_state_from_tool_output()` 讀到就更新。`/clear` 不清這兩個狀態。
 
-- **工作目錄**：`change_dir` 印 `[CWD_CHANGED] 路徑`；之後所有腳本以它為 cwd，相對路徑自然生效。
+- **工作目錄**：`change_dir` 在 `[PASS]` 之後印 `[CWD_CHANGED] 路徑`；之後所有腳本以它為 cwd，相對路徑自然生效。
 - **目標容器**：預設空。容器技能（`docker_runcmd`、`ROS2_*`）省略 `<container_name>` 時由 `_docker_common.resolve_container()` 取目標容器，沒有就回 `[ERROR]` 提示先 `docker_containers` 查、`docker_open` 選定；腳本成功操作某容器後在輸出末行印 `[TARGET_CONTAINER] <名稱>`（放末行是為了不破壞 `[PASS]`／`[ERROR]` 的開頭判定，與目前目標相同時不印）。所以目標容器＝最近一次成功操作的容器，`docker_open`／`docker_est` 是刻意選定或切換用。`AGENT.md` 要求模型直接用它、不再反問使用者要看哪個容器；`docker_runcmd` 只有一個參數時整串是指令、有目標且第一個參數不是任何現有容器的完整名稱時也把整串當指令（模型常忘記引號或省略名稱）；`ROS2_topic_echo`／`ROS2_node_info` 以 `/` 開頭的第一個參數判定為 topic／node、容器省略。組合技能重播與軌跡記錄也帶著它（`_composite._sync_state`）。
 
 ### 2.5 上下文管理：真實 token 尺度、雙水位線、滾動融合摘要
@@ -101,11 +101,11 @@ Web Console 另有 `MAX_AUTO_ITERATIONS = 25`：Auto 模式連續執行工具超
 
 **滾動融合摘要**：`compress_context_to_file()` 切出保留區以外的舊訊息交給 `summarize_messages()`，摘要模型同時收到上一份 `rolling_summary` 與新片段（渲染成 `[user]`／`[assistant]`／`[harness …]` 純文字），輸出一份更新後的完整摘要取代上一份；結構由 `format=SUMMARY_SCHEMA`（overview／key_progress／results_and_errors／user_preferences／open_items）強制，`_render_summary_markdown()` 排成固定五段。每次壓縮寫 `logs/summary_<時間>.md` 與同名 `.json`，但 system prompt 只注入最新一份；啟動時從 `logs/` 最新一份載入，摘要跨 session 延續，`/clear` 不清，要完全重來請刪 `logs/`。以 `HARNESS_MARKERS`（`[tool result]`、`[vision result]`、`[skill loaded]`、`[PLAN_REQUEST]`…）開頭的訊息會被標成框架訊息，避免被記成使用者偏好。
 
-**system prompt 成本**：`AGENT.md` 約 2100、`SKILLS.md` 約 900、`Memory.md` 依內容、滾動摘要約 500 tokens，每輪常駐。`AGENT.md` 刻意維持重複強調的詳細寫法（精簡版 A/B 實測會讓 4B 模型猜腳本檔名），新規則要精簡，技能專屬的引導放進 `tools/<name>.md`。
+**system prompt 成本**：`AGENT.md` 約 1850、`SKILLS.md` 約 1400、`Memory.md` 依內容（目前約 700）、滾動摘要約 500 tokens，每輪常駐。2026-09-25 把 `AGENT.md` 從約 2100 精簡到約 1850 tokens（合併重複的兩階段說明、拿掉已由 harness 維護的 cd 狀態提醒，補上「收到 `[ERROR]` 先修正再試、回答引用腳本算好的數字、幾件事就逐一回答」一條），14 份超過 400 tokens 的規格文件砍掉重複段落，並以 18 個真模型情境回歸（5.4）：修正前 12/18 通過、7 次錯誤回傳、6 次同一指令重試；修正後 13/18、1 次錯誤回傳、沒有猜腳本檔名、沒有多餘反問。未通過的 5 個分別是：派工前先確認（`Memory.md` 的規則，設計使然）、兩件事只答後一件、已載入 `list_dir` 就不再載 `find_file`（第 6 節第 14 點）、`/summarize off` 時的作答、以及情境本身（最新修改的項目是 `__pycache__/`）。更早的精簡版曾讓 4B 模型猜檔名；這次實測會猜的是「`Memory.md` 清空」那一組——裡面有一條要求先載規格再執行的記憶，所以清理記憶時保留了它。新規則仍要精簡，技能專屬的引導放進 `tools/<name>.md`。
 
 **`/parallel_cal on|off`（背景壓縮，預設關閉，`AGENT_PARALLEL_CAL=1` 改預設）**：軟水位壓縮改由 `start_background_compression()` 在背景執行緒進行，完成後 `_apply_compression()` 以物件身分把那幾則從 `messages` 原地移除，期間新加入的訊息不會遺失；通知放進 `pop_notices()`（CLI 下一次輸入後印出、Web 隨 stats 推送並每 4 秒輪詢）。**前提**：Ollama 要為模型配置 2 個以上 slot，或摘要模型與主模型不同——實測 Ollama 0.34 對多模態模型（gemma4）強制單 slot，同模型開背景壓縮時下一次對話會在 Ollama 內排隊；搭配 `AGENT_SUMMARY_MODEL=gemma4:26b` 之類的不同模型才有真正的平行，代價是第二個模型的記憶體與算力。算力弱的設備建議維持關閉。
 
-**工具回傳的任務導向摘要（預設開啟；`/summarize off` 或 `AGENT_TOOL_SUMMARY=0` 關閉）**：超過門檻的工具回傳一律由 `summarize_tool_result()` 開一個獨立、乾淨的一次性 session 處理，這是「原始上下文 + 當前問題」式的壓縮（context-aware compression），不是通用摘要。獨立 session 收到三樣東西：完整原始輸出（超過 `TOOL_SUMMARY_INPUT_MAX_CHARS` 時保留頭尾並標明省略）、**使用者的目標**（`_build_task_anchor_text()`：Objective、這一輪任務的原始敘述、已核准的計畫）、**這一步的目的**（`_last_assistant_step()`：決策模型剛才的 `thought`／`reply` 與執行的 `action`——在 agent 迴圈裡，比使用者的原話更精確的「當前問題」）。prompt 把它定位成資訊過濾器：只留與目標直接相關的事實，名稱與數值照抄、不推測、不給建議，並用 `not_covered` 明說原始輸出沒有涵蓋什麼。輸出以 `format=TOOL_SUMMARY_SCHEMA`（answer／facts／errors／not_covered）強制結構，排成「執行結果／回答／相關事實／錯誤／未涵蓋」加一段附註（告訴主模型它看不到原文、需要其他資訊就換參數重查），解析失敗退回模型原文，session 失敗退回成功／失敗判定。CLI 印出「🧠 獨立 session 任務導向摘要」、Web 以紫色 🧠 卡片顯示，兩者都是主對話實際收到的內容。**沒有腳本自帶的豁免**：`ROS2_topic_echo --duration` 等分析型技能改成回傳完整資訊（統計 + 全部原始訊息），什麼重要由知道任務的獨立 session 決定。代價是每次超過門檻多一次模型呼叫（同模型時與主對話序列執行）。
+**工具回傳的任務導向摘要（預設開啟；`/summarize off` 或 `AGENT_TOOL_SUMMARY=0` 關閉）**：超過門檻的工具回傳一律由 `summarize_tool_result()` 開一個獨立、乾淨的一次性 session 處理，這是「原始上下文 + 當前問題」式的壓縮（context-aware compression），不是通用摘要。獨立 session 收到三樣東西：完整原始輸出（超過 `TOOL_SUMMARY_INPUT_MAX_CHARS` 時保留頭尾並標明省略）、**使用者的目標**（`_build_task_anchor_text()`：Objective、這一輪任務的原始敘述、已核准的計畫）、**這一步的目的**（`_last_assistant_step()`：決策模型剛才的 `thought`／`reply` 與執行的 `action`——在 agent 迴圈裡，比使用者的原話更精確的「當前問題」）。prompt 把它定位成資訊過濾器：只留與目標直接相關的事實，名稱與數值照抄、不推測、不給建議，並用 `not_covered` 明說原始輸出沒有涵蓋什麼。輸出以 `format=TOOL_SUMMARY_SCHEMA`（answer／facts／errors／not_covered）強制結構，排成「執行結果／回答／相關事實／錯誤／未涵蓋」加一段附註（告訴主模型它看不到原文、需要其他資訊就換參數重查），解析失敗退回模型原文，session 失敗退回成功／失敗判定（判定訊息帶存檔編號，要模型用 `result_grep`／`result_view` 回查而不是重跑）。CLI 印出「🧠 獨立 session 任務導向摘要」、Web 以紫色 🧠 卡片顯示，兩者都是主對話實際收到的內容。**沒有腳本自帶的豁免**：`ROS2_topic_echo --duration` 等分析型技能改成回傳完整資訊（統計 + 全部原始訊息），什麼重要由知道任務的獨立 session 決定。代價是每次超過門檻多一次模型呼叫（同模型時與主對話序列執行）。
 
 **數值交給腳本算，摘要只做過濾**：實測 gemma4:e4b 對「哪個檔案最新」「幾個 topic 含 costmap」這類比較／計數題 0/5 答對，開 `think=True` 也只有 2/5 且一次 17 秒；26b 開推論才 3/3，但一次 35～60 秒。所以比較、計數、排序、門檻判斷全部放進腳本：`list_dir` 標頭給數量與「最新修改」、`--filter`／`--newest`；`find_file`／`search_text` 標頭給數量；`ROS2_topic_list`／`ROS2_node_list` 的 `--filter` 計數；`ROS2_topic_echo --where 欄位<值` 算出幾則符合、第一則符合的序號與值。摘要 prompt 規定腳本算好的數字直接照抄、不得重數或推翻；各規格文件要求模型遇到這類問題改用對應選項。摘要 session 維持 `think=False`。
 
@@ -172,8 +172,8 @@ Web Console 另有 `MAX_AUTO_ITERATIONS = 25`：Auto 模式連續執行工具超
 | :--- | :--- | :--- | :--- |
 | `list_dir` | 列出目錄清單 | `ls_cmd.py` | 純 Python 列表：標頭算好「共 N 項（檔案／目錄）」、永遠附「最新修改：A；其次：B、C」；`--filter 關鍵字` 計數、`--newest N` 依修改時間排序。舊 ls 旗標忽略 |
 | `search_text` | 在檔案內容中 grep 關鍵字 | `grep_cmd.py` | 標頭算好「共 N 筆命中，分布在 M 個檔案」；`AGENT.md` 禁止對 `/` 遞迴搜尋，範圍限制在工作目錄或子目錄 |
-| `find_file` | 只搜尋檔名 | `find_file_cmd.py` | 標頭算好「找到 N 個」＋「最新修改」一行（結果 ≤300 個時逐一 stat） |
-| `change_dir` | 切換工作目錄 | `cd_cmd.py` | 印 `[CWD_CHANGED]` 讓 harness 同步（2.4） |
+| `find_file` | 只搜尋檔名（遞迴） | `find_file_cmd.py` | 標頭算好「找到 N 個」＋「最新修改」一行（結果 ≤300 個時逐一 stat）；沒給關鍵字回 `[ERROR]` 並指路 `list_dir --newest` |
+| `change_dir` | 切換工作目錄 | `cd_cmd.py` | `[PASS]` 後印 `[CWD_CHANGED]` 讓 harness 同步（2.4） |
 | `view_file` | 查看檔案內容 | `cat_cmd.py` | 技能規格不用它，`action.command` 填技能名稱即載入 |
 
 ### 3.2 容器與 ROS2（共用 `_docker_common.py`）
@@ -184,10 +184,10 @@ Web Console 另有 `MAX_AUTO_ITERATIONS = 25`：Auto 模式連續執行工具超
 | `docker_images` | 列映像檔 | `docker_images_cmd.py` | |
 | `docker_est` | 以映像檔建容器並常駐（`tail -f /dev/null`） | `docker_est_cmd.py` | 新容器成為目標容器 |
 | `docker_open` | 選定目標容器並驗證連線 | `docker_open_cmd.py` | 部分名稱唯一符合即可，多個符合列候選；末行 `[TARGET_CONTAINER]` |
-| `docker_runcmd` | 容器內執行 shell 指令 | `docker_runcmd_cmd.py` | `[--timeout 秒]`（1～570）`[容器] "指令"`，容器可省略 |
+| `docker_runcmd` | 容器內執行 shell 指令 | `docker_runcmd_cmd.py` | `[--timeout 秒]`（1～570）`[容器] "指令"`，容器可省略；輸出加 `[PASS]` 標頭 |
 | `ROS2_topic_list` / `ROS2_node_list` | 列 topic／node | `ROS2_topic_list_cmd.py`、`ROS2_node_list_cmd.py` | `[容器]` 可省略；標頭算好總數，`--filter 關鍵字`（可重複）只列符合的並給數量（`_docker_common.count_and_filter`） |
-| `ROS2_topic_echo` | 讀一筆訊息，或 `--duration 秒`（2～300）擷取一段時間 | `ROS2_topic_echo_cmd.py` | 一段時間模式回 `[PASS]`：則數、頻率、每個欄位的數值範圍／字串種類／固定不變清單（PyYAML 攤平，String 內的 JSON 也解開），後面附全部原始訊息（超過 12000 字保留頭尾並註明省略幾則）；`--where 欄位<值`（可重複）由腳本判斷「N 則中 K 則符合；第一則符合 #k（值）；前一則不符合（值）」；幾乎必超過門檻，由獨立 session 依這一步的目的擷取 |
-| `ROS2_node_info` | node 詳細資訊 | `ROS2_node_info_cmd.py` | `[容器] <node>`，node 以 `/` 開頭 |
+| `ROS2_topic_echo` | 讀一筆訊息，或 `--duration 秒`（2～300）擷取一段時間 | `ROS2_topic_echo_cmd.py` | 單筆回 `[PASS] '<topic>' 的一筆訊息:` + YAML；一段時間模式回 `[PASS]`：則數、頻率、每個欄位的數值範圍／字串種類／固定不變清單（PyYAML 攤平，String 內的 JSON 也解開），後面附全部原始訊息（超過 12000 字保留頭尾並註明省略幾則）；`--where 欄位<值`（可重複）由腳本判斷「N 則中 K 則符合；第一則符合 #k（值）；前一則不符合（值）」；幾乎必超過門檻，由獨立 session 依這一步的目的擷取 |
+| `ROS2_node_info` | node 詳細資訊 | `ROS2_node_info_cmd.py` | `[容器] <node>`，node 以 `/` 開頭；輸出加 `[PASS]` 標頭 |
 
 共通：在容器內以 coreutils `timeout` 包住指令，逾時真的終止容器內程序而不是只殺宿主機端的 `docker exec`；常見 docker／ros2 錯誤翻成可行動的說明；ROS2 指令用 `bash -ic` 並由 `ROS2_ENV_FALLBACK` 補齊環境——shell 沒有 `ros2` 就 source `/opt/ros/<distro>`，再靜默 source 第一個找到的 colcon overlay，shell 沒有 `ROS_DOMAIN_ID` 時從容器內正在跑的 ROS 節點的 `/proc/<pid>/environ` 複製 domain／RMW／CycloneDDS／discovery 變數（fih_rmf_system 的節點跑在 domain 98，不補齊會看到空的 topic 列表）。
 
@@ -303,7 +303,7 @@ python3 web_console.py
 
 ### 5.4 離線驗證的做法
 
-專案內沒有正式測試套件（見 6），但每次改動都用同一套方法驗證，接手時可比照：以假的 `ollama.chat`（回固定 JSON）驅動 `SkillAgent`／`web_console` 的流程；技能腳本對 `scripts/mock_server.py`（調度系統）或 PATH 前置的假 `docker`（容器技能）執行；把 `SkillAgent` 的 `script_dir`／`base_path` 等路徑指到暫存副本，避免測試寫進真的 `skills_system/`、`Memory.md`、`logs/trajectory.jsonl`；最後用 `gemma4:e4b` 真模型跑幾句自然語言需求，確認技能選擇與參數（對真系統只做唯讀操作）。
+專案內沒有正式測試套件（見 6），但每次改動都用同一套方法驗證，接手時可比照：以假的 `ollama.chat`（回固定 JSON）驅動 `SkillAgent`／`web_console` 的流程；技能腳本對 `scripts/mock_server.py`（調度系統）或 PATH 前置的假 `docker`（容器技能）執行；把 `SkillAgent` 的 `script_dir`／`base_path` 等路徑指到暫存副本，避免測試寫進真的 `skills_system/`、`Memory.md`、`logs/trajectory.jsonl`；最後用 `gemma4:e4b` 真模型跑一組固定情境（每個技能至少一句自然語言需求、兩步驟任務、追問回查、plan 模式、`/summarize on|off` 前後對照、有／無 `Memory.md` 對照），以 auto 模式的完整迴圈執行並自動判定：是否先載規格再執行、有沒有猜腳本名、有沒有多餘的反問、有沒有把系統回傳說成「您提供的」、最終回答有沒有引用腳本算好的數字；對真系統只做唯讀操作，調度技能打 `mock_server.py`。
 
 ---
 
@@ -321,7 +321,10 @@ python3 web_console.py
 10. **JSON 協議下的空白回覆**：模型在字串裡用英文雙引號時會發生，屬機率性；框架自動重試一次並在提示詞禁用英文雙引號，重試仍空白時如實顯示。
 11. **任務導向摘要受摘要模型與輸入上限限制**：擷取得對不對取決於 `SUMMARY_MODEL`（預設同主模型）；需要比較或計數的問題要靠腳本選項先算好（2.5「數值交給腳本算」），摘要模型自己數會錯；原始輸出超過 16000 字只讀頭尾，中間的內容只剩腳本自帶的統計（如 `ROS2_topic_echo` 的欄位變化）可依靠；主模型看不到原文，只能靠摘要裡的「未涵蓋」提示換參數重查。每次超過門檻多一次模型呼叫、同模型時與主對話序列執行，觀察型技能幾乎每次都會觸發。組合技能的多步驟總輸出也走同一條路；重播驗證只驗證會不會 `[PASS]`、不比對內容，且會真的執行有副作用的步驟。
 12. **`result_grep` 是文字比對**：關鍵字要在原文裡出現才搜得到（同義詞靠 `a|b` 自己列），語意相近但字面不同的東西找不到；命中以行為單位，結構化內容用 `--block` 或 `result_view` 補整段。存檔依 200 檔／50 MB 輪替，太舊的會被刪。
-13. **調度系統技能依賴 web_console 的版本**：`semantic_map` 需要 `/api/topology` 端點，舊版 web_console 會回 404；OverPending 的時序常數（`threshold_ovp_sec`、`threshold_recovery_sec`）以 distribute 的設定為準，規格裡的「約 10 秒」是預設值。
+13. **小模型會把「載入規格」當成「已執行」**：用 `docker_open <容器>`、`change_dir <路徑>` 這種帶參數的技能名稱載完規格後，直接當作容器已切換、目錄已切換而做下一步。規格載入的回傳現在會點名「你附的參數沒有被執行、狀態沒有改變」，18 情境實測後不再發生，但這是措辭層面的緩解，不是機制保證。
+14. **同一 session 已載入某技能規格時，模型傾向重用它**：例如已載入 `list_dir` 後被問「專案裡檔名含 cmd 的檔案有幾個」，會用 `list_dir --filter` 在根目錄數（只看一層、得到 0）而不是再載 `find_file` 遞迴搜尋；索引描述改成只標明「一層／遞迴」時仍會答 0，改成腳本在 0 項時直接指示「如果問的是整個專案這個 0 不能當答案，請改用 `scripts/find_file_cmd.py` 遞迴搜尋」後實測會照做（腳本回傳裡的明確指示比索引描述有效）。摘要 session 在原始輸出沒有算好的數字時會自己數（實測 25 個 `.md` 數成 23），所以規格要求用 `--filter` 讓腳本算，摘要不比原文短時也改給原文。
+15. **「您提供的」殘留**：工具結果的開頭與結尾都有框架句，18 情境仍偶爾（1～2 次）出現「根據您提供的…」；兩件事一起問時偶爾只答後一件。
+16. **調度系統技能依賴 web_console 的版本**：`semantic_map` 需要 `/api/topology` 端點，舊版 web_console 會回 404；OverPending 的時序常數（`threshold_ovp_sec`、`threshold_recovery_sec`）以 distribute 的設定為準，規格裡的「約 10 秒」是預設值。
 
 ---
 

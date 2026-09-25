@@ -34,7 +34,10 @@ def run_node_info(container, node):
     )
     if not ok:
         return err
-    return with_target_marker(pass_or_empty(out, f"節點 '{node}' 沒有回傳任何資訊"), container)
+    body = pass_or_empty(out, f"節點 '{node}' 沒有回傳任何資訊")
+    if not body.startswith("[PASS]"):
+        body = f"[PASS] 節點 {node} 的資訊（ros2 node info）:\n{body}"
+    return with_target_marker(body, container)
 
 
 if __name__ == "__main__":

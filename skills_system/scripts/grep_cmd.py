@@ -3,14 +3,18 @@ import os
 import subprocess
 import shlex
 
-def execute(args_str):
+def execute(args_str, parsed_args=None):
+    """args_str 可以是參數清單（harness 已拆好）或整串字串（舊介面）。"""
+    if isinstance(args_str, list):
+        parsed_args = [a.strip("\"'") for a in args_str if a.strip("\"'")]
+        args_str = " ".join(parsed_args)
     if not args_str or args_str.strip() == "":
         return "[ERROR] 缺少參數。請提供關鍵字與路徑，例如: \"model\" ."
     
     # --- AI Generated Code / CLI Executor ---
     try:
-        # 使用 shlex 拆分 Agent 丟進來的原始指令字串
-        parsed_args = shlex.split(args_str)
+        if not isinstance(parsed_args, list):
+            parsed_args = shlex.split(args_str)
         
         # 移除可能不小心混入的 "grep" 字眼
         clean_args = [arg for arg in parsed_args if arg.lower() != 'grep']
@@ -74,8 +78,7 @@ def execute(args_str):
 
 if __name__ == "__main__":
     try:
-        input_str = " ".join(sys.argv[1:]) if len(sys.argv) > 1 else ""
-        print(execute(input_str))
+        print(execute(sys.argv[1:]))
     except Exception as e:
         print(f"Error: {e}", file=sys.stderr)
         sys.exit(1)

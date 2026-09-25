@@ -24,14 +24,14 @@ def parse_args(argv):
     if isinstance(argv, str):
         argv = shlex.split(argv)
     path, keyword, newest = ".", None, None
-    args = list(argv)
+    args = [a for a in argv if a != ""]   # 空字串參數（模型常寫 `. ""`）直接忽略
     i = 0
     while i < len(args):
         a = args[i]
         if a == "--filter":
             if i + 1 >= len(args):
                 return None, None, None, f"[ERROR] --filter 後面需要關鍵字。\n{USAGE}"
-            keyword = args[i + 1]
+            keyword = args[i + 1].strip("*")   # 模型常寫成 glob（*.md）：--filter 是子字串比對，去掉星號即可
             i += 2
             continue
         if a == "--newest":
@@ -102,7 +102,10 @@ def render(path, entries, keyword=None, newest=None):
         shown = sorted(shown, key=lambda e: e["name"].lower())
     lines = [head]
     if not shown:
-        lines.append("（沒有符合的項目）" if keyword else "（空目錄）")
+        # 實測模型會用 list_dir --filter 在根目錄數「專案裡」的檔案，0 項就回報 0：明說這裡只看一層、指路 find_file
+        lines.append(f"（{path} 這一層沒有名稱含「{keyword}」的項目。注意：list_dir 不看子目錄，如果使用者問的是整個專案或所有子目錄，"
+                     f"這個 0 不能當答案，請改用 scripts/find_file_cmd.py {keyword} {path} 遞迴搜尋後再回答）"
+                     if keyword else "（空目錄）")
         return "\n".join(lines)
     nl = newest_line(shown)
     if nl:

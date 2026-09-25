@@ -2,31 +2,23 @@
 type: Tool
 title: 檔案內容過濾
 description: 在檔案「內部文字」中過濾特定關鍵字；標頭算好命中筆數與檔案數。
-version: 1.1.0
+version: 1.2.0
 dependencies: []
 ---
 
-# 背景 / 運作原理
-包裝系統 `grep` 指令，自動補上 `-r -n -i -I` 旗標（遞迴、行號、忽略大小寫、跳過二進位檔），並阻擋對根目錄 `/` 的遞迴搜尋以避免系統過載。
+# 用途
+包裝 `grep -r -n -i -I`（遞迴、行號、忽略大小寫、跳過二進位檔），阻擋對根目錄 `/` 的搜尋。逾時 8 秒。
 
-# 語法 / 參數規範
-* `keyword` (string, required): 欲搜尋的關鍵字。
-* `path` (string, required): 搜尋範圍，必須為當前工作目錄（`.`）或其子目錄，嚴禁使用 `/`。
-* 核心腳本：`scripts/grep_cmd.py`
+# 語法
+`EXECUTE: scripts/grep_cmd.py "<keyword>" <path>`
+* `keyword`：關鍵字（含空白用引號）。`path`：目前工作目錄（`.`）或其子目錄，嚴禁 `/`。
 
-# 執行步驟 (Steps)
-1. 拆解參數並移除誤帶入的 `grep` 字樣。
-2. 補齊必要旗標並檢查路徑是否為根目錄（阻斷）。
-3. 以 8 秒逾時執行並回傳結果。
-
-# 範例 (Examples)
-* 搜尋錯誤紀錄：`EXECUTE: scripts/grep_cmd.py "ERROR" .`
-* 搜尋設定值：`EXECUTE: scripts/grep_cmd.py "model" ./skills_system`
+# 範例
+`EXECUTE: scripts/grep_cmd.py "ERROR" .`　`EXECUTE: scripts/grep_cmd.py "model" ./skills_system`
 
 # 回傳
-`[PASS] 搜尋結果：共 N 筆命中，分布在 M 個檔案:` 後接 grep 原始輸出（`路徑:行號:內容`）。筆數與檔案數由腳本算好，直接引用。
+`[PASS] 搜尋結果：共 N 筆命中，分布在 M 個檔案:` + `路徑:行號:內容`。筆數與檔案數由腳本算好，直接引用。找不到：`[PASS] 找不到符合該關鍵字的內容`（不是錯誤）。
 
-# 異常處理 (Edge Cases)
-* 搜尋目標為 `/` 時會直接阻斷並回傳安全邊界錯誤。
-* 找不到關鍵字時回傳 `[PASS] 找不到符合該關鍵字的內容`（非錯誤）。
-* 搜尋範圍過大導致逾時（8 秒）會中止並提示縮小範圍。
+# 異常
+* 路徑為 `/`：`[ERROR]` 安全邊界阻斷，改指定具體目錄。
+* 逾時 8 秒：範圍過大，縮小目錄或關鍵字。

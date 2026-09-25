@@ -46,7 +46,6 @@ from Agent_Runner import (
     KEEP_RECENT_TOKENS,
     TOOL_RESULT_TOKEN_THRESHOLD,
     TOOL_SUMMARY_DEFAULT,
-    TOOL_SUMMARY_TAG,
     context_kind,
     tool_result_message,
     MIN_COMPRESS_TOKENS,
@@ -311,11 +310,6 @@ def build_stats():
     }
 
 
-# summarize_tool_result() 產生的內容固定以 TOOL_SUMMARY_TAG 開頭，用來判斷
-# _content_for_context() 這次回傳的是不是獨立 session 的任務導向摘要。
-_SUMMARY_TAG = TOOL_SUMMARY_TAG
-
-
 def _current_tool_action():
     """剛執行完的工具是哪個 action：run_turn 與 apply_decision 的時間點，最後一則 assistant 都還是下這個工具的那一輪。"""
     return (agent._last_assistant_step() or {}).get("action")
@@ -327,19 +321,12 @@ def _emit_context_event(content, events, tool_tokens=None):
     因為上一張卡片就是同一份內容。使用者永遠同時看得到完整原文與 AI 收到的版本。"""
     kind = context_kind(content, tool_tokens)
     n = agent.count_tokens(content)
-    if kind == "summary":
-        events.append({"channel": "summary", "kind": kind, "text": content, "tokens": n})
-    elif kind == "reduced":
+    if kind in ("summary", "reduced"):
         events.append({"channel": "summary", "kind": kind, "text": content, "tokens": n})
     elif kind == "doc":
         events.append({"channel": "summary", "kind": kind, "text": f"完整規格文件（≈{n} tokens，不受門檻限制），與上方卡片相同。", "tokens": n})
     else:
         events.append({"channel": "summary", "kind": kind, "text": f"完整原文（≈{n} tokens，未縮減），與上方系統回傳卡片相同。", "tokens": n})
-
-
-def _emit_summary_event(content, events):
-    """舊名稱，保留給外部呼叫；等同 _emit_context_event。"""
-    _emit_context_event(content, events)
 
 
 DEFAULT_VISION_PROMPT = "請描述這些影像的內容，並逐字列出可見的文字、數值、錯誤訊息與任何值得注意的異常。"

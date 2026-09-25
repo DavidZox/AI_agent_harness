@@ -57,7 +57,10 @@ def run_in_container(target, command, timeout=DEFAULT_TIMEOUT_SECONDS):
     )
     if not ok:
         return err
-    return with_target_marker(pass_or_empty(out, "指令沒有任何標準輸出"), target)
+    body = pass_or_empty(out, "指令沒有任何標準輸出")
+    if not body.startswith("[PASS]"):
+        body = f"[PASS] 容器 '{target}' 內 `{command}` 執行完成（末行為執行後的容器內路徑）:\n{body}"
+    return with_target_marker(body, target)
 
 
 if __name__ == "__main__":
