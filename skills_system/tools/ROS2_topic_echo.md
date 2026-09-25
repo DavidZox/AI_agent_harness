@@ -23,7 +23,7 @@ dependencies: ["docker", "ros2"]
 `EXECUTE: scripts/ROS2_topic_echo_cmd.py ros2_humble /diagnostics 60`
 
 # 回傳
-單筆：一筆訊息的 YAML。一段時間：`[PASS] 觀察 '<topic>' N 秒：收到 M 則（約 X Hz）` + 欄位變化清單 + 每個 `--where` 一行 `條件 voltage<24：M 則中 K 則符合；第一則符合 #k（voltage=…）；前一則 #k-1 不符合（…）；…` + 全部原始訊息；沒收到訊息也是 `[PASS]` 並說明可能原因。操作的容器與目標不同時末行附 `[TARGET_CONTAINER] <名稱>`。失敗：`[ERROR] 原因`。
+單筆：一筆訊息的 YAML。一段時間：`[PASS] 觀察 '<topic>' N 秒：收到 M 則（約 X Hz）` + 欄位變化清單 + 每個 `--where` 一行 `條件 voltage<24：M 則中 K 則符合；第一則符合 #k（voltage=…）；前一則 #k-1 不符合（…）；…` + 全部原始訊息；沒收到訊息也是 `[PASS]` 並說明可能原因。操作的容器與目標不同時末行附 `[TARGET_CONTAINER] <名稱>`。完整原始訊息會存成結果檔，使用者追問某一則或某欄位時用 `result_grep <編號> <關鍵字> --block`，不要重新擷取。失敗：`[ERROR] 原因`。
 
 # 異常
 * 找不到 topic 或沒有 publisher：先用 `ROS2_topic_list` 確認名稱。

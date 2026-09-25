@@ -76,6 +76,9 @@ class SkillAgent:
         # current_plan 一起，見 _build_task_anchor_text）。每次使用者送出新任務時更新，/clear 時清空。
         # =========================
         self.current_task = None
+        self.task_history = []          # 最近 TASK_HISTORY_KEEP 則使用者任務訊息（舊→新），見 set_current_task／_build_task_anchor_text
+        self.last_result_id = None      # 最近一次 run_tool 存檔的結果編號（regard 規格載入時為 None），供摘要附註與 UI 顯示
+        self.last_result_file = None
 
         # =========================
         # 🗜️ 滾動摘要與背景壓縮（雙水位線，見檔尾 SOFT_TOKEN_THRESHOLD / KEEP_RECENT_TOKENS 說明）
@@ -549,8 +552,8 @@ class SkillAgent:
         return (f"{result[:head]}\n\n…（原始輸出過長，此處省略中間 {omitted} 字元；以下是結尾部分）…\n\n{result[-tail:]}", omitted)
 
     @staticmethod
-    def _render_tool_summary(data):
-        """把 TOOL_SUMMARY_SCHEMA 的 JSON 排成固定結構的純文字（回答／相關事實／錯誤／未涵蓋）。"""
+    def _render_tool_summary(data, result_id=None):
+        """把 TOOL_SUMMARY_SCHEMA 的 JSON 排成固定結構的純文字（回答／相關事實／錯誤／未涵蓋／可追問）。"""
         if not isinstance(data, dict):
             raise TypeError("tool summary JSON 不是物件")
 
@@ -569,9 +572,14 @@ class SkillAgent:
         not_covered = str(data.get("not_covered") or "").strip()
         if not_covered and not_covered.rstrip("。.") not in ("無", "沒有", "none", "None", "N/A", "n/a"):
             lines.append(f"未涵蓋：{not_covered}")
+        questions = [q for q in (data.get("suggested_questions") or []) if isinstance(q, dict) and str(q.get("question") or "").strip()][:3]
+        if questions:
+            where = f"（存檔 #{result_id}，可用 result_grep {result_id} <關鍵字> 搜）" if result_id else "（可用 result_grep 在存檔裡搜）"
+            lines.append(f"可追問{where}：")
+            lines += [f"- {str(q['question']).strip()} ← 關鍵字：{str(q.get('keywords') or '').strip() or '（未給）'}" for q in questions]
         return "\n".join(lines)
 
-    def summarize_tool_result(self, result, tool_tokens, step=None):
+    def summarize_tool_result(self, result, tool_tokens, step=None, result_id=None):
         """任務導向摘要（Task-Oriented Summarization）：開一個獨立、乾淨的一次性 session（自己的 system/user
         prompt，不接觸 self.messages），把超過門檻的工具回傳擷取成主對話用得上的重點，摘要完就丟棄。
 
@@ -581,8 +589,11 @@ class SkillAgent:
         規則要求名稱與數值照抄、不推測、不給建議，並用 not_covered 明說原始輸出沒有涵蓋什麼，主模型才知道
         該換參數重查而不是憑空補上。結構以 format=TOOL_SUMMARY_SCHEMA 強制，解析失敗退回模型原文。
         原始輸出超過 TOOL_SUMMARY_INPUT_MAX_CHARS 時只讀頭尾（_clip_tool_output），並在給主模型的附註標明。
-        step 可由呼叫端指定（測試用），預設取最近一則 assistant 回覆。"""
+        step 可由呼叫端指定（測試用），預設取最近一則 assistant 回覆。
+        result_id 預設取最近一次 run_tool 的存檔編號：附註會告訴主模型「細節用 result_grep <編號> 搜，不要重跑工具」，
+        並把 answer 回填到 index.md；模型另外會得到 1～3 個「可追問」（附關鍵字），使用者的要求是探索型時可拿去問。"""
         anchor = self._build_task_anchor_text()
+        result_id = self.last_result_id if result_id is None else result_id
         step = step if step is not None else (self._last_assistant_step() or {})
         step_lines = []
         if step.get("action"):
@@ -604,12 +615,14 @@ class SkillAgent:
 5. 原始輸出若標示「省略中間 N 字元」，被省略的部分不可假設，要寫進 not_covered。
 6. 數量、排序與門檻判斷以原始輸出裡腳本算好的結果為準（例如「共 N 個」「最新修改：」「條件 …：第一則符合 #k」），直接照抄、不要自己重數或推翻；原始輸出沒有算好而必須比較時，逐一核對原文並在 facts 引用依據（序號、原文數值或時間），無法確定就寫進 not_covered，不要猜。
 7. 精簡：answer 一句話（含關鍵數值或名稱）；facts 每項一句、不超過 60 字；全部合計不超過 {TOOL_SUMMARY_MAX_CHARS} 字。
+8. suggested_questions：使用者接下來可能想知道、但這一步的目的沒問到、且原始輸出裡有資料可答的問題，最多 3 個；每個附 keywords＝在原始輸出裡搜得到的關鍵字（同義詞用 | 分隔，可含正則）。使用者的要求已經明確、輸出也已回答時給空陣列，不要硬湊。
 
 輸出 JSON 物件：
 - answer：一句話直接回答這一步的目的。
 - facts：與任務相關的事實清單（名稱、數值照抄）。
 - errors：原始輸出中的錯誤／警告／異常，照抄原文；沒有就空陣列。
 - not_covered：原始輸出沒有涵蓋、或因篇幅被省略而無法確認的部分；沒有就寫「無」。
+- suggested_questions：[{{question, keywords}}] 可追問的問題與搜尋關鍵字，最多 3 個。
 """
         user_prompt = (
             f"【使用者的目標】\n{anchor}\n\n"
@@ -628,20 +641,31 @@ class SkillAgent:
             think=False,
         )
         raw = res['message']['content'].strip()
+        answer = ""
         try:
-            body = self._render_tool_summary(json.loads(raw))
+            data = json.loads(raw)
+            body = self._render_tool_summary(data, result_id)
+            answer = str(data.get("answer") or "").strip() if isinstance(data, dict) else ""
             structured = True
         except (ValueError, TypeError):
             body, structured = raw, False
         self.last_tool_summary = {
             'structured': structured, 'input_tokens': tool_tokens, 'omitted_chars': omitted,
-            'summary_tokens': self.count_tokens(body), 'model': self.summary_model,
+            'summary_tokens': self.count_tokens(body), 'model': self.summary_model, 'result_id': result_id,
         }
+        if result_id and answer:
+            self.update_result_answer(result_id, answer)
         status = "失敗（[ERROR]）" if result.lstrip().startswith("[ERROR]") else "成功"
+        recall = (
+            f"完整原始輸出已存成結果檔 #{result_id}：需要摘要以外的細節（含「未涵蓋」或被省略的部分）時，"
+            f"用 result_grep {result_id} <關鍵字|同義詞> 在存檔裡搜、或 result_view {result_id} 看片段，不要重新執行同一個工具。"
+            f"使用者的要求若是探索型（看一下／觀察一下），可把「可追問」列給使用者選；要求明確就直接回答並提一下存檔編號。"
+            if result_id else
+            "你看不到原始輸出：需要其他資訊時，換更精確的參數重新執行工具，不要憑空補上。"
+        )
         note = (
             f"（原始輸出約 {tool_tokens} tokens，超過門檻 {TOOL_RESULT_TOKEN_THRESHOLD}；以上由獨立 session 依使用者目標與"
-            f"這一步的目的從完整輸出擷取{'，過長部分只讀了頭尾' if omitted else ''}，完整內容已顯示給使用者。"
-            f"你看不到原始輸出：「未涵蓋」或需要其他資訊時，換更精確的參數重新執行工具，不要憑空補上。）"
+            f"這一步的目的從完整輸出擷取{'，過長部分只讀了頭尾' if omitted else ''}，完整內容已顯示給使用者。{recall}）"
         )
         return f"{TOOL_SUMMARY_TAG}\n執行結果：{status}\n{body}\n{note}"
 
@@ -744,7 +768,12 @@ class SkillAgent:
         if self.sticky_objective:
             parts.append(f"使用者設定的最高優先 Objective：{self.sticky_objective}")
         if self.current_task:
-            parts.append(f"這一輪任務的原始敘述：{self.current_task}")
+            parts.append(f"使用者最新的訊息：{self.current_task}")
+            earlier = [t for t in self.task_history[:-1] if t and t != self.current_task]
+            if earlier:
+                # 任務線：使用者回答追問時最新一句常只剩關鍵字（例如「看 motor_rear_left」），原本要做什麼在前幾句
+                parts.append("這串對話較早的使用者訊息（舊→新；最新訊息可能只是對其中一項的追問，原本的目的看這裡）：\n"
+                             + "\n".join(f"{i}. {t}" for i, t in enumerate(earlier, 1)))
         if self.current_plan:
             parts.append(f"使用者已核准的任務計畫（逐步執行中）：\n{self.current_plan}")
         return "\n".join(parts) if parts else "(未取得使用者原始任務敘述)"
@@ -782,9 +811,16 @@ class SkillAgent:
                 {skills}
                 """
 
+    def set_current_task(self, text):
+        """使用者送出新任務（或回答追問）時呼叫：current_task 是最新一句，task_history 保留最近幾句當任務線。"""
+        self.current_task = text
+        if text:
+            self.task_history = (self.task_history + [text])[-TASK_HISTORY_KEEP:]
+
     def reset_conversation(self):
         self.current_plan = None  # /clear 時一併清掉進行中的計畫，避免舊計畫殘留誤導新任務
         self.current_task = None  # 同上，避免舊任務敘述殘留誤導下一次的摘要 session
+        self.task_history = []
         self.add_trajectory_boundary("clear")  # 軌跡本身保留（/trajectory 仍看得到），只記一個起點
         # 原地替換而不重綁 list：背景壓縮執行緒若正在對舊 list 做原地刪除，不會操作到已被丟棄的物件
         with self.messages_lock:
@@ -1003,6 +1039,7 @@ class SkillAgent:
         """
         parsed = ai_response if isinstance(ai_response, dict) else parse_agent_reply(ai_response)
         action = parsed.get("action")
+        self.last_result_id = self.last_result_file = None   # 只有真的執行腳本（_record_trajectory）才會有存檔
         if not action:
             return None
 
@@ -1050,6 +1087,8 @@ class SkillAgent:
             env = os.environ.copy()
             env["CONTAINER_CWD"] = self.container_cwd
             env["TARGET_CONTAINER"] = self.target_container  # 容器技能省略容器名稱時的預設（比照 cwd）
+            env["TOOL_RESULTS_DIR"] = self.results_dir()     # result_list／result_grep／result_view 的存檔目錄
+            env["HARNESS_SESSION"] = self.session_id         # 讓 result_grep 16 優先解析成目前 session 的 #16
             # 軌跡記錄用：執行「前」的狀態
             cwd_before, container_before, target_before = self.current_cwd, self.container_cwd, self.target_container
 
@@ -1136,9 +1175,103 @@ class SkillAgent:
             "task": (self.current_task or "")[:200],
             "plan_active": bool(self.current_plan),
         }
+        record["result_file"] = self._archive_tool_result(record, output_text)
+        self.last_result_id = record["id"] if record["result_file"] else None
+        self.last_result_file = record["result_file"]
         self.trajectory.append(record)
         self._append_trajectory_log(record)
         return record
+
+    # ---------------------------------------------------------------- 📄 工具結果存檔
+    def results_dir(self):
+        return os.path.join(self.script_dir, "logs", TOOL_RESULTS_DIRNAME)
+
+    def _archive_tool_result(self, record, output_text):
+        """把一次腳本執行的完整原始輸出寫成 logs/tool_results/<session>_<id>_<腳本>.md，並在 index.md 追加一行。
+        檔頭是簡單的 key: value（宿主機不一定有 PyYAML）。寫不進去不影響主流程（回傳 None）。"""
+        try:
+            d = self.results_dir()
+            os.makedirs(d, exist_ok=True)
+            stem = re.sub(r"[^A-Za-z0-9_-]", "_", re.sub(r"(_cmd)?\.py$", "", record["script"]))
+            filename = f"{self.session_id}_{record['id']:03d}_{stem}.md"
+            task = " ".join((record.get("task") or "").split())
+            header = [
+                "---", f"id: {record['id']}", f"session: {self.session_id}", f"ts: {time.strftime('%Y-%m-%d %H:%M:%S')}",
+                f"script: {record['script']}", f"skill: {record.get('skill') or ''}", f"command: {record['command']}",
+                f"cwd: {record['cwd']}", f"container: {record.get('target_container') or ''}", f"status: {record['status']}",
+                f"chars: {len(output_text)}", f"task: {task[:200]}", "---",
+            ]
+            with open(os.path.join(d, filename), "w", encoding="utf-8") as f:
+                f.write("\n".join(header) + "\n" + output_text + ("\n" if not output_text.endswith("\n") else ""))
+            line = (f"#{record['id']} | {time.strftime('%Y-%m-%d %H:%M')} | {record['script']} | {record['status']} | "
+                    f"{len(output_text)} 字 | {filename} | 任務：{task[:60]} | 回答：")
+            with open(os.path.join(d, TOOL_RESULTS_INDEX), "a", encoding="utf-8") as f:
+                f.write(line + "\n")
+            self._prune_tool_results(d)
+            return filename
+        except OSError:
+            return None
+
+    def _prune_tool_results(self, d):
+        """只留最近 TOOL_RESULTS_KEEP 個檔、總大小不超過 TOOL_RESULTS_MAX_MB；刪最舊的並把 index.md 裡對應的行拿掉。"""
+        names = sorted(fn for fn in os.listdir(d) if TOOL_RESULT_FILE_RE.match(fn))   # 檔名＝session_id + 三位數編號，排序即時間順序
+        sizes = {fn: os.path.getsize(os.path.join(d, fn)) for fn in names}
+        total, removed = sum(sizes.values()), []
+        while names and (len(names) > TOOL_RESULTS_KEEP or total > TOOL_RESULTS_MAX_MB * 1024 * 1024):
+            fn = names.pop(0)
+            total -= sizes[fn]
+            os.remove(os.path.join(d, fn))
+            removed.append(fn)
+        if removed:
+            index = os.path.join(d, TOOL_RESULTS_INDEX)
+            if os.path.exists(index):
+                with open(index, encoding="utf-8") as f:
+                    lines = [ln for ln in f.read().splitlines() if not any(f"| {fn} |" in ln for fn in removed)]
+                with open(index, "w", encoding="utf-8") as f:
+                    f.write("\n".join(lines) + ("\n" if lines else ""))
+        return removed
+
+    def update_result_answer(self, result_id, answer):
+        """摘要 session 產出「回答」後回填到 index.md 該筆的「回答：」欄，result_list 一眼就能看到每個存檔在講什麼。"""
+        if not result_id or not answer:
+            return False
+        try:
+            index = os.path.join(self.results_dir(), TOOL_RESULTS_INDEX)
+            with open(index, encoding="utf-8") as f:
+                lines = f.read().splitlines()
+            key = f"#{result_id} | "
+            for i, ln in enumerate(lines):
+                if ln.startswith(key) and f"| {self.session_id}_" in ln:
+                    lines[i] = ln.rsplit("| 回答：", 1)[0] + "| 回答：" + " ".join(answer.split())[:120]
+                    break
+            else:
+                return False
+            with open(index, "w", encoding="utf-8") as f:
+                f.write("\n".join(lines) + "\n")
+            return True
+        except OSError:
+            return False
+
+    def result_file_path(self, ref):
+        """'16'／'#16'（優先目前 session）、'latest'、'index' 或檔名 → 完整路徑；找不到回 None。Web 的 /api/results/<ref> 用。"""
+        d = self.results_dir()
+        if not os.path.isdir(d):
+            return None
+        ref = str(ref or "").strip()
+        if ref == "index":
+            p = os.path.join(d, TOOL_RESULTS_INDEX)
+            return p if os.path.exists(p) else None
+        names = sorted(fn for fn in os.listdir(d) if TOOL_RESULT_FILE_RE.match(fn))
+        if ref.lstrip("#").isdigit():
+            rid = int(ref.lstrip("#"))
+            cands = [fn for fn in names if fn.split("_")[2] == f"{rid:03d}"]
+            mine = [fn for fn in cands if fn.startswith(self.session_id + "_")]
+            chosen = (mine or cands)
+            return os.path.join(d, chosen[-1]) if chosen else None
+        if ref in ("latest", "last"):
+            return os.path.join(d, names[-1]) if names else None
+        base = os.path.basename(ref)
+        return os.path.join(d, base) if base in names else None
 
     def add_trajectory_boundary(self, reason, **extra):
         """在軌跡記一個起點（/clear、計畫核准、make_skill 完成）；連續的起點只留一個。"""
@@ -2005,6 +2138,17 @@ PARALLEL_CAL_DEFAULT = os.environ.get("AGENT_PARALLEL_CAL", "").strip().lower() 
 SKILL_MODEL = os.environ.get("AGENT_SKILL_MODEL", "").strip() or None
 MAKE_SKILL_MAX_PREDICT = 3000
 TRAJECTORY_LOG = "trajectory.jsonl"   # logs/ 下的軌跡稽核記錄（每次腳本執行一行，跨 session 追加；已 .gitignore）
+
+# 📄 工具結果存檔：每次腳本執行的完整原始輸出都存成 logs/tool_results/<session>_<id>_<腳本>.md（key: value 檔頭 + 原文），
+# 並在 index.md 記一行（編號、時間、腳本、狀態、大小、任務、摘要回答）。摘要只讀頭尾、主對話只拿重點，被省略的細節不再是黑洞：
+# 模型用 result_list／result_grep／result_view 三個技能回查，不必重跑觀察型工具。技能規格文件不存（它不是執行結果）。
+# 編號＝軌跡 id（同一個 session 內遞增），/make_skill 與稽核對得上。保留最近 N 個檔且總大小不超過上限，超過刪最舊的。
+TOOL_RESULTS_DIRNAME = "tool_results"
+TOOL_RESULTS_INDEX = "index.md"
+TOOL_RESULTS_KEEP = int(os.environ.get("AGENT_TOOL_RESULTS_KEEP", "200"))
+TOOL_RESULTS_MAX_MB = float(os.environ.get("AGENT_TOOL_RESULTS_MAX_MB", "50"))
+TOOL_RESULT_FILE_RE = re.compile(r"^\d{8}_\d{6}_\d{3,}_.+\.md$")
+TASK_HISTORY_KEEP = 3   # 任務線：摘要錨點帶最近幾則使用者訊息（使用者回答追問時，最新一句往往只是關鍵字，原本要做什麼在前一句）
 TRAJECTORY_OUTPUT_HEAD = 300          # 每筆軌跡保留的輸出開頭字元數（讓草擬模型知道結果長什麼樣）
 DEFAULT_SKILL_CATEGORY = "自建技能"   # 模型選的分類不在 SKILLS.md 裡時的落點（沒有這個段落會自動建立）
 SKILL_NAME_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_]{1,40}$")
@@ -2118,6 +2262,8 @@ TOOL_RESULT_TOKEN_THRESHOLD = 500
 TOOL_SUMMARY_DEFAULT = os.environ.get("AGENT_TOOL_SUMMARY", "1").strip().lower() not in ("0", "off", "false", "no")
 # summarize_tool_result() 產生的內容固定以這個標籤開頭：CLI 據此印出、Web 據此推 🧠 卡片，讓使用者看到主對話實際收到的內容。
 TOOL_SUMMARY_TAG = "[tool result - 任務導向摘要]"
+# _content_for_context 退回「只給成功／失敗判定」時的固定開頭（/summarize off 或摘要 session 失敗）；UI 據此標示 AI 實際收到的是哪一種。
+TOOL_REDUCED_TAG = "[tool result - 已精簡]"
 # 獨立 session 一次最多讀多少原始輸出（字元）：超過就保留頭尾、明確告知中間省略了多少（見 _clip_tool_output）。
 # 16000 字 ≈ 8500 tokens，加上 system prompt 與錨點仍遠低於 NUM_CTX；小記憶體設備可用環境變數調低。
 TOOL_SUMMARY_INPUT_MAX_CHARS = int(os.environ.get("AGENT_TOOL_SUMMARY_INPUT_CHARS", "16000"))
@@ -2133,8 +2279,16 @@ TOOL_SUMMARY_SCHEMA = {
         "facts": {"type": "array", "items": {"type": "string"}},
         "errors": {"type": "array", "items": {"type": "string"}},
         "not_covered": {"type": "string"},
+        "suggested_questions": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {"question": {"type": "string"}, "keywords": {"type": "string"}},
+                "required": ["question", "keywords"],
+            },
+        },
     },
-    "required": ["answer", "facts", "errors", "not_covered"],
+    "required": ["answer", "facts", "errors", "not_covered", "suggested_questions"],
 }
 
 # run_tool 載入技能規格文件時回傳字串的固定開頭。規格文件是「按需載入」機制的核心，
@@ -2180,19 +2334,38 @@ def _content_for_context(result, tool_tokens, agent=None, use_summary=True):
 
     status = "失敗" if result.lstrip().startswith("[ERROR]") else "成功"
     return (
-        f"[tool result - 已精簡]\n"
+        f"{TOOL_REDUCED_TAG}\n"
         f"指令已{status}執行（原始輸出約 {tool_tokens} tokens，超過門檻 {TOOL_RESULT_TOKEN_THRESHOLD}，"
         f"且獨立摘要 session 未啟用或失敗，內容未加入上下文）。完整內容已顯示給使用者；你看不到它，"
         f"需要內容時請換更精確的參數重新執行工具，不要憑空補上結果。"
     )
 
 
-def _context_content_for_cli(agent, result, tool_tokens, use_summary):
-    """CLI 用：算出要餵給主對話的內容；若是獨立 session 的任務導向摘要就印出來，
-    讓使用者看到主對話實際收到什麼（Web Console 以 🧠 卡片顯示同一份內容）。"""
-    content = _content_for_context(result, tool_tokens, agent=agent, use_summary=use_summary)
+def context_kind(content, tool_tokens=None):
+    """主對話實際收到的是哪一種：summary（任務導向摘要）／reduced（只有成功／失敗）／doc（規格文件，完整放行）／raw（完整原文）。
+    CLI 與 Web 用同一個判斷來標示，使用者永遠同時看得到完整原文與 AI 收到的版本。"""
     if content.startswith(TOOL_SUMMARY_TAG):
+        return "summary"
+    if content.startswith(TOOL_REDUCED_TAG):
+        return "reduced"
+    if is_skill_doc_result(content):
+        return "doc"
+    return "raw"
+
+
+def _context_content_for_cli(agent, result, tool_tokens, use_summary):
+    """CLI 用：算出要餵給主對話的內容，並印出「主對話實際收到什麼」：完整原文只印一行提示（原文剛才已完整印過），
+    任務導向摘要與成功／失敗判定整段印出（Web Console 以 🧠 卡片顯示同一份內容）。"""
+    content = _content_for_context(result, tool_tokens, agent=agent, use_summary=use_summary)
+    kind = context_kind(content, tool_tokens)
+    if kind == "summary":
         print(f"\n🧠 獨立 session 任務導向摘要（主對話實際收到的內容）:\n{'-'*30}\n{content}\n{'-'*30}")
+    elif kind == "reduced":
+        print(f"\n🧠 主對話實際收到的內容（只有成功／失敗判定）:\n{'-'*30}\n{content}\n{'-'*30}")
+    elif kind == "doc":
+        print(f"🧠 主對話收到：完整規格文件（≈{tool_tokens} tokens，不受門檻限制）")
+    else:
+        print(f"🧠 主對話收到：完整原文（≈{tool_tokens} tokens，未縮減）")
     return content
 
 def after_turn_compression(agent, parallel, notify):
@@ -2412,7 +2585,7 @@ def main():
             # 記錄這一輪任務最原始的使用者敘述，供獨立摘要 session 在沒有
             # objective／plan 可用時，當作「原始問題」聚焦摘要內容
             # （見 _build_task_anchor_text）
-            agent.current_task = user_msg
+            agent.set_current_task(user_msg)
 
             # 📘 手動載入的技能規格附在這則訊息後面一起送出（與 Web Console 一致）
             content = user_msg
@@ -2454,6 +2627,9 @@ def main():
                     tool_tokens = agent.count_tokens(result)
                     agent.total_tool_tokens += tool_tokens
                     print(f"\n🚀 系統回傳:\n{'-'*30}\n{result}\n{'-'*30}")
+                    if agent.last_result_file:
+                        print(f"📄 已存檔 #{agent.last_result_id}（logs/{TOOL_RESULTS_DIRNAME}/{agent.last_result_file}）；"
+                              f"之後可用 result_grep {agent.last_result_id} <關鍵字> 回查")
                     print(f"🧰 Tool Tokens: {tool_tokens}")
                     if tool_tokens > TOOL_RESULT_TOKEN_THRESHOLD and not is_exempt_result(result, tool_tokens):
                         print(f"⚠️ 此工具回傳約 {tool_tokens} tokens，超過門檻 {TOOL_RESULT_TOKEN_THRESHOLD}，"

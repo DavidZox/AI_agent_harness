@@ -47,6 +47,7 @@ from Agent_Runner import (
     TOOL_RESULT_TOKEN_THRESHOLD,
     TOOL_SUMMARY_DEFAULT,
     TOOL_SUMMARY_TAG,
+    context_kind,
     tool_result_message,
     MIN_COMPRESS_TOKENS,
     PARALLEL_CAL_DEFAULT,
@@ -320,12 +321,25 @@ def _current_tool_action():
     return (agent._last_assistant_step() or {}).get("action")
 
 
+def _emit_context_event(content, events, tool_tokens=None):
+    """每次工具結果決定好要餵給主對話什麼之後，都推一個「AI 實際收到的內容」事件到右欄，緊接在完整原文卡片之後：
+    summary（任務導向摘要）與 reduced（只有成功／失敗）整段顯示；raw／doc（完整原文、規格文件）只給一行提示，
+    因為上一張卡片就是同一份內容。使用者永遠同時看得到完整原文與 AI 收到的版本。"""
+    kind = context_kind(content, tool_tokens)
+    n = agent.count_tokens(content)
+    if kind == "summary":
+        events.append({"channel": "summary", "kind": kind, "text": content, "tokens": n})
+    elif kind == "reduced":
+        events.append({"channel": "summary", "kind": kind, "text": content, "tokens": n})
+    elif kind == "doc":
+        events.append({"channel": "summary", "kind": kind, "text": f"完整規格文件（≈{n} tokens，不受門檻限制），與上方卡片相同。", "tokens": n})
+    else:
+        events.append({"channel": "summary", "kind": kind, "text": f"完整原文（≈{n} tokens，未縮減），與上方系統回傳卡片相同。", "tokens": n})
+
+
 def _emit_summary_event(content, events):
-    """若這次餵給 AI 的內容是獨立摘要 session 產生的，額外推一個事件到
-    前端的「系統 / 工具回傳」面板，讓使用者也能看到摘要結果，
-    而不是只能從主對話推測 AI 收到了什麼。"""
-    if content.startswith(_SUMMARY_TAG):
-        events.append({"channel": "summary", "text": content})
+    """舊名稱，保留給外部呼叫；等同 _emit_context_event。"""
+    _emit_context_event(content, events)
 
 
 DEFAULT_VISION_PROMPT = "請描述這些影像的內容，並逐字列出可見的文字、數值、錯誤訊息與任何值得注意的異常。"
@@ -500,6 +514,8 @@ def run_turn(events):
                 "text": result,
                 "tokens": tool_tokens,
                 "oversized": oversized,
+                "result_id": agent.last_result_id,      # 📄 存檔編號（規格載入時為 None）；卡片顯示並可開啟 /api/results/<id>
+                "result_file": agent.last_result_file,
             })
             if oversized:
                 events.append({
@@ -527,7 +543,7 @@ def run_turn(events):
             content = _content_for_context(
                 result, tool_tokens, agent=agent, use_summary=state["tool_summary_mode"]
             )
-            _emit_summary_event(content, events)
+            _emit_context_event(content, events, tool_tokens)
             agent.messages.append({'role': 'user', 'content': tool_result_message(content, _current_tool_action())})
             events.append({"channel": "system", "text": "♻️ Auto Continue 中..."})
             continue
@@ -558,7 +574,7 @@ def apply_decision(action, events):
             content = _content_for_context(
                 result, tool_tokens, agent=agent, use_summary=state["tool_summary_mode"]
             )
-            _emit_summary_event(content, events)
+            _emit_context_event(content, events, tool_tokens)
             agent.messages.append({'role': 'user', 'content': tool_result_message(content, _current_tool_action())})
         else:
             _append_discarded_tool_result(agent)
@@ -569,7 +585,7 @@ def apply_decision(action, events):
         content = _content_for_context(
             result, tool_tokens, agent=agent, use_summary=state["tool_summary_mode"]
         )
-        _emit_summary_event(content, events)
+        _emit_context_event(content, events, tool_tokens)
         agent.messages.append({'role': 'user', 'content': tool_result_message(content, _current_tool_action())})
         return True
     if action == "stop":
@@ -761,6 +777,12 @@ HTML_PAGE = r"""<!DOCTYPE html>
   .entry.thought .tag { color: #8f96a0; opacity: 1; }
   .entry.summary { background: #241f33; border: 1px solid #5a4a8f; color: #cfc3f0; }
   .entry.summary .tag { color: #b39ddb; opacity: 1; }
+  .entry.summary.reduced { background: #332a1f; border-color: #8f6a4a; color: #f0dcc3; }
+  .entry.summary.reduced .tag { color: #dbb59d; }
+  .entry.summary.raw, .entry.summary.doc { background: transparent; border: 1px dashed #5a4a8f; color: #9d94b5; padding: 4px 8px; font-size: 12px; }
+  .entry.summary.raw .tag, .entry.summary.doc .tag { color: #9d94b5; }
+  .entry .result-link { display: block; margin-top: 4px; font-size: 12px; color: #8ab4f8; text-decoration: none; }
+  .entry .result-link:hover { text-decoration: underline; }
   .entry.plan { background: #16302c; border: 1px solid #2f6f5e; }
   .entry.plan .tag { color: #4fd8ba; opacity: 1; }
   .entry.skilldraft { background: #26203a; border: 1px solid #6d5aa8; font-family: "Cascadia Code", Consolas, monospace; font-size: 12px; }
@@ -942,6 +964,18 @@ function renderEntry(container, cls, tag, text, oversized) {
   container.scrollTop = container.scrollHeight;
 }
 
+function attachResultLink(container, id) {
+  // 📄 工具結果存檔：卡片下方加一個連結開啟原文，使用者才知道對話裡的「存檔 #16」是什麼
+  const entry = container.lastElementChild;
+  if (!entry) return;
+  const a = document.createElement('a');
+  a.className = 'result-link';
+  a.href = '/api/results/' + id;
+  a.target = '_blank';
+  a.textContent = `開啟結果檔 #${id}（AI 可用 result_grep ${id} <關鍵字> 回查）`;
+  entry.appendChild(a);
+}
+
 function renderEvents(events) {
   events.forEach(ev => {
     if (ev.channel === 'chat') {
@@ -956,9 +990,18 @@ function renderEvents(events) {
     } else if (ev.channel === 'vision') {
       renderEntry(toolLog, 'vision', `🖼️ 視覺分析（獨立 session，${ev.count} 張影像）`, ev.text, ev.oversized);
     } else if (ev.channel === 'tool') {
-      renderEntry(toolLog, 'tool', '系統回傳', ev.text, ev.oversized);
+      renderEntry(toolLog, 'tool', '系統回傳' + (ev.result_id ? ` · 📄 已存檔 #${ev.result_id}` : ''), ev.text, ev.oversized);
+      if (ev.result_id) attachResultLink(toolLog, ev.result_id);
     } else if (ev.channel === 'summary') {
-      renderEntry(toolLog, 'summary', '🧠 任務導向摘要（獨立 session，AI 實際收到的內容）', ev.text);
+      // 每次工具回傳都會有這張：AI 實際收到的內容（緊接在完整原文卡片之後）
+      const kind = ev.kind || 'summary';
+      const labels = {
+        summary: '🧠 AI 實際收到的內容：任務導向摘要（獨立 session）',
+        reduced: '🧠 AI 實際收到的內容：只有成功／失敗判定（/summarize off 或摘要失敗）',
+        raw: '🧠 AI 實際收到的內容：完整原文',
+        doc: '🧠 AI 實際收到的內容：完整規格文件',
+      };
+      renderEntry(toolLog, 'summary ' + kind, labels[kind] || labels.summary, ev.text);
     } else if (ev.channel === 'plan') {
       renderEntry(chatLog, 'plan', '📝 計畫（待你確認）', ev.text);
     } else if (ev.channel === 'skilldraft') {
@@ -1436,6 +1479,21 @@ class ConsoleHandler(BaseHTTPRequestHandler):
             # 「/」選單的內容：功能開關／指令 + SKILLS.md 技能清單（含分類、是否有經驗記憶）
             self._send_json({"commands": SLASH_COMMANDS, "skills": agent.list_skills()})
             return
+        if self.path.startswith("/api/results/"):
+            # 📄 工具結果存檔原文：/api/results/<編號|latest|index|檔名>（純文字；讓使用者點卡片上的編號就能看整份原文）
+            from urllib.parse import unquote
+            path = agent.result_file_path(unquote(self.path[len("/api/results/"):]))
+            if not path:
+                self.send_error(404, "no such tool result")
+                return
+            with open(path, "rb") as f:
+                body = f.read()
+            self.send_response(200)
+            self.send_header("Content-Type", "text/plain; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+            return
         static = vision_static_file(self.path)
         if static:
             body, content_type = static
@@ -1585,7 +1643,7 @@ class ConsoleHandler(BaseHTTPRequestHandler):
         # 記錄這一輪任務最原始的使用者敘述，跟 CLI 版（Agent_Runner.main）
         # 行為一致，供獨立摘要 session 在沒有 objective／plan 可用時，
         # 當作「原始問題」聚焦摘要內容（見 SkillAgent._build_task_anchor_text）
-        agent.current_task = message
+        agent.set_current_task(message)
 
         # 有附加影像：先跑獨立視覺 sub-session，把分析結果以文字併入這次的使用者訊息，
         # 之後不論是 plan 模式還是直接執行，主 Agent 拿到的都是「原文 + 影像分析」的純文字

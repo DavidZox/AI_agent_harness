@@ -37,8 +37,11 @@
 - [overpending_cancel](tools/overpending_cancel.md) — 刪除卡在 distribute OverPending 逾時區的單站任務；不在逾時區時可等它進來再刪
 - [semantic_map](tools/semantic_map.md) — 語義地圖：站點代號／語意名稱／說明／路段，對應目前機器人與工作包位置；也可只列站點或機器人
 
+## 工具結果存檔
+- [result_list](tools/result_list.md) — 列出最近的工具結果存檔（編號、腳本、任務、摘要回答）；先看這個再決定搜哪一個
+- [result_grep](tools/result_grep.md) — 在指定編號（或 latest／all）的存檔裡搜關鍵字（a|b 同義詞、前後幾行）；使用者追問細節時用，不要重跑工具
+- [result_view](tools/result_view.md) — 讀某個存檔的第 N 行起 M 行，看 grep 命中處的整段原文
+
 ## 記憶修改
 - [modify_memory](tools/modify_memory.md) — 寫入經驗記憶：預設全域常駐；加 `--skill <技能名稱>` 綁定該技能，只在載入其規格時出現
 
-## 自建技能
-- [try_deep_search](tools/try_deep_search.md) — 當使用者要求尋找特定關鍵字相關的技能資料夾，並進入該資料夾進行後續操作時使用。

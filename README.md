@@ -17,7 +17,7 @@
 | `AGENT.md` | 系統提示詞主體：角色、JSON 回覆格式、兩階段執行協議、安全原則、記憶協議（約 2100 tokens 預算） |
 | `skills_system/SKILLS.md` | 技能索引（永遠在提示詞裡）；`tools/<name>.md` 規格按需載入；`scripts/<name>_cmd.py` 實際執行 |
 | `Memory.md`／`skills_system/memory/` | 全域常駐記憶／綁定技能的經驗記憶（`modify_memory` 寫入） |
-| `logs/` | 滾動摘要歸檔、操作軌跡 `trajectory.jsonl`、`/make_skill` 稽核（已 `.gitignore`） |
+| `logs/` | 滾動摘要歸檔、操作軌跡 `trajectory.jsonl`、工具結果存檔 `tool_results/`、`/make_skill` 稽核（已 `.gitignore`） |
 | `doc/` | 本文件用的兩張 PlantUML 圖與產生器 |
 
 **技能分四群**（第 3 節）：檔案系統；容器與 ROS2（共用 `_docker_common.py`）；調度系統（五個 `workpackage_*`／`overpending_cancel`／`semantic_map`，共用 `_rmf_common.py`）；多模態與記憶。`/make_skill` 可把做對的步驟序列編譯成組合技能（`_composite.py`）。
@@ -32,11 +32,11 @@
 
 ![AI_agent_harness 核心邏輯架構](doc/images/AI_agent_harness的說明.png)
 
-上圖是元件與資料流：使用者介面只負責互動；`SkillAgent` 組提示詞、解析回覆、派發執行；模型只產出 JSON；技能系統分索引、規格、腳本三層；腳本去碰真正的環境，並以 `[PASS]`／`[ERROR]` 與狀態標記回報；記憶與紀錄在最外圈。
+上圖是元件與資料流：使用者介面只負責互動（左欄 reply、右欄完整原文卡片與「已存檔 #id」連結、摘要卡片、決策按鈕）；`SkillAgent` 組提示詞、解析回覆、派發執行、處理結果；主 session 只產出 JSON；四種一次性獨立 session（工具摘要、滾動壓縮、視覺、make_skill 草擬）都是無狀態單次呼叫、不接觸主對話；技能系統分索引、規格、腳本三層，數量、排序、門檻由腳本算；腳本去碰真正的環境，並以 `[PASS]`／`[ERROR]` 與狀態標記回報；記憶與紀錄除了常駐記憶與滾動摘要，還有每次工具回傳的完整原文存檔，`result_list`／`result_grep`／`result_view` 直接讀它回查、不重跑工具。
 
 ![AI_agent_harness 一回合的狀態機](doc/images/AI_agent_harness的狀態轉移.png)
 
-上圖是一回合內的狀態轉移：1 收訊息 → 2 組提示詞（硬水位檢查）→ 3 模型回 JSON → 4 只看 `action` 分派：`null` 結束、技能名稱注入規格後回到 3、腳本路徑進入 5 執行 → 6 處理結果（同步狀態、記軌跡、門檻精簡、manual／hybrid／auto 決策）→ 回到 3 或結束 → 7 回合結束後做軟水位壓縮。Plan 模式與 `/make_skill` 掛在主流程旁邊，前者在核准後才進入 2，後者從軌跡取材、不在回合之內。
+上圖是一回合內的狀態轉移：1 收訊息（slash 由 harness 處理；文字任務記任務線；附圖先走視覺 session）→ 2 組提示詞（硬水位檢查）→ 3 主 session 回 JSON → 4 只看 `action` 分派：`null` 結束、技能名稱把規格文件當工具回傳直接進 6c、腳本路徑進入 5 執行 → 6a 落地（同步狀態、記軌跡、原文存檔 #id、完整顯示給使用者）→ 6b 決定進主對話的內容（規格文件或 ≤500 tokens 原文；>500 交獨立摘要 session，得到回答、事實、可追問與存檔編號；關閉或失敗只給成功／失敗）→ 6c 包框架句後依 manual／hybrid／auto 決策 → 回到 3 或結束 → 7 回合結束後做軟水位壓縮。8 是下一回合的追問回查：模型改用 `result_grep` 在存檔裡搜，不重跑工具。Plan 模式與 `/make_skill` 掛在主流程旁邊。
 
 ---
 
@@ -108,6 +108,8 @@ Web Console 另有 `MAX_AUTO_ITERATIONS = 25`：Auto 模式連續執行工具超
 **工具回傳的任務導向摘要（預設開啟；`/summarize off` 或 `AGENT_TOOL_SUMMARY=0` 關閉）**：超過門檻的工具回傳一律由 `summarize_tool_result()` 開一個獨立、乾淨的一次性 session 處理，這是「原始上下文 + 當前問題」式的壓縮（context-aware compression），不是通用摘要。獨立 session 收到三樣東西：完整原始輸出（超過 `TOOL_SUMMARY_INPUT_MAX_CHARS` 時保留頭尾並標明省略）、**使用者的目標**（`_build_task_anchor_text()`：Objective、這一輪任務的原始敘述、已核准的計畫）、**這一步的目的**（`_last_assistant_step()`：決策模型剛才的 `thought`／`reply` 與執行的 `action`——在 agent 迴圈裡，比使用者的原話更精確的「當前問題」）。prompt 把它定位成資訊過濾器：只留與目標直接相關的事實，名稱與數值照抄、不推測、不給建議，並用 `not_covered` 明說原始輸出沒有涵蓋什麼。輸出以 `format=TOOL_SUMMARY_SCHEMA`（answer／facts／errors／not_covered）強制結構，排成「執行結果／回答／相關事實／錯誤／未涵蓋」加一段附註（告訴主模型它看不到原文、需要其他資訊就換參數重查），解析失敗退回模型原文，session 失敗退回成功／失敗判定。CLI 印出「🧠 獨立 session 任務導向摘要」、Web 以紫色 🧠 卡片顯示，兩者都是主對話實際收到的內容。**沒有腳本自帶的豁免**：`ROS2_topic_echo --duration` 等分析型技能改成回傳完整資訊（統計 + 全部原始訊息），什麼重要由知道任務的獨立 session 決定。代價是每次超過門檻多一次模型呼叫（同模型時與主對話序列執行）。
 
 **數值交給腳本算，摘要只做過濾**：實測 gemma4:e4b 對「哪個檔案最新」「幾個 topic 含 costmap」這類比較／計數題 0/5 答對，開 `think=True` 也只有 2/5 且一次 17 秒；26b 開推論才 3/3，但一次 35～60 秒。所以比較、計數、排序、門檻判斷全部放進腳本：`list_dir` 標頭給數量與「最新修改」、`--filter`／`--newest`；`find_file`／`search_text` 標頭給數量；`ROS2_topic_list`／`ROS2_node_list` 的 `--filter` 計數；`ROS2_topic_echo --where 欄位<值` 算出幾則符合、第一則符合的序號與值。摘要 prompt 規定腳本算好的數字直接照抄、不得重數或推翻；各規格文件要求模型遇到這類問題改用對應選項。摘要 session 維持 `think=False`。
+
+**工具結果存檔與回查（`result_list`／`result_grep`／`result_view`）**：摘要會丟細節、原文進主對話會污染上下文，兩者都不選：每次腳本執行的完整原始輸出由 `_record_trajectory()` 順手存成 `logs/tool_results/<session>_<編號>_<腳本>.md`（簡單 key: value 檔頭：編號、時間、腳本、指令、cwd、容器、狀態、字數、當時的任務；不用 PyYAML），並在 `index.md` 記一行；摘要 session 產出的「回答」會回填到索引那一行。編號＝軌跡 id，`/make_skill` 與稽核對得上。技能規格文件不存（它不是執行結果）。摘要 schema 多了 `suggested_questions`（最多 3 個「可追問」，各附可搜尋的關鍵字），附註改成「細節用 `result_grep <編號> <關鍵字>` 搜，不要重跑工具」——觀察型技能不必再等一次擷取，摘要只讀頭尾時被省略的中段也搜得到。交握原則寫在規格文件與附註裡（`AGENT.md` 沒有預算）：使用者的要求明確就直接回答並提存檔編號；探索型（看一下／觀察一下）才把可追問列給使用者選。使用者回答追問時最新一句常只剩關鍵字，所以摘要錨點帶「任務線」——最近 3 則使用者訊息（`task_history`）。`result_grep` 的輸出走一樣的門檻：超過 500 tokens 交給獨立 session（它拿到的正是使用者的追問），沒超過直接進主對話。安全：正則長度上限 200、逐行比對帶 3 秒預算（防災難性回溯）、路徑只取檔名鎖在存檔目錄；保留最近 200 個檔且總量 50 MB（`AGENT_TOOL_RESULTS_KEEP`／`AGENT_TOOL_RESULTS_MAX_MB`），刪最舊的並同步索引；`logs/` 已 `.gitignore`（輸出可能含敏感內容）。CLI 印「📄 已存檔 #16」，Web 卡片標題帶編號並可點開 `/api/results/<編號>` 看原文。
 
 **訊息則數視窗停用**：`SkillAgent(max_history=None)` 是預設，上下文大小只由 token 門檻決定，舊內容一律摘要歸檔而不是無聲丟棄；`max_history` 只保留為可選保險絲。
 
@@ -211,7 +213,15 @@ Web Console 另有 `MAX_AUTO_ITERATIONS = 25`：Auto 模式連續執行工具超
 | `stt_engine` | 錄音 10 秒並以 Whisper 辨識 | `stt_engine_cmd.py` | 綁死作者環境，見 6 |
 | `modify_memory` | 寫入經驗記憶（全域或 `--skill`） | `modify_memory_cmd.py` | 見 2.7 |
 
-### 3.5 組合技能（`/make_skill` 產生）
+### 3.5 工具結果存檔（`_results_common.py`）
+
+| 技能 | 做什麼 | 腳本 | 重點 |
+| :--- | :--- | :--- | :--- |
+| `result_list` | 列最近的存檔索引 | `result_list_cmd.py` | 預設目前 session 最近 20 筆（新→舊），每行含編號、腳本、狀態、大小、當時任務、摘要回答；`--all` 含之前 session |
+| `result_grep` | 在存檔裡搜關鍵字 | `result_grep_cmd.py` | `<編號|latest|all> <關鍵字> [-C n] [--max m] [--block]`：`a|b` 同義詞、正則、不分大小寫；標頭給每檔命中數；`--block` 回整則 `--- #k` 訊息（echo 存檔）；`all`＝目前 session 最近 20 檔；輸出上限 12000 字 |
+| `result_view` | 讀存檔的一段原文 | `result_view_cmd.py` | `<編號|latest> [--from 行] [--lines n]`，行號與 grep 一致，預設 80 行、上限 300 |
+
+### 3.6 組合技能（`/make_skill` 產生）
 
 資料型腳本 + `_composite.py`，見 2.10；註冊後與其他技能無異，依索引描述被選到、載規格、執行。
 
@@ -225,7 +235,7 @@ AI_agent_harness/
 ├── web_console.py           # Web 版介面，重用 Agent_Runner 的邏輯
 ├── AGENT.md                 # 系統提示詞主體：角色、JSON 回覆格式、執行協議、安全原則、記憶協議
 ├── Memory.md                # 全域長期記憶（modify_memory 不加 --skill 時寫入，每輪常駐）
-├── logs/                    # 滾動摘要歸檔（.md + .json，只留最近 30 份）、trajectory.jsonl、make_skill 稽核；已 .gitignore
+├── logs/                    # 滾動摘要歸檔（.md + .json，只留最近 30 份）、trajectory.jsonl、tool_results/（每次工具回傳的原文 + index.md）、make_skill 稽核；已 .gitignore
 ├── doc/
 │   ├── AI_agent_harness的說明.puml      # 架構圖來源
 │   ├── AI_agent_harness的狀態轉移.puml  # 一回合狀態機來源
@@ -273,7 +283,7 @@ python3 Agent_Runner.py
 python3 web_console.py
 ```
 
-預設監聽 `http://127.0.0.1:8765`（只綁本機）。畫面左欄「使用者 ↔ Agent 對話」、右欄「系統 / 工具回傳」（規格載入、腳本結果、💭 thought、系統通知、🧠 任務導向摘要、🖼️ 視覺分析卡片）。輸入框打「/」彈出選單（上半指令、下半 `SKILLS.md` 技能，選技能等同 `/skill`），`/menu` 列出全部指令與說明。Manual／Hybrid 模式下工具執行後出現決策按鈕；Plan 模式出現核准／取消按鈕；`/make_skill` 出現核准／重播驗證／取消按鈕；📷 可框選畫面或選檔附圖。標題列：mode、cwd、container（目標容器）、tokens 與 ctx 水位。後端端點：`POST /api/send`、`POST /api/decision`、`GET /api/status`、`GET /api/commands`、`/api/skill/*`、`/api/vision/*`。
+預設監聽 `http://127.0.0.1:8765`（只綁本機）。畫面左欄「使用者 ↔ Agent 對話」、右欄「系統 / 工具回傳」（規格載入、腳本結果、💭 thought、系統通知、🧠 AI 實際收到的內容、🖼️ 視覺分析卡片）。每次工具回傳固定兩張卡：先是完整原文（含「📄 已存檔 #id」連結，超過門檻標 ⚠️），緊接著是「AI 實際收到的內容」——任務導向摘要或成功／失敗判定整段顯示，完整原文或規格文件則只標一行「與上方相同」；hybrid／manual 模式下第二張在你按下加入後才出現。輸入框打「/」彈出選單（上半指令、下半 `SKILLS.md` 技能，選技能等同 `/skill`），`/menu` 列出全部指令與說明。Manual／Hybrid 模式下工具執行後出現決策按鈕；Plan 模式出現核准／取消按鈕；`/make_skill` 出現核准／重播驗證／取消按鈕；📷 可框選畫面或選檔附圖。標題列：mode、cwd、container（目標容器）、tokens 與 ctx 水位。後端端點：`POST /api/send`、`POST /api/decision`、`GET /api/status`、`GET /api/commands`、`/api/skill/*`、`/api/vision/*`。
 
 | 環境變數 | 預設值 | 說明 |
 | :--- | :--- | :--- |
@@ -286,6 +296,7 @@ python3 web_console.py
 | `AGENT_PARALLEL_CAL` | 未設定＝關閉 | `/parallel_cal` 的啟動預設值 |
 | `AGENT_TOOL_SUMMARY` | `1`＝開啟 | `/summarize` 的啟動預設值（`0` 改回只給成功／失敗判定） |
 | `AGENT_TOOL_SUMMARY_INPUT_CHARS` | `16000` | 獨立摘要 session 一次最多讀多少字元的原始輸出 |
+| `AGENT_TOOL_RESULTS_KEEP` / `AGENT_TOOL_RESULTS_MAX_MB` | `200` / `50` | `logs/tool_results/` 保留的檔數與總大小上限，超過刪最舊的 |
 | `AGENT_SKILL_MODEL` | 同摘要模型 | `/make_skill` 草擬用的模型 |
 | `VISION_MODEL` / `VISION_TIMEOUT` | `gemma4:e4b` / `180` | 視覺 sub-session 的模型與逾時秒數 |
 | `RMF_WEB_CONSOLE_URL` | `http://localhost:8020` | 調度系統技能的 web_console 位址（各腳本也接受 `--url`） |
@@ -309,7 +320,8 @@ python3 web_console.py
 9. **`/make_skill` 的草稿品質受模型限制**：哪些值該參數化、索引描述是否讓之後的模型選得到，都是草擬模型的判斷；框架保證「錯不會傳下去」（對不上就退回原值、漏填照原值納入、預覽列出每項修正），最終靠使用者檢查。可用 `AGENT_SKILL_MODEL` 換較大的模型。
 10. **JSON 協議下的空白回覆**：模型在字串裡用英文雙引號時會發生，屬機率性；框架自動重試一次並在提示詞禁用英文雙引號，重試仍空白時如實顯示。
 11. **任務導向摘要受摘要模型與輸入上限限制**：擷取得對不對取決於 `SUMMARY_MODEL`（預設同主模型）；需要比較或計數的問題要靠腳本選項先算好（2.5「數值交給腳本算」），摘要模型自己數會錯；原始輸出超過 16000 字只讀頭尾，中間的內容只剩腳本自帶的統計（如 `ROS2_topic_echo` 的欄位變化）可依靠；主模型看不到原文，只能靠摘要裡的「未涵蓋」提示換參數重查。每次超過門檻多一次模型呼叫、同模型時與主對話序列執行，觀察型技能幾乎每次都會觸發。組合技能的多步驟總輸出也走同一條路；重播驗證只驗證會不會 `[PASS]`、不比對內容，且會真的執行有副作用的步驟。
-12. **調度系統技能依賴 web_console 的版本**：`semantic_map` 需要 `/api/topology` 端點，舊版 web_console 會回 404；OverPending 的時序常數（`threshold_ovp_sec`、`threshold_recovery_sec`）以 distribute 的設定為準，規格裡的「約 10 秒」是預設值。
+12. **`result_grep` 是文字比對**：關鍵字要在原文裡出現才搜得到（同義詞靠 `a|b` 自己列），語意相近但字面不同的東西找不到；命中以行為單位，結構化內容用 `--block` 或 `result_view` 補整段。存檔依 200 檔／50 MB 輪替，太舊的會被刪。
+13. **調度系統技能依賴 web_console 的版本**：`semantic_map` 需要 `/api/topology` 端點，舊版 web_console 會回 404；OverPending 的時序常數（`threshold_ovp_sec`、`threshold_recovery_sec`）以 distribute 的設定為準，規格裡的「約 10 秒」是預設值。
 
 ---
 
@@ -323,9 +335,9 @@ python3 web_console.py
 
 第一階段（2.10）只支援「既有步驟的序列」。第二階段是讓較大的模型草擬腳本到 `drafts/`，harness 以軌跡中的實際案例當測試 oracle 反覆執行、餵回錯誤讓它修正，通過且經使用者審核後才註冊；也可在 Plan 模式所有步驟完成時主動詢問「要做成技能嗎」，並把修正過程中的失敗嘗試自動寫成該技能的 `memory/<name>.md`。
 
-### 7.3 回到原始輸出重新抽取（re-query），而不是只能重跑工具
+### 7.3 滾動摘要也回到原始訊息重新抽取
 
-任務導向摘要只回答「這一步的目的」；主模型事後想從同一份輸出確認別的事（摘要的「未涵蓋」提到的部分），現在只能換參數重新執行工具——對觀察型技能就是再等一次 `--duration`。原始輸出其實 harness 都拿過：下一步是把超過門檻的原始輸出存到 `logs/tool_results/<id>.txt`，摘要附註帶上 id，並加一個 `recall_result <id> "<問題>"` 技能，用新的問題對**原始文字**再開一次獨立 session 抽取——這正是「回到原始上下文重新抽取」而不是「摘要的摘要」。同一個道理也適用於滾動摘要：`compress_context_to_file()` 目前是「上一份摘要 + 新片段 → 新摘要」的滾動式壓縮，細節會逐輪流失；歸檔時若連同被壓掉的原始訊息一起存（`logs/summary_*.json` 現在只存摘要），日後就能以「原始訊息 + 當前任務」重新抽取。
+工具回傳這一側的「回到原始輸出」已經做了（2.5 的存檔與 `result_grep`）。同一個道理還沒套到滾動摘要：`compress_context_to_file()` 是「上一份摘要 + 新片段 → 新摘要」的滾動式壓縮，細節會逐輪流失；歸檔時若連同被壓掉的原始訊息一起存（`logs/summary_*.json` 現在只存摘要），日後就能以「原始訊息 + 當前任務」重新抽取，甚至讓 `result_grep` 也能搜對話歷史。另一個延伸：存檔保留了 `ROS2_topic_echo` 的原始 YAML，可以對舊的擷取重跑 `--where` 門檻判斷，不必再等一次觀察。
 
 ### 7.4 `Memory.md` 的內化與整併
 
