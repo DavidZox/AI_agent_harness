@@ -7,6 +7,7 @@ import ollama  # 導入官方庫
 import shlex
 import time
 import re
+from skills_system.scripts import _results_common  # result_ask 偽技能重用存檔解析（resolve_result／read_header／read_lines）
 
 class SkillAgent:
     def __init__(self, model="gemma4:e4b", max_history=None, summary_model=None):
@@ -551,6 +552,13 @@ class SkillAgent:
         return (f"{result[:head]}\n\n…（原始輸出過長，此處省略中間 {omitted} 字元；以下是結尾部分）…\n\n{result[-tail:]}", omitted)
 
     @staticmethod
+    def _gap_reported(not_covered):
+        """not_covered 欄位是否代表「真的有缺口」（而不是模型寫「無」「沒有」這類空值的各種說法）。
+        _render_tool_summary 用它決定要不要印「未涵蓋」；summarize_tool_result 的自動追問迴圈用它決定要不要再跳一次。"""
+        text = str(not_covered or "").strip()
+        return bool(text) and text.rstrip("。.") not in ("無", "沒有", "none", "None", "N/A", "n/a")
+
+    @staticmethod
     def _render_tool_summary(data, result_id=None):
         """把 TOOL_SUMMARY_SCHEMA 的 JSON 排成固定結構的純文字（回答／相關事實／錯誤／未涵蓋／可追問）。"""
         if not isinstance(data, dict):
@@ -569,7 +577,7 @@ class SkillAgent:
             lines.append("錯誤／異常：")
             lines += [f"- {e}" for e in errors]
         not_covered = str(data.get("not_covered") or "").strip()
-        if not_covered and not_covered.rstrip("。.") not in ("無", "沒有", "none", "None", "N/A", "n/a"):
+        if SkillAgent._gap_reported(not_covered):
             lines.append(f"未涵蓋：{not_covered}")
         questions = [q for q in (data.get("suggested_questions") or []) if isinstance(q, dict) and str(q.get("question") or "").strip()][:3]
         if questions:
@@ -577,6 +585,53 @@ class SkillAgent:
             lines.append(f"可追問{where}：")
             lines += [f"- {str(q['question']).strip()} ← 關鍵字：{str(q.get('keywords') or '').strip() or '（未給）'}" for q in questions]
         return "\n".join(lines)
+
+    def _extract_task_oriented(self, raw_text, purpose_text, tool_tokens, omitted=0):
+        """任務導向擷取的核心呼叫（summarize_tool_result 的第一輪、自動追問的每一跳、_result_ask 共用）。
+        raw_text 是要讀的原文，purpose_text 是錨點（可以是「使用者目標＋這一步的目的」，也可以是使用者的一句追問——
+        呼叫端決定錨在什麼問題上，這裡不管錨點從哪來）。規則要求名稱與數值照抄、不推測、不給建議，並用 not_covered
+        明說原始輸出沒有涵蓋什麼。結構以 format=TOOL_SUMMARY_SCHEMA 強制。
+        回傳 (data, structured, raw_model_text)：JSON 解析失敗時 data=None、structured=False，
+        呼叫端可退回 raw_model_text（模型原文，總比丟掉整段輸出好）。"""
+        system_prompt = f"""你是一個「資訊過濾器」：把一支工具（腳本）執行後的完整原始輸出，依 user 訊息開頭提供的使用者目標／問題擷取成精簡的重點，交給另一個負責決策的 AI。那個 AI 看不到原始輸出，只看得到你的擷取結果。
+
+規則：
+1. 只保留與使用者目標或問題直接相關的事實、數值、名稱、錯誤；樣板文字、排版、重複內容、與任務無關的欄位一律捨棄。
+2. 名稱與數值一律照抄原文：topic／node／容器／檔案／路徑／站點／任務 id、數值與單位、錯誤訊息，都不要改寫、四捨五入或概括成「一些」「若干」。
+3. 只陳述原始輸出裡有的內容，不要推測、補充背景或給建議；原始輸出沒有的就寫進 not_covered。
+4. 使用者的目標／問題若在原始輸出裡找不到答案，answer 要直接寫「輸出中沒有…」，並在 not_covered 說明缺什麼。
+5. 原始輸出若標示「省略中間 N 字元」，被省略的部分不可假設，要寫進 not_covered。
+6. 數量、排序與門檻判斷以原始輸出裡腳本算好的結果為準（例如「共 N 個」「最新修改：」「條件 …：第一則符合 #k」），直接照抄、不要自己重數或推翻；原始輸出沒有算好而必須比較時，逐一核對原文並在 facts 引用依據（序號、原文數值或時間），無法確定就寫進 not_covered，不要猜。
+7. 精簡：answer 一句話（含關鍵數值或名稱）；facts 每項一句、不超過 60 字；全部合計不超過 {TOOL_SUMMARY_MAX_CHARS} 字。
+8. suggested_questions：使用者接下來可能想知道、但目標／問題沒問到、且原始輸出裡有資料可答的問題，最多 3 個；每個附 keywords＝在原始輸出裡搜得到的關鍵字（同義詞用 | 分隔，可含正則）。使用者的要求已經明確、輸出也已回答時給空陣列，不要硬湊。
+
+輸出 JSON 物件：
+- answer：一句話直接回答使用者的目標／問題。
+- facts：與任務相關的事實清單（名稱、數值照抄）。
+- errors：原始輸出中的錯誤／警告／異常，照抄原文；沒有就空陣列。
+- not_covered：原始輸出沒有涵蓋、或因篇幅被省略而無法確認的部分；沒有就寫「無」。
+- suggested_questions：[{{question, keywords}}] 可追問的問題與搜尋關鍵字，最多 3 個。
+"""
+        user_prompt = (
+            f"{purpose_text}\n\n"
+            f"【工具的完整原始輸出（約 {tool_tokens} tokens{'，過長已保留頭尾' if omitted else ''}）】\n{raw_text}"
+        )
+        res = ollama.chat(
+            model=self.summary_model,
+            messages=[
+                {'role': 'system', 'content': system_prompt},
+                {'role': 'user', 'content': user_prompt},
+            ],
+            format=TOOL_SUMMARY_SCHEMA,
+            options={'temperature': 0.2, 'num_ctx': NUM_CTX, 'num_predict': TOOL_SUMMARY_MAX_PREDICT},
+            think=False,
+        )
+        raw = res['message']['content'].strip()
+        try:
+            data = json.loads(raw)
+        except (ValueError, TypeError):
+            return None, False, raw
+        return (data, True, raw) if isinstance(data, dict) else (None, False, raw)
 
     def summarize_tool_result(self, result, tool_tokens, step=None, result_id=None):
         """任務導向摘要（Task-Oriented Summarization）：開一個獨立、乾淨的一次性 session（自己的 system/user
@@ -590,7 +645,15 @@ class SkillAgent:
         原始輸出超過 TOOL_SUMMARY_INPUT_MAX_CHARS 時只讀頭尾（_clip_tool_output），並在給主模型的附註標明。
         step 可由呼叫端指定（測試用），預設取最近一則 assistant 回覆。
         result_id 預設取最近一次 run_tool 的存檔編號：附註會告訴主模型「細節用 result_grep <編號> 搜，不要重跑工具」，
-        並把 answer 回填到 index.md；模型另外會得到 1～3 個「可追問」（附關鍵字），使用者的要求是探索型時可拿去問。"""
+        並把 answer 回填到 index.md；模型另外會得到 1～3 個「可追問」（附關鍵字），使用者的要求是探索型時可拿去問。
+
+        自動追問（有界、確定性）：第一輪擷取後若 not_covered 還有缺口、且摘要自己給了 suggested_questions，
+        直接拿第一條的 keywords 對同一份存檔再跑一次 result_grep（_exec_script，不經過 run_tool，不記軌跡、
+        不產生新編號——這不是模型的動作，是同一次工具回傳的延伸擷取），把 grep 到的原文重新交給
+        _extract_task_oriented（永遠錨回 purpose_text，不是拿上一輪的摘要文字當輸入，避免摘要疊摘要）。
+        最多跳 TOOL_SUMMARY_MAX_FOLLOWUP_HOPS 次；跳滿、grep 落空或沒有 keywords 可用時照實停下，
+        not_covered 該是什麼就是什麼，不偽裝成已經解決——使用者原始問題若本來就模糊，這裡不會硬鎖定一個
+        可能不相關的答案，而是誠實地把缺口留給主模型，逼出使用者下一句話當新錨點。"""
         anchor = self._build_task_anchor_text()
         result_id = self.last_result_id if result_id is None else result_id
         step = step if step is not None else (self._last_assistant_step() or {})
@@ -602,52 +665,41 @@ class SkillAgent:
         if step.get("reply"):
             step_lines.append(f"決策 AI 對使用者的說明：{step['reply']}")
         step_text = "\n".join(step_lines) or "（沒有取得這一步的說明，請以使用者的目標為依據）"
+        purpose_text = f"【使用者的目標】\n{anchor}\n\n【這一步的目的（決策 AI 為什麼執行這個工具）】\n{step_text}"
         clipped, omitted = self._clip_tool_output(result)
 
-        system_prompt = f"""你是一個「資訊過濾器」：把一支工具（腳本）執行後的完整原始輸出，依「使用者的目標」與「這一步的目的」擷取成精簡的重點，交給另一個負責決策的 AI。那個 AI 看不到原始輸出，只看得到你的擷取結果。
+        data, structured, raw_model_text = self._extract_task_oriented(clipped, purpose_text, tool_tokens, omitted)
 
-規則：
-1. 只保留與使用者目標或這一步目的直接相關的事實、數值、名稱、錯誤；樣板文字、排版、重複內容、與任務無關的欄位一律捨棄。
-2. 名稱與數值一律照抄原文：topic／node／容器／檔案／路徑／站點／任務 id、數值與單位、錯誤訊息，都不要改寫、四捨五入或概括成「一些」「若干」。
-3. 只陳述原始輸出裡有的內容，不要推測、補充背景或給建議；原始輸出沒有的就寫進 not_covered。
-4. 這一步的目的若在原始輸出裡找不到答案，answer 要直接寫「輸出中沒有…」，並在 not_covered 說明缺什麼。
-5. 原始輸出若標示「省略中間 N 字元」，被省略的部分不可假設，要寫進 not_covered。
-6. 數量、排序與門檻判斷以原始輸出裡腳本算好的結果為準（例如「共 N 個」「最新修改：」「條件 …：第一則符合 #k」），直接照抄、不要自己重數或推翻；原始輸出沒有算好而必須比較時，逐一核對原文並在 facts 引用依據（序號、原文數值或時間），無法確定就寫進 not_covered，不要猜。
-7. 精簡：answer 一句話（含關鍵數值或名稱）；facts 每項一句、不超過 60 字；全部合計不超過 {TOOL_SUMMARY_MAX_CHARS} 字。
-8. suggested_questions：使用者接下來可能想知道、但這一步的目的沒問到、且原始輸出裡有資料可答的問題，最多 3 個；每個附 keywords＝在原始輸出裡搜得到的關鍵字（同義詞用 | 分隔，可含正則）。使用者的要求已經明確、輸出也已回答時給空陣列，不要硬湊。
+        hops = 0
+        while (
+            structured and data is not None and result_id
+            and self._gap_reported(data.get("not_covered"))
+            and data.get("suggested_questions")
+            and hops < TOOL_SUMMARY_MAX_FOLLOWUP_HOPS
+        ):
+            top_q = data["suggested_questions"][0] if isinstance(data["suggested_questions"][0], dict) else {}
+            keywords = str(top_q.get("keywords") or "").strip()
+            if not keywords:
+                break
+            grep_script = os.path.join(self.base_path, "scripts", "result_grep_cmd.py")
+            grep_out = self._exec_script("result_grep_cmd.py", grep_script, [str(result_id), keywords, "--block"])
+            if grep_out.lstrip().startswith("[ERROR]"):
+                break
+            hops += 1
+            print(f"🔁 [自動追問 {hops}/{TOOL_SUMMARY_MAX_FOLLOWUP_HOPS}] 關鍵字「{keywords}」對存檔 #{result_id} 再查一次…")
+            grep_clipped, grep_omitted = self._clip_tool_output(grep_out)
+            new_data, new_structured, _ = self._extract_task_oriented(
+                grep_clipped, purpose_text, self.count_tokens(grep_out), grep_omitted)
+            if not new_structured:
+                break
+            data, structured = new_data, True
 
-輸出 JSON 物件：
-- answer：一句話直接回答這一步的目的。
-- facts：與任務相關的事實清單（名稱、數值照抄）。
-- errors：原始輸出中的錯誤／警告／異常，照抄原文；沒有就空陣列。
-- not_covered：原始輸出沒有涵蓋、或因篇幅被省略而無法確認的部分；沒有就寫「無」。
-- suggested_questions：[{{question, keywords}}] 可追問的問題與搜尋關鍵字，最多 3 個。
-"""
-        user_prompt = (
-            f"【使用者的目標】\n{anchor}\n\n"
-            f"【這一步的目的（決策 AI 為什麼執行這個工具）】\n{step_text}\n\n"
-            f"【工具的完整原始輸出（約 {tool_tokens} tokens{'，過長已保留頭尾' if omitted else ''}）】\n{clipped}"
-        )
-
-        res = ollama.chat(
-            model=self.summary_model,
-            messages=[
-                {'role': 'system', 'content': system_prompt},
-                {'role': 'user', 'content': user_prompt},
-            ],
-            format=TOOL_SUMMARY_SCHEMA,
-            options={'temperature': 0.2, 'num_ctx': NUM_CTX, 'num_predict': TOOL_SUMMARY_MAX_PREDICT},
-            think=False,
-        )
-        raw = res['message']['content'].strip()
         answer = ""
-        try:
-            data = json.loads(raw)
+        if structured and data is not None:
             body = self._render_tool_summary(data, result_id)
-            answer = str(data.get("answer") or "").strip() if isinstance(data, dict) else ""
-            structured = True
-        except (ValueError, TypeError):
-            body, structured = raw, False
+            answer = str(data.get("answer") or "").strip()
+        else:
+            body = raw_model_text
         self.last_tool_summary = {
             'structured': structured, 'input_tokens': tool_tokens, 'omitted_chars': omitted,
             'summary_tokens': self.count_tokens(body), 'model': self.summary_model, 'result_id': result_id,
@@ -1070,6 +1122,11 @@ class SkillAgent:
                         f"不要向使用者解釋規格內容，也不要詢問是否要執行。\n{skill_doc}")
 
             script_name = self._normalize_script_name(raw_token)
+            if script_name == "result_ask_cmd.py":
+                # 偽技能：result_ask 沒有實體 scripts/result_ask_cmd.py（要呼叫 ollama.chat，只能在本
+                # process 內做，見 README「Agent_Runner.py 是唯一的核心來源」），必須在存在性檢查前攔截，
+                # 否則會落入下面「找不到腳本」的分支。規格文件走一般的兩階段揭露，不受影響。
+                return self._result_ask(remainder)
             script_path = os.path.join(self.base_path, "scripts", script_name)
 
             print(f"🛠️  Agent 啟動工具: {script_name}")
@@ -1090,49 +1147,90 @@ class SkillAgent:
                 return f"[ERROR] 找不到腳本 {script_name}。{hint}"
 
             clean_args = self._parse_script_args(script_name, remainder)
-
-            # --- 執行工具 ---
-            # 將目前的容器路徑作為環境變數注入，讓 docker_run.py 讀取
-            env = os.environ.copy()
-            env["CONTAINER_CWD"] = self.container_cwd
-            env["TARGET_CONTAINER"] = self.target_container  # 容器技能省略容器名稱時的預設（比照 cwd）
-            env["TOOL_RESULTS_DIR"] = self.results_dir()     # result_list／result_grep／result_view 的存檔目錄
-            env["HARNESS_SESSION"] = self.session_id         # 讓 result_grep 16 優先解析成目前 session 的 #16
             # 軌跡記錄用：執行「前」的狀態
             cwd_before, container_before, target_before = self.current_cwd, self.container_cwd, self.target_container
-
-            try:
-                res = subprocess.run(
-                    [sys.executable, script_path] + clean_args,
-                    capture_output=True,
-                    text=True,
-                    cwd=self.current_cwd,
-                    env=env,
-                    timeout=TOOL_EXEC_TIMEOUT,
-                )
-            except subprocess.TimeoutExpired:
-                output_text = (
-                    f"[ERROR] 工具 {script_name} 執行逾時（超過 {TOOL_EXEC_TIMEOUT} 秒），已被系統強制終止。"
-                    f"這是 harness 的最後防線，各腳本自身應有更短的逾時；若經常觸發請檢查該腳本。"
-                )
-                self._record_trajectory(script_name, clean_args, output_text, cwd_before, container_before, target_before)
-                return output_text
-
-            if res.returncode == 0:
-                output_text = res.stdout.strip()
-            else:
-                # 腳本異常結束：優先用 stderr，沒有就用 stdout；兩者皆空也要給 AI 一個
-                # 明確的失敗訊息，否則空字串會被誤判成「沒有工具需要執行」。
-                # 統一補上 [ERROR] 前綴，讓 _content_for_context 能正確判定為失敗。
-                output_text = res.stderr.strip() or res.stdout.strip() or "（沒有任何輸出）"
-                if not output_text.startswith("[ERROR]"):
-                    output_text = f"[ERROR] 腳本 {script_name} 異常結束（exit code {res.returncode}）:\n{output_text}"
-            self._sync_state_from_tool_output(output_text)
+            output_text = self._exec_script(script_name, script_path, clean_args)
+            self._sync_state_from_tool_output(output_text)  # 逾時訊息裡不會有狀態標記，掃過去是安全的 no-op
             self._record_trajectory(script_name, clean_args, output_text, cwd_before, container_before, target_before)
             return output_text
 
         except Exception as e:
             return f"解析指令失敗: {e}"
+
+    def _exec_script(self, script_name, script_path, clean_args):
+        """執行一支腳本、回傳 output_text；不記軌跡、不同步狀態（呼叫端負責）——run_tool() 的正常派發，
+        與 summarize_tool_result() 的自動追問（直接跑 result_grep_cmd.py，跳過整個 run_tool，不印
+        「Agent 啟動工具」這種暗示模型主動執行的訊息）共用同一個執行原語。"""
+        env = os.environ.copy()
+        env["CONTAINER_CWD"] = self.container_cwd
+        env["TARGET_CONTAINER"] = self.target_container  # 容器技能省略容器名稱時的預設（比照 cwd）
+        env["TOOL_RESULTS_DIR"] = self.results_dir()     # result_list／result_grep／result_view 的存檔目錄
+        env["HARNESS_SESSION"] = self.session_id         # 讓 result_grep 16 優先解析成目前 session 的 #16
+        try:
+            res = subprocess.run(
+                [sys.executable, script_path] + clean_args,
+                capture_output=True,
+                text=True,
+                cwd=self.current_cwd,
+                env=env,
+                timeout=TOOL_EXEC_TIMEOUT,
+            )
+        except subprocess.TimeoutExpired:
+            return (
+                f"[ERROR] 工具 {script_name} 執行逾時（超過 {TOOL_EXEC_TIMEOUT} 秒），已被系統強制終止。"
+                f"這是 harness 的最後防線，各腳本自身應有更短的逾時；若經常觸發請檢查該腳本。"
+            )
+        if res.returncode == 0:
+            return res.stdout.strip()
+        # 腳本異常結束：優先用 stderr，沒有就用 stdout；兩者皆空也要給 AI 一個
+        # 明確的失敗訊息，否則空字串會被誤判成「沒有工具需要執行」。
+        # 統一補上 [ERROR] 前綴，讓 _content_for_context 能正確判定為失敗。
+        output_text = res.stderr.strip() or res.stdout.strip() or "（沒有任何輸出）"
+        if not output_text.startswith("[ERROR]"):
+            output_text = f"[ERROR] 腳本 {script_name} 異常結束（exit code {res.returncode}）:\n{output_text}"
+        return output_text
+
+    def _result_ask(self, remainder):
+        """result_ask 偽技能：main session 認得出使用者在追問前面某份存檔的內容、但想不出精確關鍵字時，
+        把問題原封不動交給獨立 session，重新讀那份存檔的完整原文並針對這個新問題擷取重點——跟 result_grep
+        的差別是這裡的錨點是使用者這句話本身，不是 _build_task_anchor_text／_last_assistant_step 那組舊錨點。
+        跟 summarize_tool_result 共用 _extract_task_oriented／_render_tool_summary；跟自動追問（同方法內的
+        迴圈）不同的是，這是 main session 主動選的一次動作，要比照其他技能記軌跡、產生新的存檔編號。"""
+        try:
+            parts = shlex.split(remainder) if remainder.strip() else []
+        except ValueError:
+            parts = remainder.split()
+        if not parts:
+            return '[ERROR] 需要指定存檔編號與問題：result_ask <編號|latest> "<問題>"。'
+        ref, question = parts[0], " ".join(parts[1:]).strip()
+        if not question:
+            return '[ERROR] 需要問題內容：result_ask <編號|latest> "<問題>"。'
+
+        path, err = _results_common.resolve_result(ref, self.results_dir())
+        if err:
+            return err
+        meta, body_start = _results_common.read_header(path)
+        lines = _results_common.read_lines(path)
+        raw = "\n".join(lines[body_start - 1:])
+        result_id = meta.get("id") or ref.lstrip("#")
+        tool_tokens = self.count_tokens(raw)
+        clipped, omitted = self._clip_tool_output(raw)
+        purpose_text = (
+            f"【使用者現在追問的問題】\n{question}\n\n"
+            f"【這份存檔原本的任務（背景，不是現在要回答的問題）】\n{meta.get('task') or '(未知)'}"
+        )
+        data, structured, raw_model_text = self._extract_task_oriented(clipped, purpose_text, tool_tokens, omitted)
+        if structured and data is not None:
+            body = self._render_tool_summary(data, result_id)
+        else:
+            body = raw_model_text or "（獨立 session 沒有回傳合法結構，請改用 result_grep 自行搜尋關鍵字。）"
+        output_text = f"{TOOL_SUMMARY_TAG}\n針對追問「{question}」重新擷取存檔 #{result_id}：\n{body}"
+
+        self._record_trajectory(
+            "result_ask_cmd.py", [ref, question], output_text,
+            self.current_cwd, self.container_cwd, self.target_container,
+        )
+        return output_text
 
 
     # =========================================================
@@ -2279,6 +2377,10 @@ TOOL_REDUCED_TAG = "[tool result - 已精簡]"
 TOOL_SUMMARY_INPUT_MAX_CHARS = int(os.environ.get("AGENT_TOOL_SUMMARY_INPUT_CHARS", "16000"))
 TOOL_SUMMARY_MAX_CHARS = 400      # 摘要長度目標（字，寫進 prompt）；門檻 500 tokens ≈ 950 字，摘要要明顯小於它才有意義
 TOOL_SUMMARY_MAX_PREDICT = 1200   # 摘要輸出的 num_predict 硬上限；被截斷時 JSON 解析失敗會退回原文
+# summarize_tool_result 的自動追問：not_covered 有缺口且摘要自己給出 suggested_questions 時，最多對同一份
+# 存檔自動再 result_grep 幾次（見該方法內的迴圈）。停止條件是機械的（跳數上限／grep 落空／沒有關鍵字），
+# 不要求任何模型判斷「問題本身夠不夠明確」——跳滿仍未涵蓋就誠實回報，不偽裝成已解決。
+TOOL_SUMMARY_MAX_FOLLOWUP_HOPS = int(os.environ.get("AGENT_TOOL_SUMMARY_MAX_HOPS", "2"))
 
 # 任務導向摘要的結構（Ollama format=）：answer 一句話回答這一步的目的、facts 照抄的相關事實、errors 錯誤原文、
 # not_covered 原始輸出沒有／被省略而無法確認的部分——讓主模型知道「摘要裡沒有」不等於「輸出裡沒有」。

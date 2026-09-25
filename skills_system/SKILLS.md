@@ -41,6 +41,7 @@
 - [result_list](tools/result_list.md) — 列出最近的工具結果存檔（編號、腳本、任務、摘要回答）；先看這個再決定搜哪一個
 - [result_grep](tools/result_grep.md) — 在指定編號（或 latest／all）的存檔裡搜關鍵字（a|b 同義詞、前後幾行）；使用者追問細節時用，不要重跑工具
 - [result_view](tools/result_view.md) — 讀某個存檔的第 N 行起 M 行，看 grep 命中處的整段原文
+- [result_ask](tools/result_ask.md) — 使用者的追問跟前面工具回傳有關、但你想不出精確關鍵字時，把問題原文交給獨立 session 重新讀原文擷取重點；答得出來優先用 result_grep
 
 ## 記憶修改
 - [modify_memory](tools/modify_memory.md) — 寫入經驗記憶：預設全域常駐；加 `--skill <技能名稱>` 綁定該技能，只在載入其規格時出現

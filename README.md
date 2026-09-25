@@ -111,6 +111,8 @@ Web Console 另有 `MAX_AUTO_ITERATIONS = 25`：Auto 模式連續執行工具超
 
 **工具結果存檔與回查（`result_list`／`result_grep`／`result_view`）**：摘要會丟細節、原文進主對話會污染上下文，兩者都不選：每次腳本執行的完整原始輸出由 `_record_trajectory()` 順手存成 `logs/tool_results/<session>_<編號>_<腳本>.md`（簡單 key: value 檔頭：編號、時間、腳本、指令、cwd、容器、狀態、字數、當時的任務；不用 PyYAML），並在 `index.md` 記一行；摘要 session 產出的「回答」會回填到索引那一行。編號＝軌跡 id，`/make_skill` 與稽核對得上。技能規格文件不存（它不是執行結果）。摘要 schema 多了 `suggested_questions`（最多 3 個「可追問」，各附可搜尋的關鍵字），附註改成「細節用 `result_grep <編號> <關鍵字>` 搜，不要重跑工具」——觀察型技能不必再等一次擷取，摘要只讀頭尾時被省略的中段也搜得到。交握原則寫在規格文件與附註裡（`AGENT.md` 沒有預算）：使用者的要求明確就直接回答並提存檔編號；探索型（看一下／觀察一下）才把可追問列給使用者選。使用者回答追問時最新一句常只剩關鍵字，所以摘要錨點帶「任務線」——最近 3 則使用者訊息（`task_history`）。`result_grep` 的輸出走一樣的門檻：超過 500 tokens 交給獨立 session（它拿到的正是使用者的追問），沒超過直接進主對話。安全：正則長度上限 200、逐行比對帶 3 秒預算（防災難性回溯）、路徑只取檔名鎖在存檔目錄；保留最近 200 個檔且總量 50 MB（`AGENT_TOOL_RESULTS_KEEP`／`AGENT_TOOL_RESULTS_MAX_MB`），刪最舊的並同步索引；`logs/` 已 `.gitignore`（輸出可能含敏感內容）。CLI 印「📄 已存檔 #16」，Web 卡片標題帶編號並可點開 `/api/results/<編號>` 看原文。
 
+**自動追問與 `result_ask`（2026-09-26）**：`summarize_tool_result()` 擷取後若 `not_covered` 還有缺口、且摘要自己給出了 `suggested_questions`，會拿第一條的 keywords 對同一份存檔自動再 `result_grep` 一次（`_exec_script` 直接跑腳本，不經過 `run_tool`、不記軌跡、不產生新編號——這不是模型的動作，是同一次工具回傳的延伸擷取，只印一行 `🔁 自動追問` 讓使用者看得到），把 grep 到的原文重新交給同一個擷取函式（`_extract_task_oriented`，`summarize_tool_result`／自動追問／`result_ask` 三處共用），永遠錨回原始的「使用者目標＋這一步的目的」，不是拿上一輪的摘要文字當輸入。最多跳 `TOOL_SUMMARY_MAX_FOLLOWUP_HOPS`（預設 2，`AGENT_TOOL_SUMMARY_MAX_HOPS`）次；跳滿、grep 落空或沒有 keywords 可用時照實停下，`not_covered` 該是什麼就是什麼，不偽裝成已解決——使用者原始問題若本來就模糊，這裡不會硬鎖定一個可能不相關的答案。`AGENT.md` 另外要求主模型看到工具回傳結尾的「可追問」清單、而使用者最新一句話沒對應其中一項時，要把選項列給使用者選（`action: null`）、不要自己猜一項執行；使用者的追問明顯跟前面的工具回傳有關、但沒有可用關鍵字時，改用新技能 `result_ask <編號|latest> "<問題>"`——這是唯一一個沒有實體 `scripts/<name>_cmd.py` 的技能：`run_tool()` 在存在性檢查前攔截 `result_ask_cmd.py`，直接呼叫 in-process 方法（要呼叫 `ollama.chat`，不能像其他技能一樣包成 subprocess），把使用者的問題原文（不是關鍵字）交給獨立 session 重新讀那份存檔的完整原文擷取重點；跟自動追問不同，這是主模型主動選的一次動作，照樣記軌跡、產生新的存檔編號。
+
 **訊息則數視窗停用**：`SkillAgent(max_history=None)` 是預設，上下文大小只由 token 門檻決定，舊內容一律摘要歸檔而不是無聲丟棄；`max_history` 只保留為可選保險絲。
 
 ### 2.6 三種執行模式
@@ -220,6 +222,7 @@ Web Console 另有 `MAX_AUTO_ITERATIONS = 25`：Auto 模式連續執行工具超
 | `result_list` | 列最近的存檔索引 | `result_list_cmd.py` | 預設目前 session 最近 20 筆（新→舊），每行含編號、腳本、狀態、大小、當時任務、摘要回答；`--all` 含之前 session |
 | `result_grep` | 在存檔裡搜關鍵字 | `result_grep_cmd.py` | `<編號|latest|all> <關鍵字> [-C n] [--max m] [--block]`：`a|b` 同義詞、正則、不分大小寫；標頭給每檔命中數；`--block` 回整則 `--- #k` 訊息（echo 存檔）；`all`＝目前 session 最近 20 檔；輸出上限 12000 字 |
 | `result_view` | 讀存檔的一段原文 | `result_view_cmd.py` | `<編號|latest> [--from 行] [--lines n]`，行號與 grep 一致，預設 80 行、上限 300 |
+| `result_ask` | 把追問原文交給獨立 session 重新理解存檔原文 | 無（`run_tool()` 內特例分派，見 2.5） | `<編號|latest> "<問題原文>"`：想不出 `result_grep` 關鍵字、或使用者是隱性追問時用；照樣記軌跡、產生新編號 |
 
 ### 3.6 組合技能（`/make_skill` 產生）
 
@@ -325,6 +328,7 @@ python3 web_console.py
 14. **同一 session 已載入某技能規格時，模型傾向重用它**：例如已載入 `list_dir` 後被問「專案裡檔名含 cmd 的檔案有幾個」，會用 `list_dir --filter` 在根目錄數（只看一層、得到 0）而不是再載 `find_file` 遞迴搜尋；索引描述改成只標明「一層／遞迴」時仍會答 0，改成腳本在 0 項時直接指示「如果問的是整個專案這個 0 不能當答案，請改用 `scripts/find_file_cmd.py` 遞迴搜尋」後實測會照做（腳本回傳裡的明確指示比索引描述有效）。摘要 session 在原始輸出沒有算好的數字時會自己數（實測 25 個 `.md` 數成 23），所以規格要求用 `--filter` 讓腳本算，摘要不比原文短時也改給原文。
 15. **「您提供的」殘留**：工具結果的開頭與結尾都有框架句，18 情境仍偶爾（1～2 次）出現「根據您提供的…」；兩件事一起問時偶爾只答後一件。
 16. **調度系統技能依賴 web_console 的版本**：`semantic_map` 需要 `/api/topology` 端點，舊版 web_console 會回 404；OverPending 的時序常數（`threshold_ovp_sec`、`threshold_recovery_sec`）以 distribute 的設定為準，規格裡的「約 10 秒」是預設值。
+17. **自動追問與 `result_ask` 的關鍵字／理解品質仍受摘要模型限制**：自動追問跳到哪個 `suggested_questions` 全靠第一輪摘要自己給的 keywords，那組 keywords 想錯（例如答案其實在存檔別處、但 keywords 沒有覆蓋到）時，`result_grep` 會落空或抓到不相關內容，迴圈一路跳到上限後誠實回報「未涵蓋」——不會更糟，但也不會比人工下 `result_grep` 更準；跟既有限制 #11 同一類。`result_ask` 把整個問題交給獨立 session 理解，answer／facts 的正確性一樣取決於 `SUMMARY_MODEL`，需要比較或計數時一樣要看原始輸出裡腳本算好的數字，摘要模型自己數一樣會錯。兩者目前都只用 5.4 節同一套假 `ollama.chat` stub 方法驗證過，還沒有 18 情境等級的真模型回歸。
 
 ---
 
