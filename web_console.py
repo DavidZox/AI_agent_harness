@@ -1650,9 +1650,8 @@ class ConsoleHandler(BaseHTTPRequestHandler):
         # 新任務開始：上一個已核准的計畫到此結束（見 clear_plan_for_new_task）
         clear_plan_for_new_task(stream)
 
-        # 記錄這一輪任務最原始的使用者敘述，跟 CLI 版（Agent_Runner.main）
-        # 行為一致，供獨立摘要 session 在沒有 objective／plan 可用時，
-        # 當作「原始問題」聚焦摘要內容（見 SkillAgent._build_task_anchor_text）
+        # 記下使用者這句話（任務線：最近 3 句），跟 CLI 版（Agent_Runner.main）一致；
+        # 獨立 session 摘要或 recall 時拿它當「使用者的目標」的一部分（見 SkillAgent._build_task_anchor_text）
         agent.set_current_task(message)
 
         # 有附加影像：先跑獨立視覺 sub-session，把分析結果以文字併入這次的使用者訊息，

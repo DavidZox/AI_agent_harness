@@ -72,9 +72,10 @@ class SkillAgent:
         self.current_plan = None
 
         # =========================
-        # 📌 這一輪任務最原始的使用者敘述
-        # 給獨立摘要 session（summarize_tool_result）當「使用者的目標」聚焦依據之一（與 sticky_objective、
-        # current_plan 一起，見 _build_task_anchor_text）。每次使用者送出新任務時更新，/clear 時清空。
+        # 📌 使用者最近說的話（任務線）
+        # current_task 是最新一句、task_history 是連同它在內最近 3 句原話，每次使用者送出新訊息時由
+        # set_current_task 更新，/clear 時清空。給獨立 session（summarize_tool_result、_result_recall）當
+        # 「使用者的目標」的一部分（與 sticky_objective、current_plan 一起，見 _build_task_anchor_text）。
         # =========================
         self.current_task = None
         self.task_history = []          # 最近 TASK_HISTORY_KEEP 則使用者任務訊息（舊→新），見 set_current_task／_build_task_anchor_text
@@ -767,7 +768,7 @@ class SkillAgent:
         prompt，不接觸 self.messages），把超過門檻的工具回傳擷取成主對話用得上的重點，摘要完就丟棄。
 
         跟通用摘要的差別在「帶著問題讀原文」——獨立 session 同時收到兩層聚焦依據：
-        1. 使用者的目標（_build_task_anchor_text：Objective、這一輪任務的原始敘述、已核准的計畫）；
+        1. 使用者的目標（_build_task_anchor_text：Objective、使用者最近 3 句原話（任務線）、已核准的計畫）；
         2. 這一步的目的（_last_assistant_step：決策 AI 剛才的 thought／reply 與執行的 action）。
         規則要求名稱與數值照抄、不推測、不給建議，並用 not_covered 明說原始輸出沒有涵蓋什麼，主模型才知道
         該換參數重查而不是憑空補上。結構以 format=TOOL_SUMMARY_SCHEMA 強制，解析失敗退回模型原文。
@@ -919,12 +920,14 @@ class SkillAgent:
             """
 
     def _build_task_anchor_text(self):
-        """獨立摘要 session 的第一層聚焦依據「使用者的目標」：
-        - sticky_objective：使用者主動設定、最高優先的任務錨點（本來就常駐 system prompt）
-        - current_task：這一輪任務使用者最原始的輸入文字（每次新任務更新，/clear 清空）
-        - current_plan：已核准的計畫（原始任務拆解出的步驟清單）
-        有幾層就給幾層，不互斥。第二層「這一步的目的」（決策 AI 的 thought／reply／action）由 _last_assistant_step
-        另外提供，這裡不再夾帶最近一則回覆。"""
+        """獨立 session（summarize_tool_result、_result_recall）的「使用者的目標」，依序組合：
+        - sticky_objective：使用者用 /objective set 設定的最高優先目標（有設定才有）
+        - current_task：使用者最新的一句話（每次送出新訊息都由 set_current_task 更新，/clear 清空）
+        - task_history：任務線，連同最新一句共最近 TASK_HISTORY_KEEP（3）句使用者的原話；最新一句常只是
+          「第一個」這種短回答，原本要做什麼要看前幾句
+        - current_plan：Plan 模式核准的計畫（到下一個新任務為止）
+        有幾層就給幾層，不互斥。「這一步的目的」（決策 AI 的 thought／reply／action）由 _last_assistant_step
+        另外提供，這裡不夾帶 AI 的回覆。"""
         parts = []
         if self.sticky_objective:
             parts.append(f"使用者設定的最高優先 Objective：{self.sticky_objective}")
@@ -2995,9 +2998,8 @@ def main():
                 agent.current_plan = None
                 print("🧹 上一個已核准的計畫已隨新任務自動清除（system prompt 不再要求依舊計畫執行）")
 
-            # 記錄這一輪任務最原始的使用者敘述，供獨立摘要 session 在沒有
-            # objective／plan 可用時，當作「原始問題」聚焦摘要內容
-            # （見 _build_task_anchor_text）
+            # 記下使用者這句話（任務線：最近 3 句），獨立 session 摘要或 recall 時
+            # 拿它當「使用者的目標」的一部分（見 _build_task_anchor_text）
             agent.set_current_task(user_msg)
 
             # 📘 手動載入的技能規格附在這則訊息後面一起送出（與 Web Console 一致）
