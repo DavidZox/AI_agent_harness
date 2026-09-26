@@ -1,0 +1,77 @@
+@startuml
+' --- 樣式精準控制 ---
+skinparam shadowing false
+skinparam defaultFontName "Microsoft JhengHei"
+skinparam ActivityBackgroundColor #FFF8E7
+skinparam ActivityBorderColor #996633
+skinparam NoteBackgroundColor #FFFFE0
+
+title 工具回傳管線：原文存檔 → 獨立 session 摘要 → 檢索清單 → 之後用 result_recall 回原文
+
+partition "這一次的工具回傳" {
+start
+:主 session 的 action＝腳本路徑;
+:run_tool → subprocess 執行腳本;
+:_record_trajectory：記軌跡，
+完整原文存成 **#編號**（logs/tool_results/，每次都存）;
+if (要加入主對話？
+auto 直接；manual／hybrid 等使用者按 y) then (加入)
+  if (規格文件、≤500 tokens、
+或本身已是 recall 的提煉結果？) then (是)
+    :原文直接進主對話;
+  else (>500 tokens)
+    :**summarize_tool_result**（一次性獨立 session）
+輸入：完整原文（>16000 字只讀頭尾）
+＋ 使用者的目標（任務線、Objective、計畫）
+＋ 這一步的目的（thought／reply／action）
+＋ 工具使用檢索清單（其他存檔的描述）; <<#FCE5CD>>
+    :_extract_task_oriented → JSON
+回答／相關事實／錯誤／未涵蓋／延伸方向
+index_hint（一句話關聯描述）／related_records（還需要哪幾筆）;
+    :有缺口、沒有 related、未滿 2 跳 → **自動追問**：
+用摘要自己給的關鍵字 grep 同一份存檔；
+0 行命中就停，有命中則併回第一輪
+（回答用新的、事實取聯集、index_hint 留第一輪）;
+    :_validate_related：只留清單裡真的有的編號;
+    :_append_tool_use_index：
+「#編號｜時間｜…｜index_hint」寫進 **tools_use_index.md**
+（grep／view／list／recall 這類看舊存檔的輸出不記）;
+    :_followup_guidance：結尾附**下一步建議**
+・還需要舊存檔 → result_recall 這份,那份 "使用者的話"
+・自動追問也解不開的缺口 → 自然地問使用者一句
+・已經回答 → 直接回答，不必 recall;
+    :摘要＋建議進主對話;
+  endif
+else (捨棄)
+  :只告訴主 session「已執行，結果未加入」;
+endif
+stop
+}
+
+partition "之後任何一回合（可以是下一次啟動）" {
+start
+:get_system_prompt 尾端注入 **工具使用檢索清單**
+最近 30 筆「#編號（時間）：描述」（檔案本身永久累加）;
+:使用者說一句話;
+if (對話裡的摘要已經有那個名稱或數值？) then (有)
+  :直接回答（不用 recall）;
+  stop
+elseif (在接續、追問或延伸某份存檔？
+（清單裡的舊紀錄、或剛才的摘要）) then (是)
+  :**result_recall <編號>[,<編號>] "使用者的話"**;
+  :_result_recall（一次性獨立 session）
+讀出那幾份存檔的**完整原文**（最多 3 份一起讀）
+錨點＝任務線（最新一句＋前幾句），模型給的參數只當聚焦點
+同一套擷取＋自動追問（單份時）＋下一步建議; <<#FCE5CD>>
+  :提煉結果進主對話（不再被摘要第二次、不記進清單）;
+  stop
+elseif (問的是「現在」「目前」的狀態？) then (是)
+  :重新執行當時的工具（→ 上面的流程）;
+  stop
+else (都不像)
+  :當作新問題;
+  stop
+endif
+}
+
+@enduml
