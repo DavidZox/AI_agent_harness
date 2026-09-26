@@ -1,0 +1,652 @@
+<!DOCTYPE html>
+<html lang="zh-Hant">
+<head>
+<meta charset="UTF-8">
+<title>SkillAgent Web Console</title>
+<link rel="stylesheet" href="/static/vision/snip.css">
+<style>
+  :root { color-scheme: dark; }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; font-family: -apple-system, "Segoe UI", "PingFang TC", "Microsoft JhengHei", sans-serif;
+    background: #1e1f22; color: #e3e3e3; height: 100vh; display: flex; flex-direction: column;
+  }
+  header {
+    padding: 10px 16px; background: #2b2d31; border-bottom: 1px solid #3a3c40;
+    display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 8px;
+  }
+  header h1 { font-size: 16px; margin: 0; }
+  #status { font-size: 12px; color: #9aa0a6; display: flex; gap: 14px; flex-wrap: wrap; }
+  main { flex: 1; display: flex; min-height: 0; }
+  .panel { flex: 1; display: flex; flex-direction: column; min-width: 0; }
+  .panel + .panel { border-left: 1px solid #3a3c40; }
+  .panel h2 {
+    font-size: 13px; margin: 0; padding: 8px 12px; background: #26282c;
+    border-bottom: 1px solid #3a3c40; color: #c7c9cc;
+  }
+  .log { flex: 1; overflow-y: auto; padding: 10px 12px; font-size: 13px; }
+  .entry { margin-bottom: 10px; padding: 8px 10px; border-radius: 6px; white-space: pre-wrap; word-break: break-word; }
+  .entry.user { background: #2c3e50; }
+  .entry.assistant { background: #2b2d31; border: 1px solid #3a3c40; }
+  .entry.tool { background: #1f2a24; border: 1px solid #2f4a3a; font-family: "Cascadia Code", Consolas, monospace; }
+  .entry.system { background: #2a2620; border: 1px solid #4a4030; color: #d8c9a3; font-style: italic; }
+  .entry.thought { background: #23262b; border: 1px dashed #4a4c50; color: #a7acb3; font-size: 12px; }
+  .entry.thought .tag { color: #8f96a0; opacity: 1; }
+  .entry.summary { background: #241f33; border: 1px solid #5a4a8f; color: #cfc3f0; }
+  .entry.summary .tag { color: #b39ddb; opacity: 1; }
+  .entry.summary.reduced { background: #332a1f; border-color: #8f6a4a; color: #f0dcc3; }
+  .entry.summary.reduced .tag { color: #dbb59d; }
+  .entry.summary.raw, .entry.summary.doc { background: transparent; border: 1px dashed #5a4a8f; color: #9d94b5; padding: 4px 8px; font-size: 12px; }
+  .entry.summary.raw .tag, .entry.summary.doc .tag { color: #9d94b5; }
+  .entry .result-link { display: block; margin-top: 4px; font-size: 12px; color: #8ab4f8; text-decoration: none; }
+  .entry .result-link:hover { text-decoration: underline; }
+  .entry.plan { background: #16302c; border: 1px solid #2f6f5e; }
+  .entry.plan .tag { color: #4fd8ba; opacity: 1; }
+  .entry.skilldraft { background: #26203a; border: 1px solid #6d5aa8; font-family: "Cascadia Code", Consolas, monospace; font-size: 12px; }
+  .entry.skilldraft .tag { color: #c4b0ff; opacity: 1; font-family: inherit; }
+  .entry.tool.oversized { border: 1px solid #b0873f; box-shadow: 0 0 0 1px #b0873f inset; }
+  .entry.tool.oversized .tag { color: #e6b95c; opacity: 1; }
+  .entry.tool.oversized.reviewed { border-color: #2f4a3a; box-shadow: none; opacity: 0.75; }
+  .entry .tag { font-size: 10px; text-transform: uppercase; opacity: 0.6; margin-bottom: 4px; }
+  .entry .ack-btn {
+    display: inline-block; margin-top: 6px; padding: 4px 10px; font-size: 11px;
+    background: #4a4c50; border-radius: 4px; cursor: pointer;
+  }
+  footer { border-top: 1px solid #3a3c40; padding: 10px 12px; background: #2b2d31; }
+  #decision-bar, #plan-bar, #skill-draft-bar { display: none; margin-bottom: 8px; gap: 8px; align-items: center; font-size: 13px; flex-wrap: wrap; }
+  #decision-bar.show, #plan-bar.show, #skill-draft-bar.show { display: flex; }
+  #decision-bar button, #plan-bar button, #skill-draft-bar button { cursor: pointer; }
+  .input-row { display: flex; gap: 8px; }
+  textarea#msg {
+    flex: 1; resize: none; height: 54px; background: #1e1f22; color: #e3e3e3;
+    border: 1px solid #3a3c40; border-radius: 6px; padding: 8px; font-size: 13px; font-family: inherit;
+  }
+  button { background: #3a6df0; color: white; border: none; border-radius: 6px; padding: 8px 16px; font-size: 13px; }
+  button:disabled { opacity: 0.5; cursor: not-allowed; }
+  button.secondary { background: #4a4c50; }
+  button.danger { background: #b0473f; }
+  button.plan-on { background: #2f9e58; }
+
+  /* ===== 📷 影像附件 ===== */
+  .entry.vision { background: #1f2b33; border: 1px solid #3d6b80; color: #cfe6f0; }
+  .entry.vision .tag { color: #7fc8e8; opacity: 1; }
+  .entry.vision.oversized { border-color: #b0873f; box-shadow: 0 0 0 1px #b0873f inset; }
+  .entry.vision.oversized .tag { color: #e6b95c; }
+  .entry.vision.oversized.reviewed { border-color: #3d6b80; box-shadow: none; opacity: 0.75; }
+  .entry.user .attach-note { font-size: 11px; color: #9fc3e6; margin-top: 4px; }
+  #attach-strip { display: none; gap: 8px; flex-wrap: wrap; margin-bottom: 8px; align-items: center; }
+  #attach-strip.show { display: flex; }
+  #attach-hint { font-size: 12px; color: #9aa0a6; }
+  .attach-item { position: relative; }
+  .attach-item img { width: 72px; height: 54px; object-fit: cover; border-radius: 4px; border: 1px solid #3a3c40; display: block; }
+  .attach-item .rm {
+    position: absolute; top: -6px; right: -6px; width: 18px; height: 18px; border-radius: 50%;
+    background: #b0473f; color: white; font-size: 11px; line-height: 18px; text-align: center; cursor: pointer;
+  }
+  .input-row { position: relative; }
+  #attach-btn, #plan-btn { white-space: nowrap; }
+  #attach-menu {
+    display: none; position: absolute; bottom: 62px; left: 0; z-index: 100;
+    background: #26282c; border: 1px solid #3a3c40; border-radius: 8px; padding: 6px;
+    flex-direction: column; gap: 4px;
+  }
+  #attach-menu.show { display: flex; }
+  #attach-menu button { background: #34363b; text-align: left; cursor: pointer; }
+  #attach-menu button:hover { background: #3a6df0; }
+
+  /* ===== 「/」選單：功能開關／指令 + 技能（手動按需載入規格）===== */
+  #slash-menu {
+    display: none; position: absolute; bottom: 62px; left: 0; right: 0; z-index: 110;
+    max-height: 46vh; overflow-y: auto; background: #26282c; border: 1px solid #3a3c40;
+    border-radius: 8px; padding: 6px; font-size: 13px;
+  }
+  #slash-menu.show { display: block; }
+  .slash-section { padding: 6px 8px 2px; font-size: 11px; color: #c7c9cc; letter-spacing: .04em; }
+  .slash-section + .slash-section, .slash-group + .slash-section, .slash-item + .slash-section {
+    border-top: 1px solid #3a3c40; margin-top: 6px; padding-top: 8px;
+  }
+  .slash-group { padding: 4px 10px 0; font-size: 11px; color: #7f8a96; }
+  .slash-item { display: flex; gap: 10px; align-items: baseline; padding: 5px 10px; border-radius: 6px; cursor: pointer; }
+  .slash-item:hover, .slash-item.active { background: #3a6df0; color: white; }
+  .slash-item .name { font-family: "Cascadia Code", Consolas, monospace; white-space: nowrap; }
+  .slash-item .desc { color: #b8bcc2; font-size: 12px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .slash-item:hover .desc, .slash-item.active .desc { color: #e8eefc; }
+  .slash-item .badge { font-size: 10px; background: #4a4c50; border-radius: 4px; padding: 1px 5px; color: #d8c9a3; white-space: nowrap; }
+  .slash-empty { padding: 8px 10px; color: #9aa0a6; }
+  #skill-strip { display: none; gap: 6px; flex-wrap: wrap; margin-bottom: 8px; align-items: center; }
+  #skill-strip.show { display: flex; }
+  #skill-hint { font-size: 12px; color: #9aa0a6; }
+  .skill-chip {
+    background: #1f2a24; border: 1px solid #2f4a3a; color: #bfe3cf; border-radius: 12px; padding: 2px 8px;
+    font-size: 12px; display: inline-flex; gap: 6px; align-items: center;
+  }
+  .skill-chip .rm { cursor: pointer; color: #e6b95c; }
+  .entry.skillload { background: #1f2a24; border: 1px dashed #4fa37a; font-family: "Cascadia Code", Consolas, monospace; }
+  .entry.skillload .tag { color: #7fd8a8; opacity: 1; }
+</style>
+</head>
+<body>
+
+<header>
+  <h1>🤖 SkillAgent Web Console</h1>
+  <div id="status">
+    <span id="stat-mode">mode: manual</span>
+    <span id="stat-cwd">cwd: -</span>
+    <span id="stat-container" title="目前的目標容器：預設空白；AI 成功操作某個容器後自動帶入，之後容器技能可省略名稱。要換容器直接跟 AI 說。">container: -</span>
+    <span id="stat-tokens">tokens: -</span>
+    <span id="stat-attach"></span>
+  </div>
+</header>
+
+<main>
+  <section class="panel">
+    <h2>💬 使用者 ↔ Agent 對話</h2>
+    <div class="log" id="chat-log"></div>
+  </section>
+  <section class="panel">
+    <h2>🛠️ 系統 / 工具回傳</h2>
+    <div class="log" id="tool-log"></div>
+  </section>
+</main>
+
+<footer>
+  <div id="decision-bar">
+    <span>⏸️ 有工具結果待決策：</span>
+    <button onclick="sendDecision('y')">✅ 加入上下文</button>
+    <button class="secondary" id="decision-n">🚫 捨棄</button>
+    <button class="danger" id="decision-stop" onclick="sendDecision('stop')">⏹️ 停止本回合</button>
+  </div>
+  <div id="plan-bar">
+    <span>📝 有計畫待你核准（也可以直接在下方輸入修改意見送出，AI 會重新規劃）：</span>
+    <button onclick="sendPlanDecision('y')">✅ 核准並執行</button>
+    <button class="danger" onclick="sendPlanDecision('n')">🚫 取消任務</button>
+  </div>
+  <div id="skill-draft-bar">
+    <span>🧩 有技能草稿待你決定（也可以直接在下方輸入修改意見送出，系統會重擬）：</span>
+    <button onclick="sendSkillDraftDecision('y')">✅ 核准並註冊</button>
+    <button class="secondary" onclick="sendSkillDraftDecision('t')">🧪 重播驗證後註冊</button>
+    <button class="danger" onclick="sendSkillDraftDecision('n')">🚫 取消草稿</button>
+  </div>
+  <div id="attach-strip"><span id="attach-hint">📎 已附加影像（送出時一起分析）：</span></div>
+  <div id="skill-strip"><span id="skill-hint">📘 已載入技能規格（隨下一則訊息一起送出）：</span></div>
+  <div class="input-row">
+    <div id="slash-menu"></div>
+    <div id="attach-menu">
+      <button onclick="attachFromScreen()">🖥️ 框選畫面</button>
+      <button onclick="attachFromFile()">📁 選擇檔案</button>
+    </div>
+    <button class="secondary" id="attach-btn" title="附加影像：框選畫面或選擇檔案" onclick="toggleAttachMenu()">📷</button>
+    <button class="secondary" id="plan-btn" title="切換 Plan 模式：開啟後，下一個新任務會先規劃步驟、你核准才執行" onclick="togglePlanMode()">📝 Plan</button>
+    <textarea id="msg" placeholder="輸入訊息；打「/」選擇功能開關或手動載入技能規格...（Enter 送出，Shift+Enter 換行；📷 可附加影像）"></textarea>
+    <button id="send-btn" onclick="sendMessage()">送出</button>
+    <input type="file" id="file-input" accept="image/*" multiple style="display:none">
+  </div>
+</footer>
+
+<script src="/static/vision/snip.js"></script>
+<script>
+const chatLog = document.getElementById('chat-log');
+const toolLog = document.getElementById('tool-log');
+const msgBox = document.getElementById('msg');
+const sendBtn = document.getElementById('send-btn');
+const decisionBar = document.getElementById('decision-bar');
+const planBar = document.getElementById('plan-bar');
+const skillDraftBar = document.getElementById('skill-draft-bar');
+const attachStrip = document.getElementById('attach-strip');
+const attachMenu = document.getElementById('attach-menu');
+const attachBtn = document.getElementById('attach-btn');
+const planBtn = document.getElementById('plan-btn');
+const fileInput = document.getElementById('file-input');
+let planModeOn = false;  // updateStatus() 依 stats.plan_mode 同步；只用來決定按鈕外觀與切換方向
+
+function renderEntry(container, cls, tag, text, oversized) {
+  const div = document.createElement('div');
+  div.className = 'entry ' + cls + (oversized ? ' oversized' : '');
+  if (tag) {
+    const tagEl = document.createElement('div');
+    tagEl.className = 'tag';
+    tagEl.textContent = oversized ? tag + ' ⚠️ 待確認' : tag;
+    div.appendChild(tagEl);
+  }
+  const textEl = document.createElement('div');
+  textEl.textContent = text;
+  div.appendChild(textEl);
+  if (oversized) {
+    const ackBtn = document.createElement('div');
+    ackBtn.className = 'ack-btn';
+    ackBtn.textContent = '✅ 我已確認';
+    ackBtn.onclick = () => {
+      div.classList.add('reviewed');
+      ackBtn.remove();
+    };
+    div.appendChild(ackBtn);
+  }
+  container.appendChild(div);
+  container.scrollTop = container.scrollHeight;
+}
+
+function attachResultLink(container, id) {
+  // 📄 工具結果存檔：卡片下方加一個連結開啟原文，使用者才知道對話裡的「存檔 #16」是什麼
+  const entry = container.lastElementChild;
+  if (!entry) return;
+  const a = document.createElement('a');
+  a.className = 'result-link';
+  a.href = '/api/results/' + id;
+  a.target = '_blank';
+  a.textContent = `開啟結果檔 #${id}（AI 可用 result_grep ${id} <關鍵字> 回查）`;
+  entry.appendChild(a);
+}
+
+function renderEvents(events) {
+  events.forEach(ev => {
+    if (ev.channel === 'chat') {
+      let note = (ev.role === 'user' && ev.attachments) ? `\n📎 附加了 ${ev.attachments} 張影像` : '';
+      if (ev.role === 'user' && ev.skills && ev.skills.length) note += `\n📘 附加了技能規格：${ev.skills.join(', ')}`;
+      if (ev.role === 'assistant' && ev.action) note += `\n▶ action: ${ev.action}`;
+      renderEntry(chatLog, ev.role, ev.role === 'user' ? '你' : 'AI', ev.text + note);
+    } else if (ev.channel === 'thought') {
+      renderEntry(toolLog, 'thought', '💭 思考', ev.text);
+    } else if (ev.channel === 'skillload') {
+      renderEntry(toolLog, 'skillload', `📘 手動載入技能規格：${ev.name}（≈${ev.tokens} tokens，隨下一則訊息送出）`, ev.text);
+    } else if (ev.channel === 'vision') {
+      renderEntry(toolLog, 'vision', `🖼️ 視覺分析（獨立 session，${ev.count} 張影像）`, ev.text, ev.oversized);
+    } else if (ev.channel === 'tool') {
+      renderEntry(toolLog, 'tool', '系統回傳' + (ev.result_id ? ` · 📄 已存檔 #${ev.result_id}` : ''), ev.text, ev.oversized);
+      if (ev.result_id) attachResultLink(toolLog, ev.result_id);
+    } else if (ev.channel === 'summary') {
+      // 每次工具回傳都會有這張：AI 實際收到的內容（緊接在完整原文卡片之後）
+      const kind = ev.kind || 'summary';
+      const labels = {
+        summary: '🧠 AI 實際收到的內容：任務導向摘要（獨立 session）',
+        reduced: '🧠 AI 實際收到的內容：只有成功／失敗判定（/summarize off 或摘要失敗）',
+        raw: '🧠 AI 實際收到的內容：完整原文',
+        doc: '🧠 AI 實際收到的內容：完整規格文件',
+      };
+      renderEntry(toolLog, 'summary ' + kind, labels[kind] || labels.summary, ev.text);
+    } else if (ev.channel === 'plan') {
+      renderEntry(chatLog, 'plan', '📝 計畫（待你確認）', ev.text);
+    } else if (ev.channel === 'skilldraft') {
+      renderEntry(chatLog, 'skilldraft', `🧩 技能草稿 ${ev.name}（待你決定：核准／重播驗證／取消，或送出修改意見）`, ev.text);
+    } else if (ev.channel === 'system') {
+      renderEntry(toolLog, 'system', '系統', ev.text);
+    }
+  });
+}
+
+let compressPoll = null;  // /parallel_cal on 背景壓縮進行中時，定期輪詢狀態以接收完成通知
+
+function updateStatus(stats) {
+  document.getElementById('stat-mode').textContent =
+    'mode: ' + stats.mode + (stats.parallel_cal ? ' · parallel_cal' : '') + (stats.plan_mode ? ' · plan' : '');
+  planModeOn = !!stats.plan_mode;
+  planBtn.classList.toggle('plan-on', planModeOn);
+  planBtn.textContent = planModeOn ? '📝 Plan ✓' : '📝 Plan';
+  planBtn.title = planModeOn
+    ? '切換 Plan 模式：目前已開啟，點一下關閉（不影響已在等待核准的計畫）'
+    : '切換 Plan 模式：開啟後，下一個新任務會先規劃步驟、你核准才執行';
+  document.getElementById('stat-cwd').textContent = 'cwd: ' + stats.current_cwd;
+  document.getElementById('stat-container').textContent = 'container: ' + (stats.target_container || '-');
+  const tokensEl = document.getElementById('stat-tokens');
+  tokensEl.textContent =
+    `tokens: user ${stats.total_user_tokens} / ai ${stats.total_ai_tokens} / tool ${stats.total_tool_tokens}` +
+    ` · ctx ${stats.context_exact ? '' : '≈'}${stats.context_tokens} (軟 ${stats.soft_threshold} / 硬 ${stats.token_threshold})` +
+    (stats.compressing ? ' · 🗜️ 背景壓縮中' : '');
+  tokensEl.title = `num_ctx ${stats.num_ctx}；軟水位（回合結束後壓縮）${stats.soft_threshold}；` +
+    `硬水位（呼叫前必壓）${stats.token_threshold}；壓縮時保留最新約 ${stats.keep_recent_tokens} tokens 原文；` +
+    `摘要模型 ${stats.summary_model}`;
+  // 背景壓縮完成／失敗的通知（後端在組 stats 時取走，不會重複）
+  (stats.notices || []).forEach(t => renderEntry(toolLog, 'system', '系統', t));
+  // 背景壓縮進行中：每 4 秒輪詢一次狀態，結束時最後一次輪詢會帶回完成通知
+  if (stats.compressing && !compressPoll) {
+    compressPoll = setInterval(() => {
+      fetch('/api/status').then(r => r.json()).then(updateStatus).catch(() => {});
+    }, 4000);
+  } else if (!stats.compressing && compressPoll) {
+    clearInterval(compressPoll);
+    compressPoll = null;
+  }
+  // 伺服器端附件已被消費（送出新任務）或清空時，同步清掉輸入框上方的縮圖
+  if (stats.attachments === 0) clearAttachStrip();
+  // 📘 待送的技能規格以伺服器狀態為準
+  if (stats.pending_skills) syncSkillStrip(stats.pending_skills);
+}
+
+function setBusy(busy) {
+  sendBtn.disabled = busy;
+  msgBox.disabled = busy;
+  attachBtn.disabled = busy;
+  planBtn.disabled = busy;
+}
+
+async function togglePlanMode() {
+  setBusy(true);
+  try {
+    applyDone(await streamPost('/api/send', { message: planModeOn ? '/plan off' : '/plan on' }));
+  } catch (e) {
+    renderEntry(toolLog, 'system', '錯誤', '與伺服器的連線中斷：' + e);
+  } finally {
+    setBusy(false);
+    msgBox.focus();
+  }
+}
+
+function showDecisionBar(pendingMode) {
+  decisionBar.classList.add('show');
+  const stopBtn = document.getElementById('decision-stop');
+  const nBtn = document.getElementById('decision-n');
+  nBtn.onclick = () => sendDecision('n');
+  // manual 模式才有獨立的「停止」選項；hybrid 模式捨棄後仍會繼續推論
+  stopBtn.style.display = (pendingMode === 'manual') ? 'inline-block' : 'none';
+}
+
+function hideDecisionBar() {
+  decisionBar.classList.remove('show');
+}
+
+function showPlanBar() {
+  planBar.classList.add('show');
+}
+
+function hidePlanBar() {
+  planBar.classList.remove('show');
+}
+
+function showSkillDraftBar() {
+  skillDraftBar.classList.add('show');
+}
+
+function hideSkillDraftBar() {
+  skillDraftBar.classList.remove('show');
+}
+
+function handleStreamMessage(msg) {
+  if (msg.type === 'event') {
+    renderEvents([msg.event]);
+  } else if (msg.type === 'stats') {
+    updateStatus(msg.stats);
+  } else if (msg.type === 'error') {
+    renderEntry(toolLog, 'system', '錯誤', msg.error);
+  }
+}
+
+// 後端以 NDJSON（一行一個 JSON）串流回傳：每完成一次推論或工具執行就推一行，
+// 這裡邊收邊解析、立刻渲染，不用等整回合結束。最後一行 type === 'done'
+// 帶有 awaiting_decision / awaiting_plan / pending_mode / stats 等收尾資訊。
+async function streamPost(url, body) {
+  const res = await fetch(url, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body || {})
+  });
+  const reader = res.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = '';
+  let done = null;
+  const consume = (line) => {
+    line = line.trim();
+    if (!line) return;
+    let msg;
+    try { msg = JSON.parse(line); } catch (e) { return; }
+    if (msg.type === 'done') done = msg; else handleStreamMessage(msg);
+  };
+  while (true) {
+    const { value, done: finished } = await reader.read();
+    if (finished) break;
+    buffer += decoder.decode(value, { stream: true });
+    let idx;
+    while ((idx = buffer.indexOf('\n')) >= 0) {
+      consume(buffer.slice(0, idx));
+      buffer = buffer.slice(idx + 1);
+    }
+  }
+  buffer += decoder.decode();
+  consume(buffer);
+  return done || {};
+}
+
+function applyDone(data) {
+  if (data.stats) updateStatus(data.stats);
+  if (data.awaiting_decision) showDecisionBar(data.pending_mode);
+  if (data.awaiting_plan) showPlanBar();
+  if (data.awaiting_skill_draft) showSkillDraftBar();
+}
+
+async function sendMessage() {
+  const text = msgBox.value.trim();
+  const hasPending = skillStrip.querySelectorAll('.skill-chip').length > 0 || attachStrip.querySelectorAll('.attach-item').length > 0;
+  if (!text && !hasPending) return;   // 只有 chip／附件沒有文字時，伺服器會用預設提示詞
+  hideSlashMenu();
+  setBusy(true);
+  hideDecisionBar();
+  hidePlanBar();
+  hideSkillDraftBar();
+  msgBox.value = '';
+  try {
+    applyDone(await streamPost('/api/send', { message: text }));
+  } catch (e) {
+    renderEntry(toolLog, 'system', '錯誤', '與伺服器的連線中斷：' + e);
+  } finally {
+    setBusy(false);
+    msgBox.focus();
+  }
+}
+
+async function sendDecision(action) {
+  setBusy(true);
+  hideDecisionBar();
+  try {
+    applyDone(await streamPost('/api/decision', { action }));
+  } catch (e) {
+    renderEntry(toolLog, 'system', '錯誤', '與伺服器的連線中斷：' + e);
+  } finally {
+    setBusy(false);
+    msgBox.focus();
+  }
+}
+
+async function sendPlanDecision(action) {
+  setBusy(true);
+  hidePlanBar();
+  try {
+    applyDone(await streamPost('/api/send', { message: action }));
+  } catch (e) {
+    renderEntry(toolLog, 'system', '錯誤', '與伺服器的連線中斷：' + e);
+  } finally {
+    setBusy(false);
+    msgBox.focus();
+  }
+}
+
+// 🧩 技能草稿的決定跟計畫一樣走 /api/send：有草稿待決定時，輸入框的內容一律視為對草稿的回應
+async function sendSkillDraftDecision(action) {
+  setBusy(true);
+  hideSkillDraftBar();
+  try {
+    applyDone(await streamPost('/api/send', { message: action }));
+  } catch (e) {
+    renderEntry(toolLog, 'system', '錯誤', '與伺服器的連線中斷：' + e);
+  } finally {
+    setBusy(false);
+    msgBox.focus();
+  }
+}
+
+// ===== 📷 影像附件：框選畫面／選擇檔案。附件本體存在伺服器端的 VisionSession，
+// 這裡只顯示縮圖並記住 id 以便移除；送出新任務時伺服器一次消費全部附件。 =====
+function toggleAttachMenu() { attachMenu.classList.toggle('show'); }
+document.addEventListener('click', (e) => {
+  if (!attachMenu.contains(e.target) && e.target !== attachBtn) attachMenu.classList.remove('show');
+});
+
+function syncAttachStrip() {
+  const n = attachStrip.querySelectorAll('.attach-item').length;
+  attachStrip.classList.toggle('show', n > 0);
+  attachBtn.textContent = n > 0 ? `📷 ${n}` : '📷';
+}
+function clearAttachStrip() {
+  attachStrip.querySelectorAll('.attach-item').forEach(el => el.remove());
+  syncAttachStrip();
+}
+function addAttachment(item) {
+  const wrap = document.createElement('div');
+  wrap.className = 'attach-item'; wrap.dataset.id = item.id;
+  const img = document.createElement('img');
+  img.src = item.thumbnail; img.title = `${item.width}x${item.height}`;
+  const rm = document.createElement('div');
+  rm.className = 'rm'; rm.textContent = '✕'; rm.title = '移除';
+  rm.onclick = async () => {
+    await VisionSnip.postJSON('/api/vision/remove', { id: item.id });
+    wrap.remove();
+    syncAttachStrip();
+  };
+  wrap.appendChild(img); wrap.appendChild(rm);
+  attachStrip.appendChild(wrap);
+  syncAttachStrip();
+}
+function attachFromScreen() { attachMenu.classList.remove('show'); VisionSnip.capture(); }
+function attachFromFile() { attachMenu.classList.remove('show'); fileInput.value = ''; fileInput.click(); }
+fileInput.addEventListener('change', async () => {
+  for (const file of Array.from(fileInput.files || [])) {
+    try {
+      const dataUrl = await new Promise((resolve, reject) => {
+        const r = new FileReader(); r.onload = () => resolve(r.result); r.onerror = () => reject(r.error); r.readAsDataURL(file);
+      });
+      const data = await VisionSnip.postJSON('/api/vision/upload', { name: file.name, data: dataUrl });
+      if (data.error) { renderEntry(toolLog, 'system', '錯誤', `附加 ${file.name} 失敗：${data.error}`); continue; }
+      addAttachment(data);
+    } catch (e) {
+      renderEntry(toolLog, 'system', '錯誤', `讀取 ${file.name} 失敗：${e}`);
+    }
+  }
+});
+document.body.insertAdjacentHTML('beforeend', VisionSnip.markup());
+VisionSnip.init({
+  apiBase: '/api/vision',
+  onAdded: addAttachment,
+  onStatus: (t) => { document.getElementById('stat-attach').textContent = '📷 ' + t; },
+  onError: (t) => renderEntry(toolLog, 'system', '錯誤', t),
+});
+
+// ===== 「/」選單：功能開關／指令 + 技能（選技能 = 手動按需載入規格，隨下一則訊息送出）=====
+const slashMenu = document.getElementById('slash-menu');
+const skillStrip = document.getElementById('skill-strip');
+let catalog = { commands: [], skills: [] };
+let slashItems = [];   // 目前顯示的可選項目（扁平，供 ↑↓ 移動）
+let slashActive = -1;
+fetch('/api/commands').then(r => r.json()).then(d => { catalog = d; }).catch(() => {});
+
+function slashQuery() {
+  const v = msgBox.value;
+  if (!v.startsWith('/') || v.includes('\n')) return null;
+  return v.slice(1).toLowerCase();
+}
+function updateSlashMenu() {
+  const q = slashQuery();
+  if (q === null) { hideSlashMenu(); return; }
+  const cmds = catalog.commands.filter(c => c.cmd.toLowerCase().includes(q) || (c.desc || '').toLowerCase().includes(q));
+  const skills = catalog.skills.filter(s => s.name.toLowerCase().includes(q) || (s.description || '').toLowerCase().includes(q) || (s.category || '').toLowerCase().includes(q));
+  slashItems = []; slashMenu.innerHTML = '';
+  const addSection = (title) => { const h = document.createElement('div'); h.className = 'slash-section'; h.textContent = title; slashMenu.appendChild(h); };
+  const addGroup = (title) => { const g = document.createElement('div'); g.className = 'slash-group'; g.textContent = title; slashMenu.appendChild(g); };
+  const addItem = (item, nameText, descText, badge) => {
+    const el = document.createElement('div'); el.className = 'slash-item'; el.dataset.index = slashItems.length;
+    const n = document.createElement('span'); n.className = 'name'; n.textContent = nameText; el.appendChild(n);
+    if (badge) { const b = document.createElement('span'); b.className = 'badge'; b.textContent = badge; el.appendChild(b); }
+    const d = document.createElement('span'); d.className = 'desc'; d.textContent = descText || ''; el.appendChild(d);
+    el.onmousedown = (e) => { e.preventDefault(); selectSlashItem(item); };  // mousedown：避免 textarea 先失焦
+    el.onmouseenter = () => setSlashActive(Number(el.dataset.index));
+    slashMenu.appendChild(el); slashItems.push({ item, el });
+  };
+  if (cmds.length) {
+    addSection('⚙️ 功能開關與指令');
+    let last = null;
+    cmds.forEach(c => { if (c.group !== last) { addGroup(c.group); last = c.group; } addItem({ type: 'command', ...c }, c.cmd, c.desc); });
+  }
+  if (skills.length) {
+    addSection('📘 技能（選取 = 手動載入規格，隨下一則訊息送出）');
+    let last = null;
+    skills.forEach(s => {
+      if (s.category !== last) { addGroup(s.category); last = s.category; }
+      addItem({ type: 'skill', ...s }, '/skill ' + s.name, s.description, s.has_memory ? '含經驗記憶' : null);
+    });
+  }
+  if (!slashItems.length) { const e = document.createElement('div'); e.className = 'slash-empty'; e.textContent = '沒有符合的指令或技能'; slashMenu.appendChild(e); }
+  slashMenu.classList.add('show');
+  setSlashActive(slashItems.length ? 0 : -1);
+}
+function setSlashActive(i) {
+  slashActive = i;
+  slashItems.forEach((it, k) => it.el.classList.toggle('active', k === i));
+  if (i >= 0) slashItems[i].el.scrollIntoView({ block: 'nearest' });
+}
+function hideSlashMenu() { slashMenu.classList.remove('show'); slashMenu.innerHTML = ''; slashItems = []; slashActive = -1; }
+function slashMenuOpen() { return slashMenu.classList.contains('show'); }
+async function selectSlashItem(item) {
+  hideSlashMenu();
+  if (item.type === 'command') {
+    // 只填入、不送出：/clear 這類指令誤點會清掉整段對話，按 Enter 才送
+    msgBox.value = item.cmd + (item.args ? '' : '');
+    msgBox.focus();
+    msgBox.setSelectionRange(msgBox.value.length, msgBox.value.length);
+    return;
+  }
+  msgBox.value = '';
+  await loadSkill(item.name);
+  msgBox.focus();
+}
+async function loadSkill(name) {
+  try {
+    const data = await VisionSnip.postJSON('/api/skill/load', { name });
+    if (data.error) { renderEntry(toolLog, 'system', '錯誤', data.error); return; }
+    if (data.already) { renderEntry(toolLog, 'system', '系統', `ℹ️ 技能 ${name} 的規格已在待送清單。`); return; }
+    renderEntry(toolLog, 'skillload', `📘 手動載入技能規格：${data.name}（≈${data.tokens} tokens，隨下一則訊息送出）`, data.doc);
+    syncSkillStrip(data.pending);
+  } catch (e) {
+    renderEntry(toolLog, 'system', '錯誤', '載入技能規格失敗：' + e);
+  }
+}
+function syncSkillStrip(names) {
+  skillStrip.querySelectorAll('.skill-chip').forEach(el => el.remove());
+  (names || []).forEach(name => {
+    const chip = document.createElement('span'); chip.className = 'skill-chip'; chip.dataset.name = name;
+    const t = document.createElement('span'); t.textContent = '📘 ' + name; chip.appendChild(t);
+    const rm = document.createElement('span'); rm.className = 'rm'; rm.textContent = '✕'; rm.title = '移除（不會隨下一則訊息送出）';
+    rm.onclick = async () => { const d = await VisionSnip.postJSON('/api/skill/remove', { name }); syncSkillStrip(d.pending); };
+    chip.appendChild(rm); skillStrip.appendChild(chip);
+  });
+  skillStrip.classList.toggle('show', (names || []).length > 0);
+}
+msgBox.addEventListener('input', updateSlashMenu);
+document.addEventListener('click', (e) => {
+  if (!slashMenu.contains(e.target) && e.target !== msgBox) hideSlashMenu();
+});
+
+msgBox.addEventListener('keydown', (e) => {
+  if (slashMenuOpen()) {
+    if (e.key === 'Escape') { e.preventDefault(); hideSlashMenu(); return; }
+    if (slashItems.length) {
+      if (e.key === 'ArrowDown') { e.preventDefault(); setSlashActive((slashActive + 1) % slashItems.length); return; }
+      if (e.key === 'ArrowUp') { e.preventDefault(); setSlashActive((slashActive - 1 + slashItems.length) % slashItems.length); return; }
+      if (e.key === 'Tab') { e.preventDefault(); if (slashActive >= 0) selectSlashItem(slashItems[slashActive].item); return; }
+      if (e.key === 'Enter' && !e.shiftKey) {
+        e.preventDefault();
+        const active = slashActive >= 0 ? slashItems[slashActive].item : null;
+        // 已經把指令完整打出來（例如 /auto on）就直接送出，不必再選一次
+        if (active && active.type === 'command' && msgBox.value.trim() === active.cmd.trim()) { hideSlashMenu(); sendMessage(); return; }
+        if (active) selectSlashItem(active);
+        return;
+      }
+    }
+  }
+  if (e.key === 'Enter' && !e.shiftKey) {
+    e.preventDefault();
+    sendMessage();
+  }
+});
+
+// 初始載入時抓一次目前狀態
+fetch('/api/status').then(r => r.json()).then(updateStatus);
+</script>
+
+</body>
+</html>

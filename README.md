@@ -75,8 +75,10 @@ Web 左欄是對話，右欄是系統與工具回傳：每次工具回傳有兩�
 
 ```
 AI_agent_harness/
-├── Agent_Runner.py     # 核心：SkillAgent 類別 + CLI（唯一的核心邏輯來源）
-├── web_console.py      # Web 介面（純標準庫），重用 SkillAgent
+├── Agent_Runner.py     # CLI 入口（幾行，實作在 agent_core/）
+├── web_console.py      # Web 入口（幾行，實作在 web_app/）
+├── agent_core/         # 核心：SkillAgent（由各 mixin 組成）、回覆協議、常數、CLI——唯一的核心邏輯來源
+├── web_app/            # Web 介面（純標準庫）：狀態、回合流程、slash 指令、HTTP、static/index.html
 ├── AGENT.md            # system prompt 主體：角色、JSON 回覆格式、執行協議、安全原則、記憶協議
 ├── Memory.md           # 全域長期記憶（每輪常駐）
 ├── skills_system/
@@ -92,7 +94,7 @@ AI_agent_harness/
 
 ## 文件
 
-- 〈[架構說明](doc/架構說明.md)〉：`Agent_Runner.py` 的完整解析（先從第 0 節「工具回傳什麼時候會被摘要」看起）
+- 〈[架構說明](doc/架構說明.md)〉：`agent_core/` 與 `web_app/` 的完整解析，含每個模組負責什麼（先從第 0 節「工具回傳什麼時候會被摘要」看起）
 - 〈[設計筆記與已知限制](doc/設計筆記與已知限制.md)〉：各機制的理由與實測數據、完整技能清單、驗證方法、已知限制、未來方向
 - 〈[長期願景](doc/長期願景.md)〉：AGV/AMR 車隊調度場景的構想（尚未實作）
 - 圖的來源在 `doc/*.puml`，用 `python3 doc/流程圖產生器.py` 重新產生

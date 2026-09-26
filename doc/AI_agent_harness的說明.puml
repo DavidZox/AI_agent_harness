@@ -10,8 +10,8 @@ title AI_agent_harness 架構：一個主 session 負責「挑技能」，一次
 
 rectangle NodeUser #F5F5F5 [
   **使用者介面**
-  CLI：Agent_Runner.py 的 main()
-  Web：web_console.py（重用 SkillAgent，不重寫規則）
+  CLI：agent_core/cli.py（python3 Agent_Runner.py）
+  Web：web_app/（python3 web_console.py；重用 SkillAgent，不重寫規則）
   ----
   * 輸入：自然語言任務、slash 指令、附圖、/skill 手動載入規格
   * 顯示：reply；每次工具回傳兩張卡——完整原文（#編號）
@@ -19,7 +19,7 @@ rectangle NodeUser #F5F5F5 [
 ]
 
 rectangle NodeAgent #D1E5F0 [
-  **SkillAgent（Agent_Runner.py，唯一核心）**
+  **SkillAgent（agent_core/，唯一核心）**
   ----
   * 每輪重組 system prompt（尾端附工具使用檢索清單）
   * 呼叫主 session，**只看 action** 派發
