@@ -38,10 +38,10 @@
 - [semantic_map](tools/semantic_map.md) — 語義地圖：站點代號／語意名稱／說明／路段，對應目前機器人與工作包位置；也可只列站點或機器人
 
 ## 工具結果存檔
-- [result_list](tools/result_list.md) — 列出最近的工具結果存檔（編號、腳本、任務、摘要回答）；先看這個再決定搜哪一個
-- [result_grep](tools/result_grep.md) — 在指定編號（或 latest／all）的存檔裡搜關鍵字（a|b 同義詞、前後幾行）；使用者追問細節時用，不要重跑工具
+- [result_recall](tools/result_recall.md) — system prompt 尾端「工具使用檢索清單」有一筆跟使用者這句話有關時用：帶編號＋問題原文，系統把那份存檔原文交給獨立 session 依問題提煉回給你（清單規則裡有語法，可直接執行）
+- [result_grep](tools/result_grep.md) — 已知存檔編號、且能想出會命中原文的精確關鍵字時，在存檔裡搜（a|b 同義詞、前後幾行）；不要重跑工具
 - [result_view](tools/result_view.md) — 讀某個存檔的第 N 行起 M 行，看 grep 命中處的整段原文
-- [result_ask](tools/result_ask.md) — 使用者的追問跟前面工具回傳有關、但你想不出精確關鍵字時，把問題原文交給獨立 session 重新讀原文擷取重點；答得出來優先用 result_grep
+- [result_list](tools/result_list.md) — 檢索清單裡沒有相關的一筆、或要瀏覽更早／更多的存檔時，列出存檔索引（編號、腳本、任務、摘要回答）
 
 ## 記憶修改
 - [modify_memory](tools/modify_memory.md) — 寫入經驗記憶：預設全域常駐；加 `--skill <技能名稱>` 綁定該技能，只在載入其規格時出現

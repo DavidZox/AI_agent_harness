@@ -7,7 +7,7 @@ import ollama  # 導入官方庫
 import shlex
 import time
 import re
-from skills_system.scripts import _results_common  # result_ask 偽技能重用存檔解析（resolve_result／read_header／read_lines）
+from skills_system.scripts import _results_common  # result_recall 偽技能重用存檔解析（resolve_result／read_header／read_lines）
 
 class SkillAgent:
     def __init__(self, model="gemma4:e4b", max_history=None, summary_model=None):
@@ -105,7 +105,9 @@ class SkillAgent:
         # =========================
         self.session_id = time.strftime("%Y%m%d_%H%M%S")
         self.trajectory = []
-        self.trajectory_seq = 0
+        # 編號跨 session 全域遞增：從既有存檔（logs/tool_results/）的最大編號續編。純數字的 #16 才能在任何一次啟動
+        # 都指到同一份存檔——工具使用檢索清單（_tool_use_index_block）就是靠這個讓模型只需要抄編號、不必抄檔名。
+        self.trajectory_seq = self._max_archived_id()
         self.drafts_dir = os.path.join(self.base_path, "drafts")
         self.skill_model = SKILL_MODEL or self.summary_model
         self.pending_skill_draft = None
@@ -591,7 +593,7 @@ class SkillAgent:
         return "\n".join(lines)
 
     def _extract_task_oriented(self, raw_text, purpose_text, tool_tokens, omitted=0):
-        """任務導向擷取的核心呼叫（summarize_tool_result 的第一輪、自動追問的每一跳、_result_ask 共用）。
+        """任務導向擷取的核心呼叫（summarize_tool_result 的第一輪、自動追問的每一跳、_result_recall 共用）。
         raw_text 是要讀的原文，purpose_text 是錨點（可以是「使用者目標＋這一步的目的」，也可以是使用者的一句追問——
         呼叫端決定錨在什麼問題上，這裡不管錨點從哪來）。規則要求名稱與數值照抄、不推測、不給建議，並用 not_covered
         明說原始輸出沒有涵蓋什麼。結構以 format=TOOL_SUMMARY_SCHEMA 強制。
@@ -608,6 +610,7 @@ class SkillAgent:
 6. 數量、排序與門檻判斷以原始輸出裡腳本算好的結果為準（例如「共 N 個」「最新修改：」「條件 …：第一則符合 #k」），直接照抄、不要自己重數或推翻；原始輸出沒有算好而必須比較時，逐一核對原文並在 facts 引用依據（序號、原文數值或時間），無法確定就寫進 not_covered，不要猜。
 7. 精簡：answer 一句話（含關鍵數值或名稱）；facts 每項一句、不超過 60 字；全部合計不超過 {TOOL_SUMMARY_MAX_CHARS} 字。
 8. suggested_questions：使用者接下來可能想知道、但目標／問題沒問到、且原始輸出裡有資料可答的問題，最多 3 個；每個附 keywords＝在原始輸出裡搜得到的關鍵字（同義詞用 | 分隔，可含正則）。使用者的要求已經明確、輸出也已回答時給空陣列，不要硬湊。
+9. index_hint：不超過 50 字，說明「使用者這次的目標／問題」跟「這份原始輸出」的關聯是什麼——這是給之後可能完全不同一次對話的自己看的檢索線索，不是 answer 的重複；要包含具體的名稱／主題（例如「motor_rear_left 溫度與狀態查詢」），不要寫「有回答使用者的問題」這種空話。
 
 輸出 JSON 物件：
 - answer：一句話直接回答使用者的目標／問題。
@@ -615,6 +618,7 @@ class SkillAgent:
 - errors：原始輸出中的錯誤／警告／異常，照抄原文；沒有就空陣列。
 - not_covered：原始輸出沒有涵蓋、或因篇幅被省略而無法確認的部分；沒有就寫「無」。
 - suggested_questions：[{{question, keywords}}] 可追問的問題與搜尋關鍵字，最多 3 個。
+- index_hint：≤50 字，「這份輸出在查什麼」的一句話標籤，供日後跨對話檢索使用。
 """
         user_prompt = (
             f"{purpose_text}\n\n"
@@ -637,44 +641,14 @@ class SkillAgent:
             return None, False, raw
         return (data, True, raw) if isinstance(data, dict) else (None, False, raw)
 
-    def summarize_tool_result(self, result, tool_tokens, step=None, result_id=None):
-        """任務導向摘要（Task-Oriented Summarization）：開一個獨立、乾淨的一次性 session（自己的 system/user
-        prompt，不接觸 self.messages），把超過門檻的工具回傳擷取成主對話用得上的重點，摘要完就丟棄。
-
-        跟通用摘要的差別在「帶著問題讀原文」——獨立 session 同時收到兩層聚焦依據：
-        1. 使用者的目標（_build_task_anchor_text：Objective、這一輪任務的原始敘述、已核准的計畫）；
-        2. 這一步的目的（_last_assistant_step：決策 AI 剛才的 thought／reply 與執行的 action）。
-        規則要求名稱與數值照抄、不推測、不給建議，並用 not_covered 明說原始輸出沒有涵蓋什麼，主模型才知道
-        該換參數重查而不是憑空補上。結構以 format=TOOL_SUMMARY_SCHEMA 強制，解析失敗退回模型原文。
-        原始輸出超過 TOOL_SUMMARY_INPUT_MAX_CHARS 時只讀頭尾（_clip_tool_output），並在給主模型的附註標明。
-        step 可由呼叫端指定（測試用），預設取最近一則 assistant 回覆。
-        result_id 預設取最近一次 run_tool 的存檔編號：附註會告訴主模型「細節用 result_grep <編號> 搜，不要重跑工具」，
-        並把 answer 回填到 index.md；模型另外會得到 1～3 個延伸方向（附關鍵字，見 _render_tool_summary），
-        有真的缺口（not_covered）時要求主模型改用自然的一句話問使用者，不要條列或照抄。
-
-        自動追問（有界、確定性）：第一輪擷取後若 not_covered 還有缺口、且摘要自己給了 suggested_questions，
-        直接拿第一條的 keywords 對同一份存檔再跑一次 result_grep（_exec_script，不經過 run_tool，不記軌跡、
-        不產生新編號——這不是模型的動作，是同一次工具回傳的延伸擷取），把 grep 到的原文重新交給
-        _extract_task_oriented（永遠錨回 purpose_text，不是拿上一輪的摘要文字當輸入，避免摘要疊摘要）。
-        最多跳 TOOL_SUMMARY_MAX_FOLLOWUP_HOPS 次；跳滿、grep 落空或沒有 keywords 可用時照實停下，
-        not_covered 該是什麼就是什麼，不偽裝成已經解決——使用者原始問題若本來就模糊，這裡不會硬鎖定一個
-        可能不相關的答案，而是誠實地把缺口留給主模型，逼出使用者下一句話當新錨點。"""
-        anchor = self._build_task_anchor_text()
-        result_id = self.last_result_id if result_id is None else result_id
-        step = step if step is not None else (self._last_assistant_step() or {})
-        step_lines = []
-        if step.get("action"):
-            step_lines.append(f"執行的工具：{action_text(step['action'])}")
-        if step.get("thought"):
-            step_lines.append(f"決策 AI 執行前的想法：{step['thought']}")
-        if step.get("reply"):
-            step_lines.append(f"決策 AI 對使用者的說明：{step['reply']}")
-        step_text = "\n".join(step_lines) or "（沒有取得這一步的說明，請以使用者的目標為依據）"
-        purpose_text = f"【使用者的目標】\n{anchor}\n\n【這一步的目的（決策 AI 為什麼執行這個工具）】\n{step_text}"
-        clipped, omitted = self._clip_tool_output(result)
-
+    def _extract_with_followups(self, clipped, purpose_text, tool_tokens, omitted, result_id):
+        """任務導向擷取＋有界的自動追問（summarize_tool_result 與 _result_recall 共用）：先擷取一次，若 not_covered
+        還有缺口、且摘要自己給了 suggested_questions，就拿第一條的 keywords 對同一份存檔（result_id）再 result_grep
+        一次（_exec_script 直接跑腳本，不經過 run_tool、不記軌跡、不產生新編號），把 grep 到的原文重新交給
+        _extract_task_oriented——永遠錨回 purpose_text，不是拿上一輪的摘要文字當輸入。最多跳
+        TOOL_SUMMARY_MAX_FOLLOWUP_HOPS 次；跳滿、grep 落空或沒有 keywords 可用時照實停下，not_covered 該是什麼
+        就是什麼，不偽裝成已解決。回傳 (data, structured, raw_model_text)，同 _extract_task_oriented。"""
         data, structured, raw_model_text = self._extract_task_oriented(clipped, purpose_text, tool_tokens, omitted)
-
         hops = 0
         while (
             structured and data is not None and result_id
@@ -698,6 +672,48 @@ class SkillAgent:
             if not new_structured:
                 break
             data, structured = new_data, True
+        return data, structured, raw_model_text
+
+    def summarize_tool_result(self, result, tool_tokens, step=None, result_id=None):
+        """任務導向摘要（Task-Oriented Summarization）：開一個獨立、乾淨的一次性 session（自己的 system/user
+        prompt，不接觸 self.messages），把超過門檻的工具回傳擷取成主對話用得上的重點，摘要完就丟棄。
+
+        跟通用摘要的差別在「帶著問題讀原文」——獨立 session 同時收到兩層聚焦依據：
+        1. 使用者的目標（_build_task_anchor_text：Objective、這一輪任務的原始敘述、已核准的計畫）；
+        2. 這一步的目的（_last_assistant_step：決策 AI 剛才的 thought／reply 與執行的 action）。
+        規則要求名稱與數值照抄、不推測、不給建議，並用 not_covered 明說原始輸出沒有涵蓋什麼，主模型才知道
+        該換參數重查而不是憑空補上。結構以 format=TOOL_SUMMARY_SCHEMA 強制，解析失敗退回模型原文。
+        原始輸出超過 TOOL_SUMMARY_INPUT_MAX_CHARS 時只讀頭尾（_clip_tool_output），並在給主模型的附註標明。
+        step 可由呼叫端指定（測試用），預設取最近一則 assistant 回覆。
+        result_id 預設取最近一次 run_tool 的存檔編號：附註會告訴主模型「細節用 result_grep <編號> 搜，不要重跑工具」，
+        並把 answer 回填到 index.md；模型另外會得到 1～3 個延伸方向（附關鍵字，見 _render_tool_summary），
+        有真的缺口（not_covered）時要求主模型改用自然的一句話問使用者，不要條列或照抄。同時把模型產出的
+        index_hint（這份輸出跟使用者問題的關聯，≤50字）連同檔名記進 tools_use_index.md（見
+        _append_tool_use_index）——這份跟 index.md 不同，永久累加、跨 session 存活，讓再久以前的工具回傳
+        也有機會被日後的 main session 從 system prompt 尾端的檢索清單裡認出來（見 _tool_use_index_block）。
+
+        自動追問（有界、確定性；_extract_with_followups，與 _result_recall 共用）：第一輪擷取後若 not_covered 還有缺口、且摘要自己給了 suggested_questions，
+        直接拿第一條的 keywords 對同一份存檔再跑一次 result_grep（_exec_script，不經過 run_tool，不記軌跡、
+        不產生新編號——這不是模型的動作，是同一次工具回傳的延伸擷取），把 grep 到的原文重新交給
+        _extract_task_oriented（永遠錨回 purpose_text，不是拿上一輪的摘要文字當輸入，避免摘要疊摘要）。
+        最多跳 TOOL_SUMMARY_MAX_FOLLOWUP_HOPS 次；跳滿、grep 落空或沒有 keywords 可用時照實停下，
+        not_covered 該是什麼就是什麼，不偽裝成已經解決——使用者原始問題若本來就模糊，這裡不會硬鎖定一個
+        可能不相關的答案，而是誠實地把缺口留給主模型，逼出使用者下一句話當新錨點。"""
+        anchor = self._build_task_anchor_text()
+        result_id = self.last_result_id if result_id is None else result_id
+        step = step if step is not None else (self._last_assistant_step() or {})
+        step_lines = []
+        if step.get("action"):
+            step_lines.append(f"執行的工具：{action_text(step['action'])}")
+        if step.get("thought"):
+            step_lines.append(f"決策 AI 執行前的想法：{step['thought']}")
+        if step.get("reply"):
+            step_lines.append(f"決策 AI 對使用者的說明：{step['reply']}")
+        step_text = "\n".join(step_lines) or "（沒有取得這一步的說明，請以使用者的目標為依據）"
+        purpose_text = f"【使用者的目標】\n{anchor}\n\n【這一步的目的（決策 AI 為什麼執行這個工具）】\n{step_text}"
+        clipped, omitted = self._clip_tool_output(result)
+
+        data, structured, raw_model_text = self._extract_with_followups(clipped, purpose_text, tool_tokens, omitted, result_id)
 
         answer = ""
         if structured and data is not None:
@@ -711,6 +727,8 @@ class SkillAgent:
         }
         if result_id and answer:
             self.update_result_answer(result_id, answer)
+        if structured and data is not None:
+            self._append_tool_use_index(result_id, self.last_result_file, data.get("index_hint"))
         status = "失敗（[ERROR]）" if result.lstrip().startswith("[ERROR]") else "成功"
         has_gap = structured and data is not None and self._gap_reported(data.get("not_covered"))
         has_questions = structured and data is not None and bool(data.get("suggested_questions"))
@@ -845,10 +863,54 @@ class SkillAgent:
             parts.append(f"使用者已核准的任務計畫（逐步執行中）：\n{self.current_plan}")
         return "\n".join(parts) if parts else "(未取得使用者原始任務敘述)"
 
+    def _tool_use_index_block(self):
+        """system prompt 尾端的『工具使用檢索清單』：讀 tools_use_index.md 最近 TOOL_USE_INDEX_SHOW 行組成。
+        這份檔案只有觸發過任務導向擷取（summarize_tool_result／_result_recall）的回傳才有一筆，不是每次工具
+        呼叫都有；檔案本身不裁剪、跨 session（甚至跨這支程式的重新啟動）持續累加，這裡只裁「顯示視窗」——
+        目的是讓再久以前的工具回傳，只要現在的問題看起來有關，都有機會被發現，而不必模型自己記得存檔編號。
+        跟 _build_plan_context_prompt／_build_objective_prompt 同一種模式：每次組 system prompt 都重新讀檔案、
+        重新塞入，不會被滑動視窗或壓縮摘要沖掉。TOOL_USE_INDEX_SHOW<=0 時關閉（環境變數可調／可關）。"""
+        if TOOL_USE_INDEX_SHOW <= 0:
+            return ""
+        path = os.path.join(self.results_dir(), TOOL_USE_INDEX_NAME)
+        if not os.path.exists(path):
+            return ""
+        try:
+            with open(path, encoding="utf-8") as f:
+                lines = [ln for ln in f.read().splitlines() if ln.strip()]
+        except OSError:
+            return ""
+        rows = []
+        for ln in lines[-TOOL_USE_INDEX_SHOW:][::-1]:   # 新→舊
+            parts = ln.split(" | ", 4)
+            if len(parts) >= 5:
+                rid, ts, _, _, hint = parts
+                rows.append(f"- {rid.strip()}（{ts.strip()}）：{hint.strip()}")
+        if not rows:
+            return ""
+        rows_text = "\n".join(rows)
+        return f"""
+            ## 工具使用檢索清單（Tool Use Index）
+            以下每筆是過去某次工具回傳的存檔（可能是很早之前、甚至上次啟動的）跟當時問題的關聯描述；只是線索，原文不在這裡：
+            {rows_text}
+
+            規則:
+            - 回答使用者之前，先判斷這句話是不是在接續、追問或延伸其中一筆（例如「剛剛那些腳本」「之前查的那個馬達」）；
+              不確定就當作無關，不要牽強附會
+            - 使用者的話裡有「那個」「那些」「剛剛」「之前」「隨便選一個」這類指涉、而目前對話裡找不到它指的是什麼時，
+              多半是在指清單裡最近的一筆（最上面那筆最新）——先用清單處理，不要反問使用者「你指的是哪一類」
+            - 有關時直接執行 EXECUTE: scripts/result_recall_cmd.py <編號> "<使用者這句話的原文>"（編號＝上面的 #數字；
+              第二個參數抄使用者說的話、不是清單上的描述；不用先載入規格、不要先 result_list 或 result_grep）：系統會把
+              那份存檔的完整原文連同使用者現在的問題交給獨立 session 提煉後回給你，你再據此回答或做下一步
+            - 使用者問的是「現在」「目前」「最新」的狀態時，舊存檔只是參考，優先重新執行當時的工具查最新狀態
+            - result_recall 回報「找不到結果」時，代表原始檔已超過保留上限被清掉：誠實告訴使用者這筆資料已經不在，不要用猜的
+            """
+
     def get_system_prompt(self):
 
         objective_prompt = self._build_objective_prompt()
         plan_prompt = self._build_plan_context_prompt()
+        tool_use_index_prompt = self._tool_use_index_block()
 
         profile = ""
         if os.path.exists(self.profile_file):
@@ -876,6 +938,7 @@ class SkillAgent:
                 {history_summary}
                 ## Available Skills (SKILLS.md)
                 {skills}
+                {tool_use_index_prompt}
                 """
 
     def set_current_task(self, text):
@@ -1138,11 +1201,11 @@ class SkillAgent:
                         f"不要向使用者解釋規格內容，也不要詢問是否要執行。\n{skill_doc}")
 
             script_name = self._normalize_script_name(raw_token)
-            if script_name == "result_ask_cmd.py":
-                # 偽技能：result_ask 沒有實體 scripts/result_ask_cmd.py（要呼叫 ollama.chat，只能在本
+            if script_name == "result_recall_cmd.py":
+                # 偽技能：result_recall 沒有實體 scripts/result_recall_cmd.py（要呼叫 ollama.chat，只能在本
                 # process 內做，見 README「Agent_Runner.py 是唯一的核心來源」），必須在存在性檢查前攔截，
                 # 否則會落入下面「找不到腳本」的分支。規格文件走一般的兩階段揭露，不受影響。
-                return self._result_ask(remainder)
+                return self._result_recall(remainder)
             script_path = os.path.join(self.base_path, "scripts", script_name)
 
             print(f"🛠️  Agent 啟動工具: {script_name}")
@@ -1206,46 +1269,63 @@ class SkillAgent:
             output_text = f"[ERROR] 腳本 {script_name} 異常結束（exit code {res.returncode}）:\n{output_text}"
         return output_text
 
-    def _result_ask(self, remainder):
-        """result_ask 偽技能：main session 認得出使用者在追問前面某份存檔的內容、但想不出精確關鍵字時，
-        把問題原封不動交給獨立 session，重新讀那份存檔的完整原文並針對這個新問題擷取重點——跟 result_grep
-        的差別是這裡的錨點是使用者這句話本身，不是 _build_task_anchor_text／_last_assistant_step 那組舊錨點。
-        跟 summarize_tool_result 共用 _extract_task_oriented／_render_tool_summary；跟自動追問（同方法內的
-        迴圈）不同的是，這是 main session 主動選的一次動作，要比照其他技能記軌跡、產生新的存檔編號。"""
+    def _result_recall(self, remainder):
+        """result_recall 偽技能——工具使用檢索清單（system prompt 尾端）的取回路徑：main session 判斷使用者這句話跟
+        清單裡某一筆有關後，帶那筆的編號＋使用者的問題原文執行；這裡把那份存檔的完整原文重新讀出來，交給獨立
+        session 以「使用者現在的問題」為錨點提煉（_extract_with_followups：同一套任務導向擷取＋有界自動追問，
+        逐步收斂），main session 只收到提煉後的重點。跟 result_grep 的差別是錨點是使用者這句話本身、語意由獨立
+        session 理解，不是 main session 自己想關鍵字比對字面。這是 main session 主動選的一次動作，比照其他技能
+        記軌跡、產生新的存檔編號，也記進 tools_use_index.md（用自己這筆新編號，不是被取回的那筆——同一份存檔可能
+        被問很多次，每次的 index_hint 只跟這次的問題有關）。"""
         try:
             parts = shlex.split(remainder) if remainder.strip() else []
         except ValueError:
             parts = remainder.split()
         if not parts:
-            return '[ERROR] 需要指定存檔編號與問題：result_ask <編號|latest> "<問題>"。'
+            return '[ERROR] 需要指定存檔編號與問題：result_recall <編號> "<使用者的問題原文>"。'
         ref, question = parts[0], " ".join(parts[1:]).strip()
         if not question:
-            return '[ERROR] 需要問題內容：result_ask <編號|latest> "<問題>"。'
+            return '[ERROR] 需要問題內容：result_recall <編號> "<使用者的問題原文>"。'
 
         path, err = _results_common.resolve_result(ref, self.results_dir())
         if err:
-            return err
+            return (f"{err} 這個編號若來自工具使用檢索清單，代表原始檔已超過保留上限被清掉："
+                    f"直接告訴使用者這筆資料已經不在，需要的話重新執行當時的工具，不要換個編號亂試。")
         meta, body_start = _results_common.read_header(path)
         lines = _results_common.read_lines(path)
         raw = "\n".join(lines[body_start - 1:])
         result_id = meta.get("id") or ref.lstrip("#")
         tool_tokens = self.count_tokens(raw)
         clipped, omitted = self._clip_tool_output(raw)
+        hint = self._tool_use_index_hint(result_id)
+        # 錨點以 harness 自己知道的「使用者最新一句」為主（實測小模型會把清單上的描述抄進參數當問題，提煉就錨錯了）；
+        # 模型給的參數只當聚焦點，跟使用者原話或清單描述一樣時就是噪音、不帶。
+        user_now = " ".join((self.current_task or "").split())
+        focus = question if user_now and question not in (user_now, hint) else ""
+        primary = user_now or question
         purpose_text = (
-            f"【使用者現在追問的問題】\n{question}\n\n"
-            f"【這份存檔原本的任務（背景，不是現在要回答的問題）】\n{meta.get('task') or '(未知)'}"
+            f"【使用者現在的問題】\n{primary}\n"
+            + (f"【決策 AI 要聚焦的點】\n{focus}\n" if focus else "")
+            + f"\n【這份存檔的背景（不是現在要回答的問題）】\n當時的任務：{meta.get('task') or '(未知)'}\n"
+            f"執行的指令：{meta.get('command') or meta.get('script') or '(未知)'}"
+            + (f"\n檢索清單對它的描述：{hint}" if hint else "")
         )
-        data, structured, raw_model_text = self._extract_task_oriented(clipped, purpose_text, tool_tokens, omitted)
+        data, structured, raw_model_text = self._extract_with_followups(clipped, purpose_text, tool_tokens, omitted, result_id)
         if structured and data is not None:
             body = self._render_tool_summary(data, result_id)
         else:
             body = raw_model_text or "（獨立 session 沒有回傳合法結構，請改用 result_grep 自行搜尋關鍵字。）"
-        output_text = f"{TOOL_SUMMARY_TAG}\n針對追問「{question}」重新擷取存檔 #{result_id}：\n{body}"
+        output_text = (f"{TOOL_SUMMARY_TAG}\n重新讀取存檔 #{result_id}（{meta.get('script') or '?'}，{meta.get('ts') or '?'}）"
+                       f"的完整原文，針對「{primary}」{'（聚焦：' + focus + '）' if focus else ''}提煉：\n{body}\n"
+                       f"（以上是獨立 session 針對使用者現在的問題從完整原文提煉的重點；直接據此回答或做任務的下一步"
+                       f"（例如要分析某個檔案就用 view_file），不要再對同一份存檔重複 recall 或 grep，除非上面有「未涵蓋」。）")
 
-        self._record_trajectory(
-            "result_ask_cmd.py", [ref, question], output_text,
+        record = self._record_trajectory(
+            "result_recall_cmd.py", [ref, question], output_text,
             self.current_cwd, self.container_cwd, self.target_container,
         )
+        if structured and data is not None and record.get("result_file"):
+            self._append_tool_use_index(record["id"], record["result_file"], data.get("index_hint"))
         return output_text
 
 
@@ -1308,6 +1388,10 @@ class SkillAgent:
     # ---------------------------------------------------------------- 📄 工具結果存檔
     def results_dir(self):
         return os.path.join(self.script_dir, "logs", TOOL_RESULTS_DIRNAME)
+
+    def _max_archived_id(self):
+        """既有存檔裡最大的編號（沒有存檔就 0）：__init__ 用它當 trajectory_seq 的起點，讓編號跨 session 不重複。"""
+        return max((f[1] for f in _results_common.list_result_files(self.results_dir())), default=0)
 
     def _archive_tool_result(self, record, output_text):
         """把一次腳本執行的完整原始輸出寫成 logs/tool_results/<session>_<id>_<腳本>.md，並在 index.md 追加一行。
@@ -1374,6 +1458,44 @@ class SkillAgent:
             return True
         except OSError:
             return False
+
+    def _tool_use_index_hint(self, result_id):
+        """tools_use_index.md 裡某編號的關聯敘述（同編號有多筆時以最後一筆為準）；沒有就回空字串。_result_recall 拿它當背景。"""
+        path = os.path.join(self.results_dir(), TOOL_USE_INDEX_NAME)
+        key = f"#{str(result_id).lstrip('#')} | "
+        hint = ""
+        try:
+            with open(path, encoding="utf-8") as f:
+                for ln in f:
+                    if ln.startswith(key):
+                        parts = ln.rstrip("\n").split(" | ", 4)
+                        if len(parts) >= 5:
+                            hint = parts[4].strip()
+        except OSError:
+            pass
+        return hint
+
+    def _append_tool_use_index(self, result_id, filename, index_hint):
+        """把這筆任務導向擷取記進 tools_use_index.md：日後（可能是完全不同一次啟動、不同 session）main
+        session 才有機會發現「現在的問題」跟「某次工具回傳」有關，進而用 result_recall 依編號重新讀原文提煉——
+        這不是給模型翻找細節用的（細節查 result_grep／result_view），只存一句話關聯敘述，不存原文。
+        summarize_tool_result（原始工具回傳）與 _result_recall（檢索清單的取回提煉）都呼叫這裡，各自用自己剛
+        產生的 result_id／檔名——同一條規則，不特別區分「第一次」或「取回」。永遠 append、不受
+        _prune_tool_results 影響，即使原始檔之後被清掉也留著當歷史軌跡；system prompt 只顯示最近
+        TOOL_USE_INDEX_SHOW 筆，見 _tool_use_index_block。沒有 result_id、拿不到檔名、或模型沒給出
+        index_hint 時不寫——沒檔名代表原文根本沒存成功，寫了也是死線索。檔名只是給人看／除錯用，
+        模型只需要抄編號（編號從啟動時的最大存檔編號續編，跨 session 不重複）。"""
+        hint = " ".join(str(index_hint or "").split())[:TOOL_USE_INDEX_HINT_MAX]
+        if not result_id or not filename or not hint:
+            return
+        try:
+            d = self.results_dir()
+            os.makedirs(d, exist_ok=True)
+            line = f"#{result_id} | {time.strftime('%Y-%m-%d %H:%M')} | {self.session_id} | {filename} | {hint}"
+            with open(os.path.join(d, TOOL_USE_INDEX_NAME), "a", encoding="utf-8") as f:
+                f.write(line + "\n")
+        except OSError:
+            pass
 
     def result_file_path(self, ref):
         """'16'／'#16'（優先目前 session）、'latest'、'index' 或檔名 → 完整路徑；找不到回 None。Web 的 /api/results/<ref> 用。"""
@@ -2265,12 +2387,24 @@ TRAJECTORY_LOG = "trajectory.jsonl"   # logs/ 下的軌跡稽核記錄（每次�
 # 📄 工具結果存檔：每次腳本執行的完整原始輸出都存成 logs/tool_results/<session>_<id>_<腳本>.md（key: value 檔頭 + 原文），
 # 並在 index.md 記一行（編號、時間、腳本、狀態、大小、任務、摘要回答）。摘要只讀頭尾、主對話只拿重點，被省略的細節不再是黑洞：
 # 模型用 result_list／result_grep／result_view 三個技能回查，不必重跑觀察型工具。技能規格文件不存（它不是執行結果）。
-# 編號＝軌跡 id（同一個 session 內遞增），/make_skill 與稽核對得上。保留最近 N 個檔且總大小不超過上限，超過刪最舊的。
+# 編號＝軌跡 id，啟動時從既有存檔的最大編號續編（跨 session 不重複，見 _max_archived_id），/make_skill 與稽核對得上。
+# 保留最近 N 個檔且總大小不超過上限，超過刪最舊的。
 TOOL_RESULTS_DIRNAME = "tool_results"
 TOOL_RESULTS_INDEX = "index.md"
 TOOL_RESULTS_KEEP = int(os.environ.get("AGENT_TOOL_RESULTS_KEEP", "200"))
 TOOL_RESULTS_MAX_MB = float(os.environ.get("AGENT_TOOL_RESULTS_MAX_MB", "50"))
 TOOL_RESULT_FILE_RE = re.compile(r"^\d{8}_\d{6}_\d{3,}_.+\.md$")
+
+# 🔎 工具使用檢索清單（logs/tool_results/tools_use_index.md）：跟 index.md 不同檔、不同用途——index.md 是
+# 「每次執行都記一筆」的稽核清單，會隨 _prune_tool_results 一起被裁；這份只有真的觸發過任務導向擷取
+# （summarize_tool_result／_result_recall，見 _append_tool_use_index）才會記一筆：編號、時間、session、檔名、
+# 「使用者問題 x 原始輸出」的 50 字關聯敘述（index_hint）。編號從啟動時既有存檔的最大編號續編（跨 session 不重複），
+# 所以模型只要抄編號執行 result_recall 就能取回正確那份；檔名只是給人看／除錯用。這個檔案永遠只 append，
+# 不隨舊存檔被裁掉而刪除對應行；get_system_prompt 只在 system prompt 尾端顯示最近 N 筆（_tool_use_index_block），
+# 是「顯示視窗」不是資料上限。
+TOOL_USE_INDEX_NAME = "tools_use_index.md"
+TOOL_USE_INDEX_SHOW = int(os.environ.get("AGENT_TOOL_USE_INDEX_SHOW", "30"))
+TOOL_USE_INDEX_HINT_MAX = 50
 TASK_HISTORY_KEEP = 3   # 任務線：摘要錨點帶最近幾則使用者訊息（使用者回答追問時，最新一句往往只是關鍵字，原本要做什麼在前一句）
 TRAJECTORY_OUTPUT_HEAD = 300          # 每筆軌跡保留的輸出開頭字元數（讓草擬模型知道結果長什麼樣）
 DEFAULT_SKILL_CATEGORY = "自建技能"   # 模型選的分類不在 SKILLS.md 裡時的落點（沒有這個段落會自動建立）
@@ -2415,8 +2549,9 @@ TOOL_SUMMARY_SCHEMA = {
                 "required": ["question", "keywords"],
             },
         },
+        "index_hint": {"type": "string"},
     },
-    "required": ["answer", "facts", "errors", "not_covered", "suggested_questions"],
+    "required": ["answer", "facts", "errors", "not_covered", "suggested_questions", "index_hint"],
 }
 
 # run_tool 載入技能規格文件時回傳字串的固定開頭。規格文件是「按需載入」機制的核心，
