@@ -560,7 +560,7 @@ class SkillAgent:
 
     @staticmethod
     def _render_tool_summary(data, result_id=None):
-        """把 TOOL_SUMMARY_SCHEMA 的 JSON 排成固定結構的純文字（回答／相關事實／錯誤／未涵蓋／可追問）。"""
+        """把 TOOL_SUMMARY_SCHEMA 的 JSON 排成固定結構的純文字（回答／相關事實／錯誤／未涵蓋／延伸方向）。"""
         if not isinstance(data, dict):
             raise TypeError("tool summary JSON 不是物件")
 
@@ -581,9 +581,13 @@ class SkillAgent:
             lines.append(f"未涵蓋：{not_covered}")
         questions = [q for q in (data.get("suggested_questions") or []) if isinstance(q, dict) and str(q.get("question") or "").strip()][:3]
         if questions:
-            where = f"（存檔 #{result_id}，可用 result_grep {result_id} <關鍵字> 搜）" if result_id else "（可用 result_grep 在存檔裡搜）"
-            lines.append(f"可追問{where}：")
-            lines += [f"- {str(q['question']).strip()} ← 關鍵字：{str(q.get('keywords') or '').strip() or '（未給）'}" for q in questions]
+            where = f"（存檔 #{result_id}）" if result_id else ""
+            # 這段是給決策 AI 自己參考的延伸方向，不是要它照抄給使用者看：故意不用「可追問」這種標籤式字眼，
+            # 並在文字裡直接要求改寫成自然的一句話——小模型很容易把看到的格式原樣複誦。
+            lines.append(f"使用者接下來可能還想知道{where}（你自己判斷要不要主動問；要問就用一句自然的話問，"
+                         f"不要條列、不要照抄下面的文字）：")
+            lines += [f"- {str(q['question']).strip()}（對應 result_grep 關鍵字：{str(q.get('keywords') or '').strip() or '（未給）'}）"
+                      for q in questions]
         return "\n".join(lines)
 
     def _extract_task_oriented(self, raw_text, purpose_text, tool_tokens, omitted=0):
@@ -645,7 +649,8 @@ class SkillAgent:
         原始輸出超過 TOOL_SUMMARY_INPUT_MAX_CHARS 時只讀頭尾（_clip_tool_output），並在給主模型的附註標明。
         step 可由呼叫端指定（測試用），預設取最近一則 assistant 回覆。
         result_id 預設取最近一次 run_tool 的存檔編號：附註會告訴主模型「細節用 result_grep <編號> 搜，不要重跑工具」，
-        並把 answer 回填到 index.md；模型另外會得到 1～3 個「可追問」（附關鍵字），使用者的要求是探索型時可拿去問。
+        並把 answer 回填到 index.md；模型另外會得到 1～3 個延伸方向（附關鍵字，見 _render_tool_summary），
+        有真的缺口（not_covered）時要求主模型改用自然的一句話問使用者，不要條列或照抄。
 
         自動追問（有界、確定性）：第一輪擷取後若 not_covered 還有缺口、且摘要自己給了 suggested_questions，
         直接拿第一條的 keywords 對同一份存檔再跑一次 result_grep（_exec_script，不經過 run_tool，不記軌跡、
@@ -707,13 +712,24 @@ class SkillAgent:
         if result_id and answer:
             self.update_result_answer(result_id, answer)
         status = "失敗（[ERROR]）" if result.lstrip().startswith("[ERROR]") else "成功"
-        recall = (
-            f"完整原始輸出已存成結果檔 #{result_id}：需要摘要以外的細節（含「未涵蓋」或被省略的部分）時，"
-            f"用 result_grep {result_id} <關鍵字|同義詞> 在存檔裡搜、或 result_view {result_id} 看片段，不要重新執行同一個工具。"
-            f"使用者的要求若是探索型（看一下／觀察一下），可把「可追問」列給使用者選；要求明確就直接回答並提一下存檔編號。"
-            if result_id else
-            "你看不到原始輸出：需要其他資訊時，換更精確的參數重新執行工具，不要憑空補上。"
-        )
+        has_gap = structured and data is not None and self._gap_reported(data.get("not_covered"))
+        has_questions = structured and data is not None and bool(data.get("suggested_questions"))
+        if result_id:
+            base_recall = (
+                f"完整原始輸出已存成結果檔 #{result_id}：需要摘要以外的細節（含「未涵蓋」或被省略的部分）時，"
+                f"用 result_grep {result_id} <關鍵字|同義詞> 在存檔裡搜、或 result_view {result_id} 看片段，不要重新執行同一個工具。"
+            )
+            if has_gap and has_questions:
+                # 這裡的「未涵蓋」是自動追問已經跳過 TOOL_SUMMARY_MAX_FOLLOWUP_HOPS 次仍解不開的缺口，
+                # harness 已經盡力，這時交回使用者選方向比主模型自己硬猜更可靠。
+                recall = base_recall + (
+                    "上面的缺口 harness 已經自動再查過還是沒解開；下一輪用 reply 自然地問使用者一句話（不要條列、不要照抄），"
+                    "不要自己選一個方向去執行——即使你已經想到要查什麼也一樣，除非使用者這句話已經對應到其中一個方向。"
+                )
+            else:
+                recall = base_recall + "已經直接回答了使用者的問題時，後面列的延伸方向只是額外可能有興趣的，提一句自然的話或略過都可以，不必特地停下來問。"
+        else:
+            recall = "你看不到原始輸出：需要其他資訊時，換更精確的參數重新執行工具，不要憑空補上。"
         note = (
             f"（原始輸出約 {tool_tokens} tokens，超過門檻 {TOOL_RESULT_TOKEN_THRESHOLD}；以上由獨立 session 依使用者目標與"
             f"這一步的目的從完整輸出擷取{'，過長部分只讀了頭尾' if omitted else ''}，完整內容已顯示給使用者。{recall}）"

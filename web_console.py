@@ -795,6 +795,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
   button:disabled { opacity: 0.5; cursor: not-allowed; }
   button.secondary { background: #4a4c50; }
   button.danger { background: #b0473f; }
+  button.plan-on { background: #2f9e58; }
 
   /* ===== 📷 影像附件 ===== */
   .entry.vision { background: #1f2b33; border: 1px solid #3d6b80; color: #cfe6f0; }
@@ -813,7 +814,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
     background: #b0473f; color: white; font-size: 11px; line-height: 18px; text-align: center; cursor: pointer;
   }
   .input-row { position: relative; }
-  #attach-btn { white-space: nowrap; }
+  #attach-btn, #plan-btn { white-space: nowrap; }
   #attach-menu {
     display: none; position: absolute; bottom: 62px; left: 0; z-index: 100;
     background: #26282c; border: 1px solid #3a3c40; border-radius: 8px; padding: 6px;
@@ -905,6 +906,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
       <button onclick="attachFromFile()">📁 選擇檔案</button>
     </div>
     <button class="secondary" id="attach-btn" title="附加影像：框選畫面或選擇檔案" onclick="toggleAttachMenu()">📷</button>
+    <button class="secondary" id="plan-btn" title="切換 Plan 模式：開啟後，下一個新任務會先規劃步驟、你核准才執行" onclick="togglePlanMode()">📝 Plan</button>
     <textarea id="msg" placeholder="輸入訊息；打「/」選擇功能開關或手動載入技能規格...（Enter 送出，Shift+Enter 換行；📷 可附加影像）"></textarea>
     <button id="send-btn" onclick="sendMessage()">送出</button>
     <input type="file" id="file-input" accept="image/*" multiple style="display:none">
@@ -923,7 +925,9 @@ const skillDraftBar = document.getElementById('skill-draft-bar');
 const attachStrip = document.getElementById('attach-strip');
 const attachMenu = document.getElementById('attach-menu');
 const attachBtn = document.getElementById('attach-btn');
+const planBtn = document.getElementById('plan-btn');
 const fileInput = document.getElementById('file-input');
+let planModeOn = false;  // updateStatus() 依 stats.plan_mode 同步；只用來決定按鈕外觀與切換方向
 
 function renderEntry(container, cls, tag, text, oversized) {
   const div = document.createElement('div');
@@ -1003,7 +1007,13 @@ let compressPoll = null;  // /parallel_cal on 背景壓縮進行中時，定期�
 
 function updateStatus(stats) {
   document.getElementById('stat-mode').textContent =
-    'mode: ' + stats.mode + (stats.parallel_cal ? ' · parallel_cal' : '');
+    'mode: ' + stats.mode + (stats.parallel_cal ? ' · parallel_cal' : '') + (stats.plan_mode ? ' · plan' : '');
+  planModeOn = !!stats.plan_mode;
+  planBtn.classList.toggle('plan-on', planModeOn);
+  planBtn.textContent = planModeOn ? '📝 Plan ✓' : '📝 Plan';
+  planBtn.title = planModeOn
+    ? '切換 Plan 模式：目前已開啟，點一下關閉（不影響已在等待核准的計畫）'
+    : '切換 Plan 模式：開啟後，下一個新任務會先規劃步驟、你核准才執行';
   document.getElementById('stat-cwd').textContent = 'cwd: ' + stats.current_cwd;
   document.getElementById('stat-container').textContent = 'container: ' + (stats.target_container || '-');
   const tokensEl = document.getElementById('stat-tokens');
@@ -1035,6 +1045,19 @@ function setBusy(busy) {
   sendBtn.disabled = busy;
   msgBox.disabled = busy;
   attachBtn.disabled = busy;
+  planBtn.disabled = busy;
+}
+
+async function togglePlanMode() {
+  setBusy(true);
+  try {
+    applyDone(await streamPost('/api/send', { message: planModeOn ? '/plan off' : '/plan on' }));
+  } catch (e) {
+    renderEntry(toolLog, 'system', '錯誤', '與伺服器的連線中斷：' + e);
+  } finally {
+    setBusy(false);
+    msgBox.focus();
+  }
 }
 
 function showDecisionBar(pendingMode) {

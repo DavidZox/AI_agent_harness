@@ -36,7 +36,7 @@
 
 ![AI_agent_harness 一回合的狀態機](doc/images/AI_agent_harness的狀態轉移.png)
 
-上圖是一回合內的狀態轉移：1 收訊息（slash 由 harness 處理；文字任務記任務線；附圖先走視覺 session）→ 2 組提示詞（硬水位檢查）→ 3 主 session 回 JSON → 4 只看 `action` 分派：`null` 結束、技能名稱把規格文件當工具回傳直接進 6c、腳本路徑進入 5 執行 → 6a 落地（同步狀態、記軌跡、原文存檔 #id、完整顯示給使用者）→ 6b 決定進主對話的內容（規格文件或 ≤500 tokens 原文；>500 交獨立摘要 session，得到回答、事實、可追問與存檔編號；關閉或失敗只給成功／失敗）→ 6c 包框架句後依 manual／hybrid／auto 決策 → 回到 3 或結束 → 7 回合結束後做軟水位壓縮。8 是下一回合的追問回查：模型改用 `result_grep` 在存檔裡搜，不重跑工具。Plan 模式與 `/make_skill` 掛在主流程旁邊。
+上圖是一回合內的狀態轉移：1 收訊息（slash 由 harness 處理；文字任務記任務線；附圖先走視覺 session）→ 2 組提示詞（硬水位檢查）→ 3 主 session 回 JSON → 4 只看 `action` 分派：`null` 結束、技能名稱把規格文件當工具回傳直接進 6c、腳本路徑進入 5 執行 → 6a 落地（同步狀態、記軌跡、原文存檔 #id、完整顯示給使用者）→ 6b 決定進主對話的內容（規格文件或 ≤500 tokens 原文；>500 交獨立摘要 session，得到回答、事實、延伸方向與存檔編號；關閉或失敗只給成功／失敗）→ 6c 包框架句後依 manual／hybrid／auto 決策 → 回到 3 或結束 → 7 回合結束後做軟水位壓縮。8 是下一回合的追問回查：模型改用 `result_grep` 在存檔裡搜，不重跑工具。Plan 模式與 `/make_skill` 掛在主流程旁邊。
 
 ---
 
@@ -109,9 +109,9 @@ Web Console 另有 `MAX_AUTO_ITERATIONS = 25`：Auto 模式連續執行工具超
 
 **數值交給腳本算，摘要只做過濾**：實測 gemma4:e4b 對「哪個檔案最新」「幾個 topic 含 costmap」這類比較／計數題 0/5 答對，開 `think=True` 也只有 2/5 且一次 17 秒；26b 開推論才 3/3，但一次 35～60 秒。所以比較、計數、排序、門檻判斷全部放進腳本：`list_dir` 標頭給數量與「最新修改」、`--filter`／`--newest`；`find_file`／`search_text` 標頭給數量；`ROS2_topic_list`／`ROS2_node_list` 的 `--filter` 計數；`ROS2_topic_echo --where 欄位<值` 算出幾則符合、第一則符合的序號與值。摘要 prompt 規定腳本算好的數字直接照抄、不得重數或推翻；各規格文件要求模型遇到這類問題改用對應選項。摘要 session 維持 `think=False`。
 
-**工具結果存檔與回查（`result_list`／`result_grep`／`result_view`）**：摘要會丟細節、原文進主對話會污染上下文，兩者都不選：每次腳本執行的完整原始輸出由 `_record_trajectory()` 順手存成 `logs/tool_results/<session>_<編號>_<腳本>.md`（簡單 key: value 檔頭：編號、時間、腳本、指令、cwd、容器、狀態、字數、當時的任務；不用 PyYAML），並在 `index.md` 記一行；摘要 session 產出的「回答」會回填到索引那一行。編號＝軌跡 id，`/make_skill` 與稽核對得上。技能規格文件不存（它不是執行結果）。摘要 schema 多了 `suggested_questions`（最多 3 個「可追問」，各附可搜尋的關鍵字），附註改成「細節用 `result_grep <編號> <關鍵字>` 搜，不要重跑工具」——觀察型技能不必再等一次擷取，摘要只讀頭尾時被省略的中段也搜得到。交握原則寫在規格文件與附註裡（`AGENT.md` 沒有預算）：使用者的要求明確就直接回答並提存檔編號；探索型（看一下／觀察一下）才把可追問列給使用者選。使用者回答追問時最新一句常只剩關鍵字，所以摘要錨點帶「任務線」——最近 3 則使用者訊息（`task_history`）。`result_grep` 的輸出走一樣的門檻：超過 500 tokens 交給獨立 session（它拿到的正是使用者的追問），沒超過直接進主對話。安全：正則長度上限 200、逐行比對帶 3 秒預算（防災難性回溯）、路徑只取檔名鎖在存檔目錄；保留最近 200 個檔且總量 50 MB（`AGENT_TOOL_RESULTS_KEEP`／`AGENT_TOOL_RESULTS_MAX_MB`），刪最舊的並同步索引；`logs/` 已 `.gitignore`（輸出可能含敏感內容）。CLI 印「📄 已存檔 #16」，Web 卡片標題帶編號並可點開 `/api/results/<編號>` 看原文。
+**工具結果存檔與回查（`result_list`／`result_grep`／`result_view`）**：摘要會丟細節、原文進主對話會污染上下文，兩者都不選：每次腳本執行的完整原始輸出由 `_record_trajectory()` 順手存成 `logs/tool_results/<session>_<編號>_<腳本>.md`（簡單 key: value 檔頭：編號、時間、腳本、指令、cwd、容器、狀態、字數、當時的任務；不用 PyYAML），並在 `index.md` 記一行；摘要 session 產出的「回答」會回填到索引那一行。編號＝軌跡 id，`/make_skill` 與稽核對得上。技能規格文件不存（它不是執行結果）。摘要 schema 多了 `suggested_questions`（最多 3 個延伸方向，各附可搜尋的關鍵字），附註改成「細節用 `result_grep <編號> <關鍵字>` 搜，不要重跑工具」——觀察型技能不必再等一次擷取，摘要只讀頭尾時被省略的中段也搜得到。交握原則寫在規格文件與附註裡（`AGENT.md` 沒有預算，見 2026-09-26 那段）：有真的缺口（`not_covered`）時，主模型要用自然的一句話問使用者，不列清單、不照抄 `suggested_questions` 的文字；已經直接回答時，延伸方向只是順口一提或略過。使用者回答追問時最新一句常只剩關鍵字，所以摘要錨點帶「任務線」——最近 3 則使用者訊息（`task_history`）。`result_grep` 的輸出走一樣的門檻：超過 500 tokens 交給獨立 session（它拿到的正是使用者的追問），沒超過直接進主對話。安全：正則長度上限 200、逐行比對帶 3 秒預算（防災難性回溯）、路徑只取檔名鎖在存檔目錄；保留最近 200 個檔且總量 50 MB（`AGENT_TOOL_RESULTS_KEEP`／`AGENT_TOOL_RESULTS_MAX_MB`），刪最舊的並同步索引；`logs/` 已 `.gitignore`（輸出可能含敏感內容）。CLI 印「📄 已存檔 #16」，Web 卡片標題帶編號並可點開 `/api/results/<編號>` 看原文。
 
-**自動追問與 `result_ask`（2026-09-26）**：`summarize_tool_result()` 擷取後若 `not_covered` 還有缺口、且摘要自己給出了 `suggested_questions`，會拿第一條的 keywords 對同一份存檔自動再 `result_grep` 一次（`_exec_script` 直接跑腳本，不經過 `run_tool`、不記軌跡、不產生新編號——這不是模型的動作，是同一次工具回傳的延伸擷取，只印一行 `🔁 自動追問` 讓使用者看得到），把 grep 到的原文重新交給同一個擷取函式（`_extract_task_oriented`，`summarize_tool_result`／自動追問／`result_ask` 三處共用），永遠錨回原始的「使用者目標＋這一步的目的」，不是拿上一輪的摘要文字當輸入。最多跳 `TOOL_SUMMARY_MAX_FOLLOWUP_HOPS`（預設 2，`AGENT_TOOL_SUMMARY_MAX_HOPS`）次；跳滿、grep 落空或沒有 keywords 可用時照實停下，`not_covered` 該是什麼就是什麼，不偽裝成已解決——使用者原始問題若本來就模糊，這裡不會硬鎖定一個可能不相關的答案。`AGENT.md` 另外要求主模型看到工具回傳結尾的「可追問」清單、而使用者最新一句話沒對應其中一項時，要把選項列給使用者選（`action: null`）、不要自己猜一項執行；使用者的追問明顯跟前面的工具回傳有關、但沒有可用關鍵字時，改用新技能 `result_ask <編號|latest> "<問題>"`——這是唯一一個沒有實體 `scripts/<name>_cmd.py` 的技能：`run_tool()` 在存在性檢查前攔截 `result_ask_cmd.py`，直接呼叫 in-process 方法（要呼叫 `ollama.chat`，不能像其他技能一樣包成 subprocess），把使用者的問題原文（不是關鍵字）交給獨立 session 重新讀那份存檔的完整原文擷取重點；跟自動追問不同，這是主模型主動選的一次動作，照樣記軌跡、產生新的存檔編號。
+**自動追問與 `result_ask`（2026-09-26）**：`summarize_tool_result()` 擷取後若 `not_covered` 還有缺口、且摘要自己給出了 `suggested_questions`，會拿第一條的 keywords 對同一份存檔自動再 `result_grep` 一次（`_exec_script` 直接跑腳本，不經過 `run_tool`、不記軌跡、不產生新編號——這不是模型的動作，是同一次工具回傳的延伸擷取，只印一行 `🔁 自動追問` 讓使用者看得到），把 grep 到的原文重新交給同一個擷取函式（`_extract_task_oriented`，`summarize_tool_result`／自動追問／`result_ask` 三處共用），永遠錨回原始的「使用者目標＋這一步的目的」，不是拿上一輪的摘要文字當輸入。最多跳 `TOOL_SUMMARY_MAX_FOLLOWUP_HOPS`（預設 2，`AGENT_TOOL_SUMMARY_MAX_HOPS`）次；跳滿、grep 落空或沒有 keywords 可用時照實停下，`not_covered` 該是什麼就是什麼，不偽裝成已解決——使用者原始問題若本來就模糊，這裡不會硬鎖定一個可能不相關的答案。`AGENT.md` 另外要求主模型看到工具回傳同時有「未涵蓋」與延伸方向、而使用者最新一句話沒對應其中一個時，要用平常聊天的口吻自然地問一句（不條列、不照抄、不出現「延伸方向」「關鍵字」這些字）、`action` 填 `null`，不要自己猜一個方向執行；使用者的追問明顯跟前面的工具回傳有關、但沒有可用關鍵字時，改用新技能 `result_ask <編號|latest> "<問題>"`——這是唯一一個沒有實體 `scripts/<name>_cmd.py` 的技能：`run_tool()` 在存在性檢查前攔截 `result_ask_cmd.py`，直接呼叫 in-process 方法（要呼叫 `ollama.chat`，不能像其他技能一樣包成 subprocess），把使用者的問題原文（不是關鍵字）交給獨立 session 重新讀那份存檔的完整原文擷取重點；跟自動追問不同，這是主模型主動選的一次動作，照樣記軌跡、產生新的存檔編號。
 
 **訊息則數視窗停用**：`SkillAgent(max_history=None)` 是預設，上下文大小只由 token 門檻決定，舊內容一律摘要歸檔而不是無聲丟棄；`max_history` 只保留為可選保險絲。
 
@@ -130,7 +130,7 @@ Web Console 另有 `MAX_AUTO_ITERATIONS = 25`：Auto 模式連續執行工具超
 
 ### 2.8 Plan 模式：先規劃、經使用者核准才執行
 
-`/plan on|off`。開啟後**下一個**新任務不直接執行，而是：
+`/plan on|off`（CLI 打指令；Web Console 輸入框旁有 📝 Plan 切換鈕，開啟時變綠色並顯示「📝 Plan ✓」，點一下就是送出 `/plan on`／`/plan off`，跟打指令走同一條路徑、無需另外接 API）。開啟後**下一個**新任務不直接執行，而是：
 
 1. `build_plan_request()` 把任務包成「請依 `SKILLS.md` 規劃步驟、這輪不要執行」的請求（`[PLAN_REQUEST]`；修改意見為 `[PLAN_REVISION]`）。
 2. 模型回步驟清單，使用者 `y` 核准／`n` 取消／其他文字＝修改意見重新規劃（CLI 用 `input()` 迴圈 `_run_plan_flow()`；Web 是「📝 有計畫待你核准」提示列＋按鈕，也可直接打字）。
@@ -286,7 +286,7 @@ python3 Agent_Runner.py
 python3 web_console.py
 ```
 
-預設監聽 `http://127.0.0.1:8765`（只綁本機）。畫面左欄「使用者 ↔ Agent 對話」、右欄「系統 / 工具回傳」（規格載入、腳本結果、💭 thought、系統通知、🧠 AI 實際收到的內容、🖼️ 視覺分析卡片）。每次工具回傳固定兩張卡：先是完整原文（含「📄 已存檔 #id」連結，超過門檻標 ⚠️），緊接著是「AI 實際收到的內容」——任務導向摘要或成功／失敗判定整段顯示，完整原文或規格文件則只標一行「與上方相同」；hybrid／manual 模式下第二張在你按下加入後才出現。輸入框打「/」彈出選單（上半指令、下半 `SKILLS.md` 技能，選技能等同 `/skill`），`/menu` 列出全部指令與說明。Manual／Hybrid 模式下工具執行後出現決策按鈕；Plan 模式出現核准／取消按鈕；`/make_skill` 出現核准／重播驗證／取消按鈕；📷 可框選畫面或選檔附圖。標題列：mode、cwd、container（目標容器）、tokens 與 ctx 水位。後端端點：`POST /api/send`、`POST /api/decision`、`GET /api/status`、`GET /api/commands`、`/api/skill/*`、`/api/vision/*`。
+預設監聽 `http://127.0.0.1:8765`（只綁本機）。畫面左欄「使用者 ↔ Agent 對話」、右欄「系統 / 工具回傳」（規格載入、腳本結果、💭 thought、系統通知、🧠 AI 實際收到的內容、🖼️ 視覺分析卡片）。每次工具回傳固定兩張卡：先是完整原文（含「📄 已存檔 #id」連結，超過門檻標 ⚠️），緊接著是「AI 實際收到的內容」——任務導向摘要或成功／失敗判定整段顯示，完整原文或規格文件則只標一行「與上方相同」；hybrid／manual 模式下第二張在你按下加入後才出現。輸入框打「/」彈出選單（上半指令、下半 `SKILLS.md` 技能，選技能等同 `/skill`），`/menu` 列出全部指令與說明。Manual／Hybrid 模式下工具執行後出現決策按鈕；Plan 模式出現核准／取消按鈕；`/make_skill` 出現核准／重播驗證／取消按鈕；📷 可框選畫面或選檔附圖；旁邊的 📝 Plan 鈕直接切換 Plan 模式開關（開啟時變綠、顯示「📝 Plan ✓」），不用打指令。標題列：mode、cwd、container（目標容器）、tokens 與 ctx 水位（plan_mode 開啟時 mode 後面加 `· plan`）。後端端點：`POST /api/send`、`POST /api/decision`、`GET /api/status`、`GET /api/commands`、`/api/skill/*`、`/api/vision/*`。
 
 | 環境變數 | 預設值 | 說明 |
 | :--- | :--- | :--- |
