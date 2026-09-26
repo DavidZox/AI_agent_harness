@@ -38,8 +38,8 @@
 - [semantic_map](tools/semantic_map.md) — 語義地圖：站點代號／語意名稱／說明／路段，對應目前機器人與工作包位置；也可只列站點或機器人
 
 ## 工具結果存檔
-- [result_recall](tools/result_recall.md) — system prompt 尾端「工具使用檢索清單」有一筆跟使用者這句話有關時用：帶編號＋問題原文，系統把那份存檔原文交給獨立 session 依問題提煉回給你（清單規則裡有語法，可直接執行）
-- [result_grep](tools/result_grep.md) — 已知存檔編號、且能想出會命中原文的精確關鍵字時，在存檔裡搜（a|b 同義詞、前後幾行）；不要重跑工具
+- [result_recall](tools/result_recall.md) — 追問任何存檔的內容時用（檢索清單裡的舊紀錄、或剛剛摘要沒寫到的細節）：帶編號＋使用者的話，系統把那份存檔原文交給獨立 session 依問題提煉回給你（清單規則裡有語法，可直接執行）
+- [result_grep](tools/result_grep.md) — 使用者要找某個字串／名稱出現在存檔哪幾行時用（a|b 同義詞、前後幾行）；一般追問用 result_recall
 - [result_view](tools/result_view.md) — 讀某個存檔的第 N 行起 M 行，看 grep 命中處的整段原文
 - [result_list](tools/result_list.md) — 檢索清單裡沒有相關的一筆、或要瀏覽更早／更多的存檔時，列出存檔索引（編號、腳本、任務、摘要回答）
 
