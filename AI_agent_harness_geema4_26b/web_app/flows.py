@@ -14,7 +14,7 @@ from agent_core.config import (
 )
 from agent_core.protocol import action_text, is_exempt_result, tool_result_message
 from agent_core.turn import _append_discarded_tool_result, _content_for_context, context_kind, oversized_notice
-from .state import agent, clear_pending, pending, pending_skill_names, plan_pending, state, vision_session
+from .state import agent, clear_pending, pending, pending_skill_names, state, vision_session
 
 
 MAX_AUTO_ITERATIONS = 25  # 安全防護：避免 auto 模式下模型無限迴圈卡住伺服器
@@ -44,6 +44,7 @@ def build_stats():
         "tool_summary_mode": state["tool_summary_mode"],
         "plan_mode": state["plan_mode"],
         "current_plan": agent.current_plan or None,
+        "plan": agent.plan_stats(),   # 草稿／執行中的步驟與進度（/plan）
         "current_cwd": agent.current_cwd,
         "container_cwd": agent.container_cwd,
         "target_container": agent.target_container,
@@ -146,69 +147,31 @@ def _emit_reply_meta(parsed, events):
         events.append({"channel": "thought", "text": parsed["thought"]})
 
 
-def _ask_and_present_plan(events):
-    """呼叫一次 ask_ai() 取得計畫文字，推到 events 給前端顯示，並把
-    plan_pending 標記為待核准。跟 CLI 的 _run_plan_flow 用同一套
-    SkillAgent.build_plan_request / build_plan_revision_request，
-    只是這裡拆成「單次 HTTP 請求處理一小段」的非同步形式。"""
-    plan_raw = agent.ask_ai()
-    agent.total_ai_tokens += agent.last_ai_tokens(plan_raw)
-    if agent.auto_compressed:
-        events.append({"channel": "system", "text": "📦 上下文超過門檻，呼叫前已自動壓縮並歸檔。"})
-    agent.messages.append({'role': 'assistant', 'content': plan_raw})
-    parsed = agent.parse_reply(plan_raw)
-    _emit_reply_meta(parsed, events)
-    plan_msg = parsed["reply"] or plan_raw  # 計畫文字在 reply；就算模型夾帶了 action，規劃階段也不會執行
-    events.append({"channel": "plan", "text": plan_msg})
-    plan_pending["active"] = True
-    plan_pending["text"] = plan_msg
-
-
 def start_plan_flow(user_task, events):
-    """/plan 模式：把使用者任務包裝成規劃請求送出，取得第一版計畫。"""
-    agent.messages.append({'role': 'user', 'content': agent.build_plan_request(user_task)})
-    _ask_and_present_plan(events)
+    """/plan 模式：一次性的規劃 session 產生第一版草稿（agent_core/plan.py；不進主對話），推到前端等使用者核准或修改。"""
+    events.append({"channel": "system", "text": "📝 規劃中（一次性的規劃 session，不進主對話）…"})
+    events.append({"channel": "plan", "text": agent.plan_start_draft(user_task)})
 
 
 def handle_plan_response(text, events):
-    """處理使用者對目前待核准計畫的回應（y／n／修改意見三選一，比照 CLI）。
+    """草稿等待核准時使用者的輸入（y／n／/plan 指令／用說的改，規則在 SkillAgent.plan_handle_input，與 CLI 共用）。
 
-    安全設計跟 CLI 版一致：這個函式從頭到尾不會呼叫 agent.run_tool()，
-    確認關卡不依賴 AI 是否遵守「先別執行」的指示。
-
-    回傳 "approved" / "rejected" / "revised"。
+    安全設計跟 CLI 版一致：這個函式從頭到尾不會呼叫 agent.run_tool()，確認關卡不依賴 AI 是否遵守「先別執行」的指示。
+    回傳 "approved" / "rejected" / "edited"。
     """
-    choice = text.strip()
-
-    if choice.lower() == 'y':
-        agent.confirm_plan(plan_pending["text"])  # 存 current_plan、加 [PLAN_CONFIRMED]、軌跡記起點（與 CLI 共用）
-        plan_pending["active"] = False
-        plan_pending["text"] = None
-        # 核准即退出 Plan 模式：Plan 模式的意義是「下一個新任務先規劃」，規劃階段到此結束；
-        # 這個任務接著依 current_plan 執行，下一個新任務會直接執行（要再規劃請重新 /plan on）。
-        # 取消（n）或送修改意見則維持 Plan 模式，方便重新描述任務再規劃。
+    outcome, msg = agent.plan_handle_input(text)
+    if outcome == "approved":
+        events.append({"channel": "system", "text": msg})
+        # 核准即退出 Plan 模式：Plan 模式的意義是「下一個新任務先規劃」，規劃階段到此結束。
         if state["plan_mode"]:
             state["plan_mode"] = False
             events.append({"channel": "system", "text": (
-                "📝 計畫已核准，已自動退出 Plan 模式：這個任務會依計畫執行；"
-                "下一個新任務將直接執行（要再規劃請重新 /plan on）。"
-            )})
-        return "approved"
-
-    if choice == "" or choice.lower() in ("n", "no"):
-        agent.messages.append({
-            'role': 'user',
-            'content': "[PLAN_REJECTED]\n使用者取消了上述計畫，本次任務不會執行，請等待使用者的新指示。"
-        })
-        plan_pending["active"] = False
-        plan_pending["text"] = None
-        events.append({"channel": "system", "text": "🚫 已取消，本次任務不會執行。"})
-        return "rejected"
-
-    # 其餘輸入視為修改意見，重新規劃一次
-    agent.messages.append({'role': 'user', 'content': agent.build_plan_revision_request(choice)})
-    _ask_and_present_plan(events)
-    return "revised"
+                "📝 已自動退出 Plan 模式：這個任務依計畫執行；下一個新任務將直接執行（要再規劃請重新 /plan on）。")})
+    elif outcome == "rejected":
+        events.append({"channel": "system", "text": msg})
+    else:
+        events.append({"channel": "plan", "text": msg})
+    return outcome
 
 
 def handle_skill_draft_response(text, events):
@@ -318,7 +281,17 @@ def run_turn(events):
             return True
 
         outcome = _handle_tool_result(agent.run_tool(parsed), events)
+        for notice in agent.pop_notices():   # 計畫換下一步、連續失敗退出等
+            events.append({"channel": "system", "text": notice})
         if outcome == "end":
+            # /plan 執行中：剩下的都是不需技能的步驟就算完成；/plan_exec_guard on 時還有步驟沒做就自動提醒 AI 繼續
+            nudge = agent.plan_after_reply(parsed)
+            for notice in agent.pop_notices():
+                events.append({"channel": "system", "text": notice})
+            if nudge:
+                events.append({"channel": "system", "text": "📝 計畫還沒做完，自動提醒 AI 繼續下一步。"})
+                agent.messages.append({'role': 'user', 'content': nudge})
+                continue
             return False
         if outcome == "await":
             return True

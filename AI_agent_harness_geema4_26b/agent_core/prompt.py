@@ -51,52 +51,20 @@ class PromptMixin:
         note = f"\n（另有 {dropped} 條較舊的記憶超過載入上限，沒有載入。）" if dropped else ""
         return guide + "\n" + "\n".join(kept) + note
 
-    # ---------------------------------------------------------------- Plan 模式（使用者核准的計畫）
-    def build_plan_request(self, user_task):
-        """/plan 模式用：把使用者的原始任務包裝成「先規劃、別執行」的請求。
-        不需要另外把技能索引塞進來，因為 SKILLS.md 已經在系統提示詞裡，
-        AI 本來就看得到，這裡只需要下達規劃指令即可。"""
-        return f"""[PLAN_REQUEST]
-請先不要執行任何指令。請依照你目前看到的 SKILLS.md 技能索引，
-針對下面的任務規劃出所需的步驟清單，列出來讓使用者確認後才會開始執行。
-
-規則：
-- 用條列式（1. 2. 3. ...）列出步驟，簡短清楚即可
-- 每個步驟盡量標明會用到的技能名稱（來自 SKILLS.md），以及這步要做什麼
-- 如果某步驟不需要任何技能，直接說明要做什麼即可
-- 這一輪的 action 必須是 null（不執行任何技能），計畫寫在 reply 裡，等待使用者確認
-
-任務：
-{user_task}
-"""
-
-    def confirm_plan(self, plan_msg):
-        """使用者核准計畫（CLI 的 _run_plan_flow 與 Web 的 handle_plan_response 共用）：存進 current_plan（每次呼叫都顯示在
-        動態區，也是獨立 session 的錨點），加入 [PLAN_CONFIRMED] 訊息，並在操作軌跡記一個起點，之後 /make_skill 不指定範圍時
-        就從這裡開始取步驟。"""
-        self.current_plan = plan_msg
-        self.messages.append({
-            'role': 'user',
-            'content': "[PLAN_CONFIRMED]\n使用者已核准上述計畫，現在開始依計畫執行第一個步驟。"
-        })
-        self.add_trajectory_boundary("plan_confirmed", plan=plan_msg)
-
+    # ---------------------------------------------------------------- Plan 模式（草稿與執行在 plan.py）
     def end_plan_for_new_task(self):
-        """使用者送出新任務時（CLI／Web 共用）：上一個已核准的計畫到此結束。回傳要顯示給使用者的說明（沒有計畫時回 None）。"""
-        if not self.current_plan:
-            return None
-        self.current_plan = None
-        return "🧹 上一個已核准的計畫已隨新任務自動清除。"
-
-    def build_plan_revision_request(self, feedback):
-        """/plan 模式用：使用者對計畫不滿意時，帶著回饋重新規劃一次。規則同上。"""
-        return f"""[PLAN_REVISION]
-使用者對你剛才列出的計畫有以下修改意見，請依照意見重新規劃一份新的步驟清單。
-規則同上：計畫寫在 reply、action 必須是 null，等待使用者確認。
-
-修改意見：
-{feedback}
-"""
+        """使用者送出新訊息時（CLI／Web 共用）：做完或退出的計畫到此清掉；執行中的計畫保留（使用者可能只是在回答追問，
+        計畫要留著才能繼續），用 /plan done 提早結束。回傳要顯示給使用者的說明（沒有要說的回 None）。"""
+        status = self.plan_status()
+        if status in ("done", "aborted"):
+            self.plan_clear()
+            return "🧹 上一個計畫已結束，隨新任務清除。"
+        if status == "active":
+            return "📝 計畫仍在執行中（/plan done 可提早結束）。"
+        if self.current_plan:   # 相容：沒有草稿結構、只有文字的計畫
+            self.current_plan = None
+            return "🧹 上一個已核准的計畫已隨新任務自動清除。"
+        return None
 
     # ---------------------------------------------------------------- 各區塊
     def _build_objective_prompt(self):
@@ -125,17 +93,11 @@ class PromptMixin:
                 # 任務線：使用者回答追問時最新一句常只剩關鍵字（例如「看 motor_rear_left」），原本要做什麼在前幾句
                 parts.append("這串對話較早的使用者訊息（舊→新；最新訊息可能只是對其中一項的追問，原本的目的看這裡）：\n"
                              + "\n".join(f"{i}. {t}" for i, t in enumerate(earlier, 1)))
-        if self.current_plan:
+        if self.plan_status() == "active":
+            parts.append(f"使用者已核准的任務計畫（[→] 是目前這一步）：\n{self.plan_text()}")
+        elif self.current_plan:
             parts.append(f"使用者已核准的任務計畫（逐步執行中）：\n{self.current_plan}")
         return "\n".join(parts) if parts else "(未取得使用者原始任務敘述)"
-
-    def _build_plan_context_prompt(self):
-        """Plan 模式核准、正在執行中的計畫（動態區用）；沒有就回空字串。"""
-        if not self.current_plan:
-            return ""
-        return (f"## CURRENT APPROVED TASK PLAN\n使用者已核准以下步驟計畫，請依計畫逐步執行：\n{self.current_plan}\n"
-                "規則：一次只做一步，等系統回傳這一步的結果後再進行下一步；除非使用者明確要求變更，否則不可自行更改或遺忘此計畫；"
-                "所有步驟都做完後，向使用者回報結果並等待新指示。")
 
     def _user_words_block(self):
         """被壓縮掉的對話裡使用者的原話（程式逐字保留，見 CompressionMixin._keep_user_words），以及被壓縮的對話片段存檔編號。"""
@@ -176,6 +138,6 @@ class PromptMixin:
         state = (f"## Current Agent State\n- CURRENT_WORKING_DIRECTORY: {self.current_cwd}\n"
                  f"- CURRENT_CONTAINER_DIRECTORY: {self.container_cwd}\n"
                  f"- CURRENT_TARGET_CONTAINER: {self.target_container or '（未設定：需要容器時先用 docker_containers 查、docker_open 選定）'}")
-        blocks = [state, self._build_objective_prompt(), self._build_plan_context_prompt(), self.tool_use_index_pointer()]
+        blocks = [state, self._build_objective_prompt(), self.plan_block(), self.tool_use_index_pointer()]
         body = "\n\n".join(b for b in blocks if b)
         return ("[harness state]\n（以下是系統每次附上的目前狀態，不是使用者說的話；請回應上面那則訊息）\n" + body)

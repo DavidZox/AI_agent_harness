@@ -14,47 +14,23 @@ from .protocol import attach_skill_docs, is_exempt_result, tool_result_message
 from .turn import _append_discarded_tool_result, _content_for_context, after_turn_compression, context_kind, oversized_notice
 
 
-def _run_plan_flow(agent, user_task):
-    """/plan 模式：先讓 AI 依 SKILLS.md 規劃步驟、印出來給使用者看，
-    使用者核准後才讓 main() 的主迴圈開始真正執行（ask_ai -> run_tool）。
+def _run_plan_flow(agent, user_task=None):
+    """/plan 模式（草稿與規則在 agent_core/plan.py）：user_task 有值時先讓規劃 session 產生第一版草稿；接著等使用者
+    y 核准／n 取消／/plan 指令直接改／其他文字＝用說的改（AI 只提出要改哪幾條，harness 套用）。
 
-    安全設計：規劃階段自始至終不會呼叫 agent.run_tool()，就算模型不聽話
-    在計畫裡夾帶了 EXECUTE: 指令也不會被執行——確認關卡是靠「這個函式
-    根本不執行工具」保證的，不依賴模型是否遵守「先不要執行」的指示。
-
-    回傳 True 代表使用者已核准，main() 可以繼續往下進入正常執行迴圈；
-    回傳 False 代表使用者取消，本次任務到此為止，不會呼叫任何工具。
+    安全設計：規劃階段自始至終不會呼叫 agent.run_tool()，也不碰主對話——確認關卡是靠「這個函式根本不執行工具」保證的。
+    回傳 True 代表使用者已核准（任務原文＋[PLAN_CONFIRMED] 已加入主對話），False 代表取消。
     """
-    agent.messages.append({'role': 'user', 'content': agent.build_plan_request(user_task)})
-
+    if user_task is not None:
+        print("📝 規劃中（一次性的規劃 session，不進主對話）…")
+        print(f"\n📝 計畫草稿:\n{'-'*30}\n{agent.plan_start_draft(user_task)}\n{'-'*30}")
     while True:
-        plan_raw = agent.ask_ai()
-        agent.total_ai_tokens += agent.last_ai_tokens(plan_raw)
-        agent.messages.append({'role': 'assistant', 'content': plan_raw})
-        parsed = agent.parse_reply(plan_raw)
-        if agent.last_reply_retry:
-            print(agent.last_reply_retry)
-        plan_msg = parsed["reply"] or plan_raw  # 計畫文字在 reply；就算模型夾帶了 action，這裡也不會執行
-        if parsed["thought"]:
-            print(f"💭 {parsed['thought']}")
-        print(f"\n📝 AI 規劃的任務計畫:\n{'-'*30}\n{plan_msg}\n{'-'*30}")
-
-        choice = input("\n是否核准此計畫並開始執行？(y=核准 / n=取消 / 直接輸入修改意見=重新規劃): ").strip()
-
-        if choice.lower() == 'y':
-            agent.confirm_plan(plan_msg)
+        outcome, msg = agent.plan_handle_input(input("\n📝 計畫> "))
+        print(msg)
+        if outcome == "approved":
             return True
-
-        if choice == "" or choice.lower() in ('n', 'no'):
-            agent.messages.append({
-                'role': 'user',
-                'content': "[PLAN_REJECTED]\n使用者取消了上述計畫，本次任務不會執行，請等待使用者的新指示。"
-            })
-            print("🚫 已取消，本次任務不會執行。")
+        if outcome == "rejected":
             return False
-
-        # 其餘輸入視為修改意見，重新規劃一次
-        agent.messages.append({'role': 'user', 'content': agent.build_plan_revision_request(choice)})
 
 
 def _context_content_for_cli(agent, result, tool_tokens, use_summary):
@@ -128,6 +104,105 @@ def main():
     print("="*50)
     for notice in agent.pop_notices():   # 例如長期記憶超過載入上限
         print(notice)
+
+    def execute_turn():
+        """一個回合：反覆 ask_ai → 執行前確認 → run_tool → 依 auto／hybrid／manual 決定結果怎麼加入，直到模型不再下 action；
+        最後做軟水位檢查。模式變數（auto_mode 等）由外層的 slash 指令改，這裡只讀。"""
+        while True:
+            # --- 🧠 AI 推論 ---
+            ai_msg = agent.ask_ai()
+            ai_tokens = agent.last_ai_tokens(ai_msg)
+            agent.total_ai_tokens += ai_tokens
+            if agent.auto_cleared:
+                print(f"🧹 上下文超過門檻，呼叫前先把 {agent.auto_cleared['results']} 則舊的工具回傳清成存檔編號"
+                      f"（騰出約 {agent.auto_cleared['tokens']} tokens，原文仍在存檔）。")
+            if agent.auto_compressed:
+                print("📦 上下文超過門檻，呼叫前已自動壓縮並歸檔。")
+            parsed = agent.parse_reply(ai_msg)  # 回覆協議：顯示 reply／thought，執行只看 action
+            if agent.last_reply_retry:
+                print(agent.last_reply_retry)
+            print(f"\n🧠 AI:\n{'-'*30}\n{agent.format_reply_for_console(parsed)}\n{'-'*30}")
+            print(f"📤 AI Tokens: {ai_tokens}")
+            agent.messages.append({'role': 'assistant', 'content': ai_msg})
+
+            # --- 🛡️ 執行前關卡：會改變系統狀態的技能先問使用者（程式擋，不靠模型記得要問）---
+            guard = agent.guard_check(parsed)
+            if guard:
+                print(f"\n{agent.guard_prompt_text(guard)}")
+                if input("確定執行？(y/n): ").strip().lower() != 'y':
+                    agent.messages.append({'role': 'user', 'content': tool_result_message(agent.guard_denied_text(guard), parsed["action"])})
+                    print("🚫 已拒絕，這個動作沒有執行；請告訴 AI 要怎麼調整。")
+                    break
+
+            # --- 🧰 TOOL 執行（只看 action 欄位，reply 裡的文字不會被執行）---
+            result = agent.run_tool(parsed, approved=bool(guard))
+            for notice in agent.pop_notices():   # 計畫換下一步、連續失敗退出等
+                print(notice)
+            tool_tokens = 0
+            if result:
+                tool_tokens = agent.count_tokens(result)
+                agent.total_tool_tokens += tool_tokens
+                print(f"\n🚀 系統回傳:\n{'-'*30}\n{result}\n{'-'*30}")
+                if agent.last_result_file:
+                    print(f"📄 已存檔 #{agent.last_result_id}（logs/{TOOL_RESULTS_DIRNAME}/{agent.last_result_file}）；"
+                          f"之後可用 result_grep {agent.last_result_id} <關鍵字> 回查")
+                print(f"🧰 Tool Tokens: {tool_tokens}")
+                if tool_tokens > TOOL_RESULT_TOKEN_THRESHOLD and not is_exempt_result(result, tool_tokens):
+                    print(oversized_notice(agent, tool_tokens, tool_summary_mode))
+            else:
+                print("✅ 無工具需要執行")
+
+            # --- 📊 TOKEN 統計顯示 ---
+            print(f"\n📦 Context Tokens: {agent.context_tokens()} / 軟水位 {SOFT_TOKEN_THRESHOLD}"
+                  f" / 硬水位 {TOKEN_THRESHOLD}（num_ctx {NUM_CTX}）")
+            # 硬水位的壓縮檢查統一在 ask_ai() 呼叫前（ensure_context_budget），軟水位在回合結束後
+            # （after_turn_compression）。舊版這裡壓縮後 continue，會跳過「把工具結果加入上下文」
+            # 那一步，AI 拿不到剛執行的結果而重複下同一個指令，已移除。
+            print(f"📊 Stats | User: {agent.total_user_tokens} | AI: {agent.total_ai_tokens} | Tool: {agent.total_tool_tokens}")
+
+            # --- 模式判定流程 ---
+            if not result:
+                # /plan 執行中：剩下的都是不需技能的步驟就算完成；/plan_exec_guard on 時還有步驟沒做就自動提醒 AI 繼續
+                nudge = agent.plan_after_reply(parsed)
+                for notice in agent.pop_notices():
+                    print(notice)
+                if nudge:
+                    print("📝 計畫還沒做完，自動提醒 AI 繼續下一步。")
+                    agent.messages.append({'role': 'user', 'content': nudge})
+                    continue
+                break
+
+            # 1. Auto Mode
+            if auto_mode:
+                agent.messages.append({'role': 'user', 'content': tool_result_message(_context_content_for_cli(agent, result, tool_tokens, tool_summary_mode), parsed["action"])})
+                print("♻️ Auto Continue 中...")
+                continue
+
+            # 2. Hybrid Mode
+            if hybrid_mode:
+                choice = input("\n🤔 Hybrid Mode - 加入上下文？(y/n): ").lower()
+                if choice == 'y':
+                    agent.messages.append({'role': 'user', 'content': tool_result_message(_context_content_for_cli(agent, result, tool_tokens, tool_summary_mode), parsed["action"])})
+                    continue
+                else:
+                    _append_discarded_tool_result(agent)
+                    print("🚫 該結果已被略過 (已告知 Agent 執行結束)")
+                    # 這裡不使用 break，讓 AI 根據這個「工具執行完畢」的資訊繼續推論
+                    continue
+
+            # 3. Manual Mode
+            choice = input("\n是否將系統結果加入上下文？(y/n/stop): ").lower()
+            if choice == 'y':
+                agent.messages.append({'role': 'user', 'content': tool_result_message(_context_content_for_cli(agent, result, tool_tokens, tool_summary_mode), parsed["action"])})
+            elif choice == 'stop':
+                break
+            else:
+                _append_discarded_tool_result(agent)
+                print("👀 已略過")
+                break
+
+        # --- 🗜️ 回合結束：軟水位檢查（答案已印出，這裡壓縮不影響回覆延遲） ---
+        after_turn_compression(agent, parallel_cal, print)
 
     while True:
         try:
@@ -224,11 +299,23 @@ def main():
                 _run_make_skill_flow(agent, user_msg[len('/make_skill'):].strip())
                 continue
             if user_msg.lower() == '/plan done':
-                if agent.current_plan:
-                    agent.current_plan = None
-                    print("✅ 已提早清除目前的計畫（平常會在下一個新任務送出時自動清除）")
+                if agent.plan or agent.current_plan:
+                    agent.plan_clear()
+                    print("✅ 已清除目前的計畫與草稿")
                 else:
                     print("ℹ️ 目前沒有進行中的計畫")
+                continue
+            if user_msg.lower() in ('/plan_exec_guard on', '/plan_exec_guard off'):
+                agent.plan_exec_guard = user_msg.lower().endswith('on')
+                print("📝 已開啟計畫執行前檢查：計畫執行中，不是目前這一步、又會改變狀態的技能不執行；AI 停下來會自動提醒它繼續；"
+                      "連續失敗 3 次退出計畫" if agent.plan_exec_guard else "📝 已關閉計畫執行前檢查：計畫只顯示進度，沒有限制")
+                continue
+            # /plan add|insert|edit|del|move|show：使用者直接改草稿（不經過模型）；有草稿時進入核准流程
+            handled, plan_msg = agent.plan_edit_command(user_msg)
+            if handled:
+                print(plan_msg)
+                if agent.plan_status() == "draft" and _run_plan_flow(agent):
+                    execute_turn()
                 continue
             if user_msg.lower() == '/context_mode' or user_msg.lower().startswith('/context_mode '):
                 arg = user_msg[len('/context_mode'):].strip()
@@ -271,9 +358,7 @@ def main():
             agent.total_user_tokens += user_tokens
             print(f"📥 User Tokens: {user_tokens}")
 
-            # 新任務開始：上一個已核准的計畫到此結束，自動清除（自己規劃的清單全部做完也清掉）。計畫的生命週期 = 核准後
-            # 那個任務的執行期間（期間的工具決策、auto 迴圈、自動壓縮都不會清掉它）；再打一句新訊息就是新任務。
-            # 舊版要求手動 /plan done，容易忘記而讓舊計畫殘留在 system prompt 干擾之後的每個任務。
+            # 新訊息：做完或退出的計畫清掉；執行中的保留（使用者可能在回答追問），/plan done 提早結束
             cleared_note = agent.end_plan_for_new_task()
             if cleared_note:
                 print(cleared_note)
@@ -295,97 +380,13 @@ def main():
                 if not _run_plan_flow(agent, content):
                     after_turn_compression(agent, parallel_cal, print)  # 取消也算回合結束
                     continue  # 使用者取消了計畫，維持 Plan 模式，回到最上層等待新的輸入
-                # 核准即退出 Plan 模式：規劃階段結束，這個任務依 current_plan 執行，下一個新任務直接執行
+                # 核准即退出 Plan 模式：規劃階段結束，這個任務依計畫執行，下一個新任務直接執行
                 plan_mode = False
                 print("📝 計畫已核准，已自動退出 Plan 模式（要再規劃下一個任務請重新 /plan on）")
             else:
                 agent.messages.append({'role': 'user', 'content': content})
 
-            while True:
-                # --- 🧠 AI 推論 ---
-                ai_msg = agent.ask_ai()
-                ai_tokens = agent.last_ai_tokens(ai_msg)
-                agent.total_ai_tokens += ai_tokens
-                if agent.auto_cleared:
-                    print(f"🧹 上下文超過門檻，呼叫前先把 {agent.auto_cleared['results']} 則舊的工具回傳清成存檔編號"
-                          f"（騰出約 {agent.auto_cleared['tokens']} tokens，原文仍在存檔）。")
-                if agent.auto_compressed:
-                    print("📦 上下文超過門檻，呼叫前已自動壓縮並歸檔。")
-                parsed = agent.parse_reply(ai_msg)  # 回覆協議：顯示 reply／thought，執行只看 action
-                if agent.last_reply_retry:
-                    print(agent.last_reply_retry)
-                print(f"\n🧠 AI:\n{'-'*30}\n{agent.format_reply_for_console(parsed)}\n{'-'*30}")
-                print(f"📤 AI Tokens: {ai_tokens}")
-                agent.messages.append({'role': 'assistant', 'content': ai_msg})
-
-                # --- 🛡️ 執行前關卡：會改變系統狀態的技能先問使用者（程式擋，不靠模型記得要問）---
-                guard = agent.guard_check(parsed)
-                if guard:
-                    print(f"\n{agent.guard_prompt_text(guard)}")
-                    if input("確定執行？(y/n): ").strip().lower() != 'y':
-                        agent.messages.append({'role': 'user', 'content': tool_result_message(agent.guard_denied_text(guard), parsed["action"])})
-                        print("🚫 已拒絕，這個動作沒有執行；請告訴 AI 要怎麼調整。")
-                        break
-
-                # --- 🧰 TOOL 執行（只看 action 欄位，reply 裡的文字不會被執行）---
-                result = agent.run_tool(parsed, approved=bool(guard))
-                tool_tokens = 0
-                if result:
-                    tool_tokens = agent.count_tokens(result)
-                    agent.total_tool_tokens += tool_tokens
-                    print(f"\n🚀 系統回傳:\n{'-'*30}\n{result}\n{'-'*30}")
-                    if agent.last_result_file:
-                        print(f"📄 已存檔 #{agent.last_result_id}（logs/{TOOL_RESULTS_DIRNAME}/{agent.last_result_file}）；"
-                              f"之後可用 result_grep {agent.last_result_id} <關鍵字> 回查")
-                    print(f"🧰 Tool Tokens: {tool_tokens}")
-                    if tool_tokens > TOOL_RESULT_TOKEN_THRESHOLD and not is_exempt_result(result, tool_tokens):
-                        print(oversized_notice(agent, tool_tokens, tool_summary_mode))
-                else:
-                    print("✅ 無工具需要執行")
-
-                # --- 📊 TOKEN 統計顯示 ---
-                print(f"\n📦 Context Tokens: {agent.context_tokens()} / 軟水位 {SOFT_TOKEN_THRESHOLD}"
-                      f" / 硬水位 {TOKEN_THRESHOLD}（num_ctx {NUM_CTX}）")
-                # 硬水位的壓縮檢查統一在 ask_ai() 呼叫前（ensure_context_budget），軟水位在回合結束後
-                # （after_turn_compression）。舊版這裡壓縮後 continue，會跳過「把工具結果加入上下文」
-                # 那一步，AI 拿不到剛執行的結果而重複下同一個指令，已移除。
-                print(f"📊 Stats | User: {agent.total_user_tokens} | AI: {agent.total_ai_tokens} | Tool: {agent.total_tool_tokens}")
-
-                # --- 模式判定流程 ---
-                if not result:
-                    break
-
-                # 1. Auto Mode
-                if auto_mode:
-                    agent.messages.append({'role': 'user', 'content': tool_result_message(_context_content_for_cli(agent, result, tool_tokens, tool_summary_mode), parsed["action"])})
-                    print("♻️ Auto Continue 中...")
-                    continue
-
-                # 2. Hybrid Mode
-                if hybrid_mode:
-                    choice = input("\n🤔 Hybrid Mode - 加入上下文？(y/n): ").lower()
-                    if choice == 'y':
-                        agent.messages.append({'role': 'user', 'content': tool_result_message(_context_content_for_cli(agent, result, tool_tokens, tool_summary_mode), parsed["action"])})
-                        continue
-                    else:
-                        _append_discarded_tool_result(agent)
-                        print("🚫 該結果已被略過 (已告知 Agent 執行結束)")
-                        # 這裡不使用 break，讓 AI 根據這個「工具執行完畢」的資訊繼續推論
-                        continue
-
-                # 3. Manual Mode
-                choice = input("\n是否將系統結果加入上下文？(y/n/stop): ").lower()
-                if choice == 'y':
-                    agent.messages.append({'role': 'user', 'content': tool_result_message(_context_content_for_cli(agent, result, tool_tokens, tool_summary_mode), parsed["action"])})
-                elif choice == 'stop':
-                    break
-                else:
-                    _append_discarded_tool_result(agent)
-                    print("👀 已略過")
-                    break
-
-            # --- 🗜️ 回合結束：軟水位檢查（答案已印出，這裡壓縮不影響回覆延遲） ---
-            after_turn_compression(agent, parallel_cal, print)
+            execute_turn()
 
         except KeyboardInterrupt:
             print("\n👋 Bye")

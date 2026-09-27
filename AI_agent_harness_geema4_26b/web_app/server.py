@@ -26,7 +26,6 @@ from .state import (
     lock,
     pending,
     pending_skill_names,
-    plan_pending,
     remove_pending_skill,
     state,
     take_all_pending_skills,
@@ -117,7 +116,7 @@ class ConsoleHandler(BaseHTTPRequestHandler):
         """推出最後一行 done：帶前端收尾要用的旗標與最新 stats。"""
         stream.done(
             awaiting_decision=awaiting_decision,
-            awaiting_plan=plan_pending["active"],
+            awaiting_plan=agent.plan_status() == "draft",
             awaiting_skill_draft=agent.pending_skill_draft is not None,
             pending_mode=pending["mode"] if awaiting_decision else None,
         )
@@ -126,7 +125,7 @@ class ConsoleHandler(BaseHTTPRequestHandler):
         """回合真正結束（不在等決策、也沒有計畫待核准）時的收尾：先做軟水位檢查再送 done。
         AI 的最終回覆事件早已串流到前端，這裡的壓縮不影響使用者看到答案的時間；
         /parallel_cal on 時壓縮在背景執行緒進行，done 會立刻送出。"""
-        if not awaiting_decision and not plan_pending["active"]:
+        if not awaiting_decision and agent.plan_status() != "draft":
             after_turn_compression(
                 agent, state["parallel_cal"],
                 lambda text: stream.append({"channel": "system", "text": text}),
@@ -266,12 +265,12 @@ class ConsoleHandler(BaseHTTPRequestHandler):
         # 有計畫待核准時，輸入框的內容一律視為對計畫的回應（y／n／修改意見），
         # 不當作新指令或 slash command 處理——跟 CLI 版 _run_plan_flow 的
         # input() 迴圈行為一致。
-        if plan_pending["active"]:
+        if agent.plan_status() == "draft":
             outcome = handle_plan_response(message, stream)
             awaiting_decision = False
             if outcome == "approved":
                 awaiting_decision = run_turn(stream)
-            if outcome == "revised":
+            if outcome == "edited":
                 self._finish(stream, False)  # 仍在規劃中，不算回合結束
             else:
                 self._finish_turn(stream, awaiting_decision)  # 核准後跑完、或取消，都是回合結束

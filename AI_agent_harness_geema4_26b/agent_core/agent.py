@@ -9,6 +9,7 @@ from .config import (
     CONTEXT_MODE_DEFAULT,
     DEFAULT_CHARS_PER_TOKEN,
     GUARD_DEFAULT,
+    PLAN_EXEC_GUARD_DEFAULT,
     MAX_CHARS_PER_TOKEN,
     MIN_CHARS_PER_TOKEN,
     PROJECT_ROOT,
@@ -21,13 +22,14 @@ from .dispatch import DispatchMixin
 from .guard import GuardMixin
 from .make_skill import MakeSkillMixin
 from .perf import PerfMixin
+from .plan import PlanMixin
 from .prompt import PromptMixin
 from .tool_summary import ToolSummaryMixin
 from .tool_use_index import ToolUseIndexMixin
 from .trajectory import TrajectoryMixin
 
 
-class SkillAgent(ConversationMixin, PromptMixin, DispatchMixin, GuardMixin, ContextModeMixin,
+class SkillAgent(ConversationMixin, PromptMixin, DispatchMixin, GuardMixin, ContextModeMixin, PlanMixin,
                  ToolSummaryMixin, ToolUseIndexMixin, ArchiveMixin, TrajectoryMixin, CompressionMixin,
                  MakeSkillMixin, PerfMixin):
     def __init__(self, model="gemma4:e4b", max_history=None, summary_model=None):
@@ -59,6 +61,11 @@ class SkillAgent(ConversationMixin, PromptMixin, DispatchMixin, GuardMixin, Cont
         # 🔀 上下文管理模式（harness／claude_code，見 config.CONTEXT_MODES 與 context_mode.py）與 🛡️ 執行前關卡
         self.context_mode = CONTEXT_MODE_DEFAULT
         self.guard_enabled = GUARD_DEFAULT
+        # 📝 /plan 的草稿與執行進度（plan.py）：None 或 {task, steps:[{skill, goal, status}], status, failures, warning}；
+        # plan_exec_guard：/plan_exec_guard on 時，計畫執行中有執行前檢查與自動推進（預設關＝沒有限制）
+        self.plan = None
+        self.plan_error = None   # 最近一次規劃 session 失敗的原因（連不到 Ollama 等）
+        self.plan_exec_guard = PLAN_EXEC_GUARD_DEFAULT
 
         if not os.path.exists(self.index_file):
             raise FileNotFoundError(f"找不到技能索引：{self.index_file}")

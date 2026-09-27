@@ -296,7 +296,7 @@ class CompressionMixin:
             return content.rsplit("修改意見：\n", 1)[-1].strip() or None
         if content.startswith(HARNESS_MARKERS) or content.startswith("[harness"):
             return None
-        for marker in ("\n\n[vision result]", "\n\n" + SKILL_LOADED_MARKER):
+        for marker in ("\n\n[vision result]", "\n\n" + SKILL_LOADED_MARKER, "\n\n[PLAN_CONFIRMED]"):
             content = content.split(marker, 1)[0]
         return content.strip() or None
 

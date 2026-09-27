@@ -117,3 +117,36 @@ TOOL_SUMMARY_SCHEMA = {
     },
     "required": ["answer", "facts", "errors", "not_covered", "suggested_questions", "index_hint", "related_records"],
 }
+
+
+# /plan 草稿（PlanMixin）：第一版由規劃 session 產生整份步驟；之後的自然語言修改只輸出「要套用的操作」，
+# 不重寫整份——小模型重寫時會把 4 步變 2 步、把沒提到的步驟改掉。操作由 harness 套用在保存的草稿上。
+PLAN_DRAFT_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "steps": {"type": "array", "items": {
+            "type": "object",
+            "properties": {"skill": {"type": "string"}, "goal": {"type": "string"}},
+            "required": ["skill", "goal"],
+        }},
+    },
+    "required": ["steps"],
+}
+
+PLAN_OPS_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "ops": {"type": "array", "items": {
+            "type": "object",
+            "properties": {
+                "op": {"type": "string", "enum": ["add", "insert", "edit", "delete", "move"]},
+                "step": {"type": "integer"},
+                "to": {"type": "integer"},
+                "skill": {"type": "string"},
+                "goal": {"type": "string"},
+            },
+            "required": ["op", "step", "to", "skill", "goal"],
+        }},
+    },
+    "required": ["ops"],
+}

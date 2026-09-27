@@ -56,7 +56,7 @@ SUMMARY_ARCHIVE_KEEP = int(os.environ.get("AGENT_SUMMARY_KEEP", "30"))
 SKILL_LOADED_MARKER = "[skill loaded]"  # 使用者從選單手動載入的技能規格（附在使用者訊息後面）
 HARNESS_MARKERS = (
     "[tool result]", "[vision result]", SKILL_LOADED_MARKER,
-    "[PLAN_REQUEST]", "[PLAN_REVISION]", "[PLAN_CONFIRMED]", "[PLAN_REJECTED]",
+    "[PLAN_REQUEST]", "[PLAN_REVISION]", "[PLAN_CONFIRMED]", "[PLAN_REJECTED]", "[PLAN_CONTINUE]",
 )
 
 
@@ -215,6 +215,15 @@ GUARD_DENIED_TAG = "[DENIED]"
 # =========================================================
 PERF_LOG = "perf.jsonl"
 PERF_LOG_ENABLED = os.environ.get("AGENT_PERF_LOG", "1").strip().lower() not in ("0", "off", "false", "no")
+
+# =========================================================
+# 📝 /plan：計畫是 harness 保存的草稿（agent_core/plan.py）。PLAN_MAX_FAILURES：/plan_exec_guard on 時，連續失敗
+# （被執行前檢查擋下、[ERROR]、模型停下來沒繼續）幾次就退出計畫、交回使用者。
+# =========================================================
+PLAN_MAX_STEPS = 12
+PLAN_MAX_FAILURES = 3
+PLAN_DRAFT_FILE = "plan_draft.md"   # logs/ 下，草稿與進度（給人看）
+PLAN_EXEC_GUARD_DEFAULT = os.environ.get("AGENT_PLAN_EXEC_GUARD", "0").strip().lower() in ("1", "on", "true", "yes")
 
 # 單一工具腳本的總逾時（秒）：harness 的最後防線。各腳本自身應設定更短的逾時
 # （容器類腳本可調的上限 570 秒就是為了低於這個值），這裡只處理腳本本身卡死
