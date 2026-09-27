@@ -5,6 +5,7 @@ import re
 import shlex
 from skills_system.scripts import _results_common
 from .config import (
+    CONVERSATION_ARCHIVE_SCRIPT,
     DERIVED_RESULT_SCRIPTS,
     GREP_NO_HIT_RE,
     NUM_CTX,
@@ -15,6 +16,7 @@ from .config import (
     TOOL_SUMMARY_MAX_FOLLOWUP_HOPS,
     TOOL_SUMMARY_MAX_PREDICT,
     TOOL_SUMMARY_TAG,
+    TOOL_USE_INDEX_HINT_TARGET,
 )
 from .protocol import action_text, parse_agent_reply
 from .schemas import TOOL_SUMMARY_SCHEMA
@@ -110,7 +112,7 @@ class ToolSummaryMixin:
 6. 數量、排序與門檻判斷以原始輸出裡腳本算好的結果為準（例如「共 N 個」「最新修改：」「條件 …：第一則符合 #k」），直接照抄、不要自己重數或推翻；原始輸出沒有算好而必須比較時，逐一核對原文並在 facts 引用依據（序號、原文數值或時間），無法確定就寫進 not_covered，不要猜。
 7. 精簡：answer 一句話（含關鍵數值或名稱）；facts 每項一句、不超過 60 字；全部合計不超過 {TOOL_SUMMARY_MAX_CHARS} 字。
 8. suggested_questions：使用者接下來可能想知道、但目標／問題沒問到、且原始輸出裡有資料可答的問題，最多 3 個；每個附 keywords＝在原始輸出裡搜得到的關鍵字（同義詞用 | 分隔，可含正則）。使用者的要求已經明確、輸出也已回答時給空陣列，不要硬湊。
-9. index_hint：之後可能是完全不同的一次對話，要靠這一句話判斷「使用者那時問的事跟這份存檔有沒有關」。寫法「<使用者想知道什麼>：<這份原文是什麼、關鍵內容>」，50 字以內（一段英數路徑或檔名算 1 字），名稱照抄原文、放前面。例：「想找記憶相關檔案：skills_system/tools 清單，含 modify_memory.md、result_recall.md」「inference.py 在做什麼：原始碼，視覺推論主流程與 DEFAULT_MODEL 等設定」。不要用「此輸出」「檢視」「了解」開頭，不要重複 answer。
+9. index_hint：之後可能是完全不同的一次對話，要靠這一句話判斷「使用者那時問的事跟這份存檔有沒有關」。寫法「<使用者想知道什麼>：<這份原文是什麼、關鍵內容>」，{TOOL_USE_INDEX_HINT_TARGET} 字以內（一段英數路徑或檔名算 1 字），名稱照抄原文、放前面；寫成完整的一句話（系統整句照存、不會截斷），列不完就寫「共 N 項，含 A、B」，不要用「…」或「等等」收尾。例：「想找記憶相關檔案：skills_system/tools 清單，含 modify_memory.md、result_recall.md」「inference.py 在做什麼：原始碼，視覺推論主流程與 DEFAULT_MODEL 等設定」。不要用「此輸出」「檢視」「了解」開頭，不要重複 answer。
 10. related_records：user 訊息若附了【過去的工具使用檢索清單】，判斷使用者現在的目標／問題是否「還需要」清單裡某筆的內容才能答完整（例如要跟之前查過的東西比較、問題提到之前查過的東西、這份輸出缺的正好是那筆有的），是就列出那筆的 id（清單上的數字）與一句理由，最多 2 筆；只是同一種工具或主題相近不算；沒有清單或都不需要就給空陣列（大多數情況是空陣列）。
 
 輸出 JSON 物件：
@@ -119,7 +121,7 @@ class ToolSummaryMixin:
 - errors：原始輸出中的錯誤／警告／異常，照抄原文；沒有就空陣列。
 - not_covered：原始輸出沒有涵蓋、或因篇幅被省略而無法確認的部分；沒有就寫「無」。
 - suggested_questions：[{{question, keywords}}] 可追問的問題與搜尋關鍵字，最多 3 個。
-- index_hint：50 字以內，「<使用者想知道什麼>：<這份原文有什麼>」，供日後跨對話檢索使用。
+- index_hint：{TOOL_USE_INDEX_HINT_TARGET} 字以內的完整一句話，「<使用者想知道什麼>：<這份原文有什麼>」，供日後跨對話檢索使用。
 - related_records：[{{id, reason}}] 使用者的問題還需要的舊存檔，最多 2 筆，通常是空陣列。
 """
         catalog_block = (
@@ -384,10 +386,19 @@ class ToolSummaryMixin:
         for rid, meta, raw in loaded:
             clipped_one, om = self._clip_tool_output(raw, per_budget)
             omitted += om
-            chunks.append(clipped_one if len(loaded) == 1 else f"===== 存檔 #{rid}（{meta.get('script') or '?'}）=====\n{clipped_one}")
+            is_conv = meta.get("script") == CONVERSATION_ARCHIVE_SCRIPT
+            kind_label = "過去的對話片段" if is_conv else (meta.get('script') or '?')
+            chunks.append(clipped_one if len(loaded) == 1 else f"===== 存檔 #{rid}（{kind_label}）=====\n{clipped_one}")
             hint = self._tool_use_index_hint(rid)
-            background.append(f"#{rid}：當時的任務：{meta.get('task') or '(未知)'}；執行的指令：{meta.get('command') or meta.get('script') or '(未知)'}"
-                              + (f"；檢索清單對它的描述：{hint}" if hint else ""))
+            if is_conv:
+                # 對話片段不是工具輸出：告訴獨立 session 怎麼讀，讓它回答「當時談了什麼、決定了什麼、使用者怎麼說」
+                background.append(f"#{rid}：這份是過去被壓縮的對話原文（{meta.get('command') or ''}），不是工具輸出——"
+                                  f"[user] 是使用者當時說的話、[assistant] 是 AI 當時的想法與回覆、[harness …] 是當時的工具回傳；"
+                                  f"回答時說明當時談了什麼、查到什麼、決定了什麼，使用者的原話與名稱、數值照抄"
+                                  + (f"；檢索清單對這一段的描述：{hint}" if hint else ""))
+            else:
+                background.append(f"#{rid}：當時的任務：{meta.get('task') or '(未知)'}；執行的指令：{meta.get('command') or meta.get('script') or '(未知)'}"
+                                  + (f"；檢索清單對它的描述：{hint}" if hint else ""))
         clipped = "\n\n".join(chunks)
         tool_tokens = sum(self.count_tokens(raw) for _, _, raw in loaded)
         hints = {self._tool_use_index_hint(i) for i in ids}

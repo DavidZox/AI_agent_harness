@@ -75,10 +75,11 @@ rectangle NodeStore #E1D5E7 [
   **logs/ 與記憶（logs/ 已 .gitignore）**
   ----
   * tool_results/<session>_<編號>_<腳本>.md：每次執行的完整原文
-    （編號跨 session 唯一；留最近 200 檔／50 MB）＋ index.md
+    （編號跨 session 唯一；工具回傳留最近 200 檔／50 MB）＋ index.md
   * tool_results/tools_use_index.md：大量回傳的一句話關聯描述
-    （「#編號｜使用者想知道什麼：原文有什麼」，永久累加）
-  * 被壓縮的對話片段也存成 #編號（conversation_segment）
+    （「#編號｜使用者想知道什麼：原文有什麼」，整句不截斷，永久累加）
+  * 被壓縮的對話片段也存成 #編號（conversation_segment），描述只講那一段；
+    system prompt 另列「過去的對話片段」，保留上限另計（100 份）
   * trajectory.jsonl（操作軌跡）、summary_*.md／.json（滾動摘要＋
     使用者原話）、perf.jsonl（每次模型呼叫的耗時）
   * Memory.md（整份常駐）、skills_system/memory/<name>.md（綁技能）

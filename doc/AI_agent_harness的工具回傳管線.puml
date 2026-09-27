@@ -45,7 +45,7 @@ result_recall 哪一個，由 main session 自己決定;
     else (否)
     endif
     :**④ 一句話描述寫進工具使用檢索清單**
-logs/tool_results/tools_use_index.md;
+logs/tool_results/tools_use_index.md（整句照存、不截斷）;
     :**⑤ 附上下一步建議，連同重點交給 main session**
 ・還需要舊存檔 → 下一輪執行 result_recall 這份,那份
 ・缺口補不到 → 用自然的一句話問使用者

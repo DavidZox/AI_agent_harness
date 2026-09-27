@@ -84,8 +84,10 @@ SUMMARY_SCHEMA = {
         },
         "user_preferences": {"type": "array", "items": {"type": "string"}},
         "open_items": {"type": "array", "items": {"type": "string"}},
+        # 只描述「這次被壓掉的那一段」（不是整份滾動摘要），寫進檢索清單的「過去的對話片段」，日後靠它認出要 recall 哪一段
+        "segment_hint": {"type": "string"},
     },
-    "required": ["overview", "key_progress", "results_and_errors", "user_preferences", "open_items"],
+    "required": ["overview", "key_progress", "results_and_errors", "user_preferences", "open_items", "segment_hint"],
 }
 
 # 任務導向摘要的結構（Ollama format=）：answer 一句話回答這一步的目的、facts 照抄的相關事實、errors 錯誤原文、

@@ -73,7 +73,10 @@ USER_WORDS_MAX_CHARS = int(os.environ.get("AGENT_USER_WORDS_MAX_CHARS", "2000"))
 USER_WORD_MAX_CHARS = 300
 # 被壓縮的對話片段也存成一份工具結果存檔（同一套 #編號，可用 result_recall 取回），存檔的「腳本」欄寫這個名稱
 CONVERSATION_ARCHIVE_SCRIPT = "conversation_segment"
-CONVERSATION_ARCHIVES_SHOW = 5   # system prompt 列出最近幾份對話片段存檔的編號
+# 對話片段在檢索清單裡跟工具回傳分開顯示（system prompt「過去的對話片段」一節），名額與保留上限也各自獨立：
+# 對話片段少、價值高，不該被大量工具回傳擠出顯示視窗，也不該被工具存檔的輪替刪掉。
+CONVERSATION_ARCHIVES_SHOW = int(os.environ.get("AGENT_CONVERSATION_ARCHIVES_SHOW", "10"))
+CONVERSATION_SEGMENTS_KEEP = int(os.environ.get("AGENT_CONVERSATION_SEGMENTS_KEEP", "100"))
 
 # 🧠 長期記憶（Memory.md）載入上限（字元）：以前只讀最後 30 行，條目變多時最舊的規則會無聲消失。
 # 現在整份載入；超過上限才丟最舊的條目，並在 system prompt 與 UI 明說還有幾條沒載入。用字元數而不是 token，
@@ -113,13 +116,14 @@ TOOL_RESULT_FILE_RE = re.compile(r"^\d{8}_\d{6}_\d{3,}_.+\.md$")
 # 🔎 工具使用檢索清單（logs/tool_results/tools_use_index.md）：跟 index.md 不同檔、不同用途——index.md 是
 # 「每次執行都記一筆」的稽核清單，會隨 _prune_tool_results 一起被裁；這份只有真的觸發過任務導向擷取
 # （summarize_tool_result／_result_recall，見 _append_tool_use_index）才會記一筆：編號、時間、session、檔名、
-# 「使用者問題 x 原始輸出」的 50 字關聯敘述（index_hint）。編號從啟動時既有存檔的最大編號續編（跨 session 不重複），
+# 「使用者問題 x 原始輸出」的一句話關聯敘述（index_hint；被壓縮的對話片段則是 segment_hint）。描述整句照存、不截斷：
+# 截斷後的「…」會把名稱和結論切掉，模型就認不出這筆跟現在的問題有關；長度改由 prompt 要求模型自己寫精簡。編號從啟動時既有存檔的最大編號續編（跨 session 不重複），
 # 所以模型只要抄編號執行 result_recall 就能取回正確那份；檔名只是給人看／除錯用。這個檔案永遠只 append，
 # 不隨舊存檔被裁掉而刪除對應行；get_system_prompt 只在 system prompt 尾端顯示最近 N 筆（_tool_use_index_block），
 # 是「顯示視窗」不是資料上限。
 TOOL_USE_INDEX_NAME = "tools_use_index.md"
 TOOL_USE_INDEX_SHOW = int(os.environ.get("AGENT_TOOL_USE_INDEX_SHOW", "30"))
-TOOL_USE_INDEX_HINT_MAX = 50   # 中文字數（clip_hint 的算法），不是 len()
+TOOL_USE_INDEX_HINT_TARGET = 60   # prompt 要求的描述長度（中文字數，一段英數路徑算 1 字）；只是給模型的目標，程式不截斷
 # 看舊存檔的衍生輸出：不記進檢索清單（會跟原本那筆重複佔位，recall 到它只拿得到部分內容）
 DERIVED_RESULT_SCRIPTS = {"result_grep_cmd.py", "result_view_cmd.py", "result_list_cmd.py", "result_recall_cmd.py"}
 TASK_HISTORY_KEEP = 3   # 任務線：摘要錨點帶最近幾則使用者訊息（使用者回答追問時，最新一句往往只是關鍵字，原本要做什麼在前一句）

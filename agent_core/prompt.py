@@ -7,7 +7,7 @@
   每次呼叫只接在送出快照的最後一則訊息後面（ask_ai），不寫進 self.messages——切目錄不再讓整段歷史重算，
   而且它們離生成點最近，小模型最看得到。"""
 import os
-from .config import CONVERSATION_ARCHIVES_SHOW, MEMORY_MAX_CHARS
+from .config import MEMORY_MAX_CHARS
 
 
 class PromptMixin:
@@ -100,16 +100,14 @@ class PromptMixin:
         return "\n".join(parts) if parts else "(未取得使用者原始任務敘述)"
 
     def _user_words_block(self):
-        """被壓縮掉的對話裡使用者的原話（程式逐字保留，見 CompressionMixin._keep_user_words），以及被壓縮的對話片段存檔編號。"""
-        if not self.user_words and not self.conversation_archives:
+        """被壓縮掉的對話裡使用者的原話（程式逐字保留，見 CompressionMixin._keep_user_words）。對話片段存檔的編號與描述
+        另外列在「過去的對話片段」一節（ToolUseIndexMixin._conversation_index_block）。"""
+        if not self.user_words:
             return ""
         lines = ["## 使用者說過的話（已被壓縮的對話裡使用者的原話，程式逐字保留，舊→新）"]
         lines += [f"- [{w['ts']}] {w['text']}" if w.get("ts") else f"- {w['text']}" for w in self.user_words]
         if self.user_words_dropped:
-            lines.append(f"（更早還有 {self.user_words_dropped} 則沒有列出）")
-        if self.conversation_archives:
-            ids = "、".join(f"#{i}" for i in self.conversation_archives[-CONVERSATION_ARCHIVES_SHOW:])
-            lines.append(f"被壓縮的對話原文存成：{ids}（要看當時的完整對話，用 result_recall <編號> \"<問題>\" 取回）")
+            lines.append(f"（更早還有 {self.user_words_dropped} 則沒有列出，原文在「過去的對話片段」的存檔裡）")
         return "\n".join(lines)
 
     # ---------------------------------------------------------------- system prompt（不常變的部分）
@@ -127,6 +125,7 @@ class PromptMixin:
             f"## Long Term Memory\n{self.load_long_term_memory()}",
             f"## Recent Compressed History Summary\n{self.rolling_summary or 'No history summary yet.'}",
             self._user_words_block(),
+            self._conversation_index_block(),
             f"## Available Skills (SKILLS.md)\n{skills}",
             self._tool_use_index_block().strip(),
         ]

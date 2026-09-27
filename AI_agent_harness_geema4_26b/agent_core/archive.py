@@ -4,12 +4,14 @@ import re
 import time
 from skills_system.scripts import _results_common
 from .config import (
+    CONVERSATION_SEGMENTS_KEEP,
     TOOL_RESULT_FILE_RE,
     TOOL_RESULTS_DIRNAME,
     TOOL_RESULTS_INDEX,
     TOOL_RESULTS_KEEP,
     TOOL_RESULTS_MAX_MB,
 )
+from .tool_use_index import is_conversation_file
 
 
 class ArchiveMixin:
@@ -35,7 +37,7 @@ class ArchiveMixin:
                 "---", f"id: {record['id']}", f"session: {self.session_id}", f"ts: {time.strftime('%Y-%m-%d %H:%M:%S')}",
                 f"script: {record['script']}", f"skill: {record.get('skill') or ''}", f"command: {record['command']}",
                 f"cwd: {record['cwd']}", f"container: {record.get('target_container') or ''}", f"status: {record['status']}",
-                f"chars: {len(output_text)}", f"task: {task[:200]}", "---",
+                f"chars: {len(output_text)}", f"task: {task}", "---",
             ]
             with open(os.path.join(d, filename), "w", encoding="utf-8") as f:
                 f.write("\n".join(header) + "\n" + output_text + ("\n" if not output_text.endswith("\n") else ""))
@@ -49,13 +51,21 @@ class ArchiveMixin:
             return None
 
     def _prune_tool_results(self, d):
-        """只留最近 TOOL_RESULTS_KEEP 個檔、總大小不超過 TOOL_RESULTS_MAX_MB；刪最舊的並把 index.md 裡對應的行拿掉。"""
+        """工具回傳只留最近 TOOL_RESULTS_KEEP 個檔、總大小不超過 TOOL_RESULTS_MAX_MB；被壓縮的對話片段另外只看
+        CONVERSATION_SEGMENTS_KEEP——兩種分開算，工具跑得再多也不會把對話原文擠掉（對話片段少、價值高，而且沒辦法重跑
+        一次拿回來）。刪最舊的並把 index.md 裡對應的行拿掉。"""
         names = sorted(fn for fn in os.listdir(d) if TOOL_RESULT_FILE_RE.match(fn))   # 檔名＝session_id + 三位數編號，排序即時間順序
-        sizes = {fn: os.path.getsize(os.path.join(d, fn)) for fn in names}
+        convs = [fn for fn in names if is_conversation_file(fn)]
+        tools = [fn for fn in names if not is_conversation_file(fn)]
+        sizes = {fn: os.path.getsize(os.path.join(d, fn)) for fn in tools}
         total, removed = sum(sizes.values()), []
-        while names and (len(names) > TOOL_RESULTS_KEEP or total > TOOL_RESULTS_MAX_MB * 1024 * 1024):
-            fn = names.pop(0)
+        while tools and (len(tools) > TOOL_RESULTS_KEEP or total > TOOL_RESULTS_MAX_MB * 1024 * 1024):
+            fn = tools.pop(0)
             total -= sizes[fn]
+            os.remove(os.path.join(d, fn))
+            removed.append(fn)
+        while len(convs) > max(CONVERSATION_SEGMENTS_KEEP, 1):
+            fn = convs.pop(0)
             os.remove(os.path.join(d, fn))
             removed.append(fn)
         if removed:

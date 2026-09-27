@@ -19,7 +19,7 @@ from .config import (
     TOOL_RESULT_TOKEN_THRESHOLD,
     TOOL_TRUNCATED_TAG,
 )
-from .tool_use_index import clip_hint
+from .tool_use_index import tidy_hint
 
 
 CONTEXT_MODE_DESCRIPTIONS = {
@@ -67,7 +67,7 @@ class ContextModeMixin:
         record = self._trajectory_record(rid) or {}
         if tool_tokens > TOOL_RESULT_TOKEN_THRESHOLD and record.get("script") not in DERIVED_RESULT_SCRIPTS:
             what = f"{record.get('skill') or record.get('script') or ''} {' '.join(record.get('args') or [])}".strip()
-            hint = clip_hint(clip_hint(self.current_task or "（沒有使用者訊息）", 26) + "：" + clip_hint(what, 22))
+            hint = tidy_hint(self.current_task or "（沒有使用者訊息）") + "：" + tidy_hint(what)   # 整句照存，不截斷
             self._append_tool_use_index(rid, self.last_result_file, hint)
         header = f"（完整原文存檔 #{rid}，約 {tool_tokens} tokens）"
         if tool_tokens <= RAW_RESULT_MAX_TOKENS:

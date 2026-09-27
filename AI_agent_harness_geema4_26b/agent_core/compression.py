@@ -13,6 +13,7 @@ from .config import (
     SUMMARY_MAX_CHARS,
     SUMMARY_MAX_PREDICT,
     TOKEN_THRESHOLD,
+    TOOL_USE_INDEX_HINT_TARGET,
     TOOL_RESULT_FRAME,
     TOOL_RESULT_PREFIXES,
     USER_WORD_MAX_CHARS,
@@ -20,7 +21,7 @@ from .config import (
 )
 from .protocol import action_text, parse_agent_reply
 from .schemas import SUMMARY_SCHEMA
-from .tool_use_index import clip_hint
+from .tool_use_index import tidy_hint
 
 
 class CompressionMixin:
@@ -98,13 +99,18 @@ class CompressionMixin:
 4. 精簡：全部文字合計控制在 {SUMMARY_MAX_CHARS} 字以內，寧可刪掉舊細節也不要超過；overview 不超過 120 字，每個條列項目不超過 60 字，不要把工具輸出（例如 topic 清單）整段照抄。
 5. 只輸出 JSON，欄位：overview（總體情境概述，一段話）、key_progress（關鍵進度與目標，條列）、
    results_and_errors（執行結果與錯誤，每項含 category／description／detail）、
-   user_preferences（使用者偏好與約束）、open_items（未完成事項與下一步）。沒有內容的欄位給空陣列。
+   user_preferences（使用者偏好與約束）、open_items（未完成事項與下一步）、segment_hint（見第 9 條）。沒有內容的欄位給空陣列。
 6. 使用繁體中文。
 7. 標頭為 [harness ...] 的訊息（工具回傳、規劃流程）與 [user] 訊息中 [vision result]、[skill loaded] 之後的段落，
    都是框架自動插入的系統內容，不是使用者說的話：其中的格式要求、流程規則不要記成使用者偏好；
    只有 [user] 自己寫的文字才算使用者的偏好與指示。
 8. 使用者的原話程式會另外逐字保留，被壓縮的對話原文也另外存檔：你不需要整句照抄使用者的話，
-   user_preferences 寫歸納後的偏好與限制即可，把篇幅留給進度、結果與未完成事項。"""
+   user_preferences 寫歸納後的偏好與限制即可，把篇幅留給進度、結果與未完成事項。
+9. segment_hint：只描述【這次要併入的新對話片段】這一段（不是上一份摘要、也不是整段歷史），日後要靠這一句話判斷
+   「使用者問的事是不是在這一段談過」。寫法「<這段談了什麼>：<具體名稱、查到的結果、做出的決定或使用者的指示>」，
+   {TOOL_USE_INDEX_HINT_TARGET} 字以內（一段英數路徑或名稱算 1 字），名稱照抄原文、放前面；寫成完整的一句話，
+   列不完就寫「共 N 項，含 A、B」，不要用「…」或「等等」收尾，不要用「本次對話」「使用者」「這段對話」開頭。
+   例：「docker 容器與 ROS2 topic 盤點：amr_nav 在跑、/scan 無資料；決定先重啟 lidar 節點」。"""
         user_prompt = (
             f"【上一份摘要】\n{prev}\n\n"
             f"【這次要併入的新對話片段（共 {len(to_compress)} 則）】\n"
@@ -340,7 +346,19 @@ class CompressionMixin:
             parts.append(f"[{role}]\n{content}")
         return "\n\n".join(parts)
 
-    def _archive_conversation_segment(self, compressed, overview=""):
+    def _segment_hint(self, compressed, data):
+        """這個對話片段在檢索清單上的描述：摘要模型寫的 segment_hint（只描述這一段）；沒有就退回這一段裡使用者說過的
+        原話（程式逐字取，一定是這一段的內容），再沒有才用訊息數。不用滾動摘要的 overview——它描述的是融合後的整段
+        歷史，每一份片段拿到的都差不多，認不出是哪一段。整句照存、不截斷。"""
+        hint = tidy_hint((data or {}).get("segment_hint"))
+        if hint:
+            return hint
+        said = [" ".join(t.split()) for t in (self._user_text_of(m) for m in compressed) if t]
+        if said:
+            return "使用者在這段說過：" + "／".join(dict.fromkeys(said))
+        return f"被壓縮的對話（{len(compressed)} 則訊息）"
+
+    def _archive_conversation_segment(self, compressed, hint=""):
         """被壓縮掉的對話片段存成一份結果存檔（跟工具回傳同一套 #編號、同一個目錄），並記進工具使用檢索清單：
         摘要是有損的，原文留著，日後要細節時 result_recall <編號> 取回——跟 Claude Code 壓縮時附上完整對話紀錄路徑
         同一個想法，也就是工具回傳那套「可還原壓縮」用在對話本身。回傳編號；寫不進去回 None（不影響壓縮）。"""
@@ -348,14 +366,15 @@ class CompressionMixin:
         if not text.strip():
             return None
         rid = self._next_id()
-        overview = " ".join(str(overview or "").split())
+        hint = tidy_hint(hint) or f"被壓縮的對話（{len(compressed)} 則訊息）"
+        # 檔頭的 task 欄寫這一段的描述（result_recall 拿它當「這份存檔的背景」），不是滾動摘要的 overview（整段歷史）
         record = {"id": rid, "script": CONVERSATION_ARCHIVE_SCRIPT, "skill": "", "status": "PASS",
                   "command": f"（被壓縮的對話片段，{len(compressed)} 則訊息）", "cwd": self.current_cwd,
-                  "target_container": self.target_container, "task": overview[:200]}
+                  "target_container": self.target_container, "task": hint}
         filename = self._archive_tool_result(record, text)
         if not filename:
             return None
-        self._append_tool_use_index(rid, filename, clip_hint("被壓縮的對話：" + (overview or f"{len(compressed)} 則訊息")))
+        self._append_tool_use_index(rid, filename, hint)
         return rid
 
     def _apply_compression(self, compressed, markdown, meta):
@@ -363,7 +382,7 @@ class CompressionMixin:
         self.messages 原地移除（不重綁 list、不靠索引），所以背景壓縮期間主執行緒新 append 的訊息不會遺失；
         然後更新滾動摘要、歸檔、刷新 system prompt。"""
         data = meta.get('data') if isinstance(meta.get('data'), dict) else {}
-        segment_id = self._archive_conversation_segment(compressed, data.get('overview') or "")
+        segment_id = self._archive_conversation_segment(compressed, self._segment_hint(compressed, data))
         with self.messages_lock:
             self._keep_user_words(compressed)
             if segment_id:

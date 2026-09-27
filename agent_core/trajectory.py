@@ -62,7 +62,7 @@ class TrajectoryMixin:
             "target_container": target_container,
             "status": status,
             "output_head": output_text[:TRAJECTORY_OUTPUT_HEAD],
-            "task": (self.current_task or "")[:200],
+            "task": self.current_task or "",
             "plan_active": bool(self.current_plan),
         }
         record["result_file"] = self._archive_tool_result(record, output_text)
