@@ -81,8 +81,6 @@ def evaluate(expect, turn):
         checks["archive_ids"] = all(str(i) in used for i in expect["archive_ids"])
     if "guard" in expect:
         checks["guard"] = bool(turn["guards"]) == expect["guard"]
-    if "plan" in expect:
-        checks["plan"] = any(c["script"] == "plan_task_cmd.py" and c["args"][:1] in (["set"], ["new"]) for c in turn["tool_calls"]) == expect["plan"]
     if "memory_skill" in expect:
         mem = [c for c in turn["tool_calls"] if c["script"] == "modify_memory_cmd.py"]
         checks["memory_skill"] = any(("--skill" in c["args"] or "--move-last-to-skill" in c["args"])
@@ -183,7 +181,7 @@ def main():
     seen, reruns = set(), 0
     for c in all_calls:
         key = (c["script"], tuple(c["args"]))
-        if c["script"] not in RESULT_SCRIPTS and c["script"] != "plan_task_cmd.py" and key in seen:
+        if c["script"] not in RESULT_SCRIPTS and key in seen:
             reruns += 1
         seen.add(key)
     out = {"scenario": scenario_id, "mode": agent.context_mode, "model": agent.model,

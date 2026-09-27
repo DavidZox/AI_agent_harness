@@ -47,7 +47,7 @@ class TrajectoryMixin:
 
     def _record_trajectory(self, script_name, args, output_text, cwd, container_cwd, target_container=""):
         """run_tool 每執行一支腳本（成功、失敗、逾時都算；找不到腳本的猜測不算）記一筆。
-        記完交給任務清單（todo_auto_tick）：harness 模式下，步驟裡寫的技能執行成功就自動打勾。"""
+"""
         status = "ERROR" if output_text.lstrip().startswith("[ERROR]") else "PASS"
         record = {
             "id": self._next_id(),
@@ -70,7 +70,6 @@ class TrajectoryMixin:
         self.last_result_file = record["result_file"]
         self.trajectory.append(record)
         self._append_trajectory_log(record)
-        self.todo_auto_tick(record)
         return record
 
     def add_trajectory_boundary(self, reason, **extra):

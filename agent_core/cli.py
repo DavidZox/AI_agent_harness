@@ -224,10 +224,9 @@ def main():
                 _run_make_skill_flow(agent, user_msg[len('/make_skill'):].strip())
                 continue
             if user_msg.lower() == '/plan done':
-                if agent.current_plan or agent.todo:
+                if agent.current_plan:
                     agent.current_plan = None
-                    agent.clear_todo()
-                    print("✅ 已提早清除目前的計畫與任務清單（平常會在下一個新任務送出時自動清除）")
+                    print("✅ 已提早清除目前的計畫（平常會在下一個新任務送出時自動清除）")
                 else:
                     print("ℹ️ 目前沒有進行中的計畫")
                 continue

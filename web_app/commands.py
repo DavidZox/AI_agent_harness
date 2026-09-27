@@ -33,7 +33,7 @@ SLASH_COMMANDS = [
     {"cmd": "/skills", "desc": "列出所有可用技能", "group": "動作與查詢"},
     {"cmd": "/menu", "desc": "顯示完整指令說明", "group": "動作與查詢"},
     {"cmd": "/compress", "desc": "手動壓縮並歸檔目前的歷史對話", "group": "動作與查詢"},
-    {"cmd": "/plan done", "desc": "提早清除目前的計畫與任務清單", "group": "動作與查詢"},
+    {"cmd": "/plan done", "desc": "提早清除目前已核准的計畫", "group": "動作與查詢"},
     {"cmd": "/context_mode", "desc": "查看目前的上下文模式", "group": "動作與查詢"},
     {"cmd": "/make_skill ", "desc": "把這段做對的操作步驟編譯成新技能（後接技能名稱，可再接步驟範圍如 3-7）", "group": "動作與查詢", "args": True},
     {"cmd": "/trajectory", "desc": "列出本次 session 記錄到的腳本執行軌跡（步驟編號、成功／失敗）", "group": "動作與查詢"},
@@ -52,7 +52,7 @@ MENU_TEXT = """可用指令：
 /summarize on / /summarize off 切換工具回傳的任務導向摘要（見下方說明，預設開啟）
 /parallel_cal on / /parallel_cal off 切換平行壓縮（回合結束後的軟水位壓縮改在背景執行緒做，預設關閉）
 /plan on / /plan off    開啟 Plan 模式：下一個新任務會先規劃步驟、經你核准後才執行；核准後自動退出（預設關閉）
-/plan done              提早清除目前的計畫與任務清單（正常情況下會在你送出下一個新任務時自動清除）
+/plan done              提早清除目前已核准的計畫（正常情況下會在你送出下一個新任務時自動清除）
 /context_mode [模式]    查看或切換上下文模式：harness（預設）／claude_code，見下方說明
 /guard on / /guard off  執行前關卡（預設開啟）：會改變系統狀態的技能執行前先問你
 /objective set <內容>   設定 Sticky Objective（最高優先任務，會持續提醒 AI）
@@ -97,16 +97,12 @@ AI 的每一次回覆都是固定的 JSON（thought／reply／action），由 Ol
 - harness（預設，下一段的說明）：harness 替模型做決定，大量回傳由獨立 session 依問題擷取重點、附下一步建議。
 - claude_code：相信模型，原文直接進上下文；超過 {raw_max} tokens 保留頭尾、中間註明省略多少與存檔編號，
   要不要回存檔查（result_grep／result_view／result_recall）由 AI 自己決定。上下文超過水位時，先把舊的工具回傳
-  清成「原文在存檔 #N」的佔位（不呼叫模型、可取回），不夠才做滾動摘要。任務清單由 AI 自己勾（plan_task done）。
+  清成「原文在存檔 #N」的佔位（不呼叫模型、可取回），不夠才做滾動摘要。
 兩種模式可以隨時切換比較（之後的工具回傳才照新模式處理）；evals/ 有同一組情境跑兩種模式的評測。
 
 執行前關卡（/guard，預設開啟）：派工單（workpackage_send，--dry-run 除外）、取消任務、刪逾時任務、建容器、
 容器內非唯讀的指令（ls、cat、ros2 topic echo 這類唯讀指令直接放行），執行前畫面下方會出現「✅ 同意執行／🚫 拒絕」。
 auto 模式也一樣會停下來問；是由系統不執行保證的，不是提醒 AI 而已。拒絕時 AI 會收到「沒有執行」，等你說明怎麼調整。
-
-任務清單：多步驟的任務，AI 可以自己用 plan_task 列步驟（不需要你核准），清單每一輪都附在送給 AI 的內容最後面，
-標題列的 📋 顯示進度。/plan on 核准的計畫也會轉成同一份清單。harness 模式由系統依執行紀錄自動打勾，
-claude_code 模式由 AI 自己勾。
 
 單一工具回傳若超過 {threshold} tokens（harness 模式），不會直接進主對話：
 預設交給一個獨立、乾淨的 session 做「任務導向摘要」——它拿到完整原始輸出、
@@ -230,10 +226,9 @@ def handle_slash_command(message, events):
         events.append({"channel": "system", "text": "📝 已關閉 Plan 模式（恢復直接執行）"})
         return True
     if lower == "/plan done":
-        if agent.current_plan or agent.todo:
+        if agent.current_plan:
             agent.current_plan = None
-            agent.clear_todo()
-            events.append({"channel": "system", "text": "✅ 已提早清除目前的計畫與任務清單（平常會在下一個新任務送出時自動清除）"})
+            events.append({"channel": "system", "text": "✅ 已提早清除目前的計畫（平常會在下一個新任務送出時自動清除）"})
         else:
             events.append({"channel": "system", "text": "ℹ️ 目前沒有進行中的計畫"})
         return True

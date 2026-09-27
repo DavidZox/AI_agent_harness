@@ -56,7 +56,6 @@
   .entry.guard .tag { color: #ff9a8f; opacity: 1; }
   .entry.summary.truncated { background: transparent; border: 1px dashed #b0873f; color: #d9c49a; padding: 4px 8px; font-size: 12px; }
   .entry.summary.truncated .tag { color: #e6b95c; }
-  #stat-todo { cursor: help; }
   footer { border-top: 1px solid #3a3c40; padding: 10px 12px; background: #2b2d31; }
   #decision-bar, #plan-bar, #skill-draft-bar, #guard-bar { display: none; margin-bottom: 8px; gap: 8px; align-items: center; font-size: 13px; flex-wrap: wrap; }
   #decision-bar.show, #plan-bar.show, #skill-draft-bar.show, #guard-bar.show { display: flex; }
@@ -137,7 +136,6 @@
   <div id="status">
     <span id="stat-mode">mode: manual</span>
     <span id="stat-cmode" title="上下文模式（/context_mode 切換）：harness＝大量回傳由獨立 session 擷取重點；claude_code＝原文進上下文，查不查細節由 AI 決定">ctx-mode: -</span>
-    <span id="stat-todo"></span>
     <span id="stat-cwd">cwd: -</span>
     <span id="stat-container" title="目前的目標容器：預設空白；AI 成功操作某個容器後自動帶入，之後容器技能可省略名稱。要換容器直接跟 AI 說。">container: -</span>
     <span id="stat-tokens">tokens: -</span>
@@ -296,9 +294,6 @@ function updateStatus(stats) {
     'mode: ' + stats.mode + (stats.parallel_cal ? ' · parallel_cal' : '') + (stats.plan_mode ? ' · plan' : '');
   document.getElementById('stat-cmode').textContent =
     'ctx-mode: ' + (stats.context_mode || '-') + (stats.guard === false ? ' · ⚠️ guard off' : '');
-  const todoEl = document.getElementById('stat-todo');
-  todoEl.textContent = stats.todo ? `📋 ${stats.todo.done}/${stats.todo.total}` : '';
-  todoEl.title = stats.todo ? '任務清單（plan_task／核准的計畫）：\n' + stats.todo.text : '';
   planModeOn = !!stats.plan_mode;
   planBtn.classList.toggle('plan-on', planModeOn);
   planBtn.textContent = planModeOn ? '📝 Plan ✓' : '📝 Plan';

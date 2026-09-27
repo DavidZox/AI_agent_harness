@@ -22,13 +22,12 @@ from .guard import GuardMixin
 from .make_skill import MakeSkillMixin
 from .perf import PerfMixin
 from .prompt import PromptMixin
-from .task_list import TaskListMixin
 from .tool_summary import ToolSummaryMixin
 from .tool_use_index import ToolUseIndexMixin
 from .trajectory import TrajectoryMixin
 
 
-class SkillAgent(ConversationMixin, PromptMixin, DispatchMixin, GuardMixin, ContextModeMixin, TaskListMixin,
+class SkillAgent(ConversationMixin, PromptMixin, DispatchMixin, GuardMixin, ContextModeMixin,
                  ToolSummaryMixin, ToolUseIndexMixin, ArchiveMixin, TrajectoryMixin, CompressionMixin,
                  MakeSkillMixin, PerfMixin):
     def __init__(self, model="gemma4:e4b", max_history=None, summary_model=None):
@@ -155,12 +154,6 @@ class SkillAgent(ConversationMixin, PromptMixin, DispatchMixin, GuardMixin, Cont
         self._id_lock = threading.Lock()
         self.trajectory_seq = self._max_archived_id()
 
-        # =========================
-        # 📋 任務清單（task_list.py）：plan_task 或 Plan 模式核准的計畫，顯示在動態區；todo_updated_seq 是最後一次更新時的編號
-        # =========================
-        self.todo = []
-        self.todo_source = None
-        self.todo_updated_seq = self.trajectory_seq
         self.drafts_dir = os.path.join(self.base_path, "drafts")
         self.skill_model = SKILL_MODEL or self.summary_model
         self.pending_skill_draft = None

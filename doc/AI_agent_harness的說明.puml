@@ -22,13 +22,13 @@ rectangle NodeAgent #D1E5F0 [
   **SkillAgent（agent_core/，唯一核心）**
   ----
   * system prompt 只放不常變的（尾端附工具使用檢索清單）；
-    工作目錄、目標容器、任務清單每次接在最後一則訊息後（動態區）
+    工作目錄、目標容器、核准的計畫每次接在最後一則訊息後（動態區）
   * 呼叫主 session，**只看 action** 派發；
     會改變實體狀態的動作先由程式請使用者確認
   * 執行腳本 → 記軌跡 → 原文存檔 #編號
   * 依上下文模式決定工具回傳怎麼進主對話：
     harness＝獨立 session 擷取重點；claude_code＝原文（太大保留頭尾）
-  * 替模型維護狀態：工作目錄、目標容器、任務線、任務清單
+  * 替模型維護狀態：工作目錄、目標容器、任務線、計畫
   * 上下文超過水位就壓成滾動摘要（使用者原話逐字保留、
     被壓掉的對話存檔）
 ]
@@ -38,7 +38,7 @@ rectangle NodeLLM #FFE6CC [
   ----
   每輪固定回 JSON {thought, reply, action}
   action 只能是：技能名稱、規格標明的腳本路徑、
-  result_recall 或 plan_task；reply 裡的文字不會被執行
+  或 result_recall；reply 裡的文字不會被執行
 ]
 
 rectangle NodeSub #FCE5CD [

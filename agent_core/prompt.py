@@ -3,12 +3,11 @@
 排列依「多久變一次」決定（Ollama 只重用跟上一次請求相同的開頭，從第一個不同的 token 開始全部重算）：
 - system prompt（get_system_prompt）只放不常變的：AGENT.md、目前上下文模式的規則、長期記憶、滾動摘要、
   使用者原話、技能索引、工具使用檢索清單。清單一千多 tokens、只在跑完獨立 session 時多一筆，留在這裡最划算。
-- 動態區（build_state_tail）放小而常變的：Current Agent State、Objective、任務清單、檢索清單最新一筆。
-  每次呼叫只接在送出快照的最後一則訊息後面（ask_ai），不寫進 self.messages——切目錄、勾任務不再讓整段歷史重算，
+- 動態區（build_state_tail）放小而常變的：Current Agent State、Objective、已核准的計畫、檢索清單最新一筆。
+  每次呼叫只接在送出快照的最後一則訊息後面（ask_ai），不寫進 self.messages——切目錄不再讓整段歷史重算，
   而且它們離生成點最近，小模型最看得到。"""
 import os
 from .config import CONVERSATION_ARCHIVES_SHOW, MEMORY_MAX_CHARS
-from .task_list import plan_lines
 
 
 class PromptMixin:
@@ -72,11 +71,10 @@ class PromptMixin:
 """
 
     def confirm_plan(self, plan_msg):
-        """使用者核准計畫（CLI 的 _run_plan_flow 與 Web 的 handle_plan_response 共用）：存進 current_plan（獨立 session 的
-        錨點用），條列的步驟轉成任務清單（跟 plan_task 同一份，顯示在動態區、依模式打勾），加入 [PLAN_CONFIRMED] 訊息，
-        並在操作軌跡記一個起點，之後 /make_skill 不指定範圍時就從這裡開始取步驟。"""
+        """使用者核准計畫（CLI 的 _run_plan_flow 與 Web 的 handle_plan_response 共用）：存進 current_plan（每次呼叫都顯示在
+        動態區，也是獨立 session 的錨點），加入 [PLAN_CONFIRMED] 訊息，並在操作軌跡記一個起點，之後 /make_skill 不指定範圍時
+        就從這裡開始取步驟。"""
         self.current_plan = plan_msg
-        self._todo_set(plan_lines(plan_msg), "user_plan")
         self.messages.append({
             'role': 'user',
             'content': "[PLAN_CONFIRMED]\n使用者已核准上述計畫，現在開始依計畫執行第一個步驟。"
@@ -84,16 +82,11 @@ class PromptMixin:
         self.add_trajectory_boundary("plan_confirmed", plan=plan_msg)
 
     def end_plan_for_new_task(self):
-        """使用者送出新任務時（CLI／Web 共用）：上一個已核准的計畫到此結束；自己規劃的清單若已全部做完也清掉。
-        回傳要顯示給使用者的說明（沒有清任何東西時回 None）。自己規劃、還沒做完的清單保留：使用者可能只是在回答追問。"""
-        notes = []
-        if self.current_plan:
-            self.current_plan = None
-            notes.append("上一個已核准的計畫")
-        if self.todo and (self.todo_source == "user_plan" or self.todo_all_done()):
-            self.clear_todo()
-            notes.append("任務清單")
-        return f"🧹 {'與'.join(notes)}已隨新任務自動清除。" if notes else None
+        """使用者送出新任務時（CLI／Web 共用）：上一個已核准的計畫到此結束。回傳要顯示給使用者的說明（沒有計畫時回 None）。"""
+        if not self.current_plan:
+            return None
+        self.current_plan = None
+        return "🧹 上一個已核准的計畫已隨新任務自動清除。"
 
     def build_plan_revision_request(self, feedback):
         """/plan 模式用：使用者對計畫不滿意時，帶著回饋重新規劃一次。規則同上。"""
@@ -119,7 +112,7 @@ class PromptMixin:
         - current_task：使用者最新的一句話（每次送出新訊息都由 set_current_task 更新，/clear 清空）
         - task_history：任務線，連同最新一句共最近 TASK_HISTORY_KEEP（3）句使用者的原話；最新一句常只是
           「第一個」這種短回答，原本要做什麼要看前幾句
-        - 任務清單（plan_task 或 Plan 模式核准的計畫，含目前做到哪一步）
+        - current_plan：Plan 模式核准的計畫（到下一個新任務為止）
         有幾層就給幾層，不互斥。「這一步的目的」（決策 AI 的 thought／reply／action）由 _last_assistant_step
         另外提供，這裡不夾帶 AI 的回覆。"""
         parts = []
@@ -132,12 +125,17 @@ class PromptMixin:
                 # 任務線：使用者回答追問時最新一句常只剩關鍵字（例如「看 motor_rear_left」），原本要做什麼在前幾句
                 parts.append("這串對話較早的使用者訊息（舊→新；最新訊息可能只是對其中一項的追問，原本的目的看這裡）：\n"
                              + "\n".join(f"{i}. {t}" for i, t in enumerate(earlier, 1)))
-        if self.todo:
-            who = "使用者已核准的任務計畫" if self.todo_source == "user_plan" else "決策 AI 自己列的任務清單"
-            parts.append(f"{who}（[→] 是目前這一步）：\n{self._todo_text()}")
-        elif self.current_plan:
+        if self.current_plan:
             parts.append(f"使用者已核准的任務計畫（逐步執行中）：\n{self.current_plan}")
         return "\n".join(parts) if parts else "(未取得使用者原始任務敘述)"
+
+    def _build_plan_context_prompt(self):
+        """Plan 模式核准、正在執行中的計畫（動態區用）；沒有就回空字串。"""
+        if not self.current_plan:
+            return ""
+        return (f"## CURRENT APPROVED TASK PLAN\n使用者已核准以下步驟計畫，請依計畫逐步執行：\n{self.current_plan}\n"
+                "規則：一次只做一步，等系統回傳這一步的結果後再進行下一步；除非使用者明確要求變更，否則不可自行更改或遺忘此計畫；"
+                "所有步驟都做完後，向使用者回報結果並等待新指示。")
 
     def _user_words_block(self):
         """被壓縮掉的對話裡使用者的原話（程式逐字保留，見 CompressionMixin._keep_user_words），以及被壓縮的對話片段存檔編號。"""
@@ -178,6 +176,6 @@ class PromptMixin:
         state = (f"## Current Agent State\n- CURRENT_WORKING_DIRECTORY: {self.current_cwd}\n"
                  f"- CURRENT_CONTAINER_DIRECTORY: {self.container_cwd}\n"
                  f"- CURRENT_TARGET_CONTAINER: {self.target_container or '（未設定：需要容器時先用 docker_containers 查、docker_open 選定）'}")
-        blocks = [state, self._build_objective_prompt(), self.todo_block(), self.tool_use_index_pointer()]
+        blocks = [state, self._build_objective_prompt(), self._build_plan_context_prompt(), self.tool_use_index_pointer()]
         body = "\n\n".join(b for b in blocks if b)
         return ("[harness state]\n（以下是系統每次附上的目前狀態，不是使用者說的話；請回應上面那則訊息）\n" + body)

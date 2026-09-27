@@ -158,7 +158,7 @@ class GuardMixin:
     def guard_check(self, parsed):
         """這一輪的 action 執行前需不需要使用者確認。回傳 None（不需要），或
         {"skill", "script", "command", "reason"} 給 CLI／Web 顯示。parsed 是 parse_agent_reply 的結果（或含 action 的 dict）。
-        技能名稱（只載入規格）、找不到的腳本、偽技能（result_recall、plan_task）都不需要確認。"""
+        技能名稱（只載入規格）、找不到的腳本、偽技能（result_recall）都不需要確認。"""
         if not getattr(self, "guard_enabled", True) or not GUARDED_SKILLS:
             return None
         action = (parsed or {}).get("action") if isinstance(parsed, dict) else None

@@ -41,7 +41,6 @@ python3 evals/perf_report.py                # 平常使用 CLI／Web 累積的 l
 | error_recovery | 容器名稱打錯回 `[ERROR]`：要自己修正 |
 | guard_dispatch | 派工單要經過執行前確認；使用者拒絕後不能說成已送出 |
 | memory_skill_routing | 記憶寫入：用某技能時才需要的規則，經使用者同意後綁到技能（看最後的檔案狀態） |
-| plan_multistep | 多步驟任務：先列清單、每一步都做到 |
 | memory_stale_state | 記憶裡有「系統整體健康」的舊觀察：問現況要重查 |
 | count_from_script | 數量用腳本算好的，不要自己數 |
 
@@ -68,7 +67,6 @@ python3 evals/perf_report.py                # 平常使用 CLI／Web 累積的 l
 | `archive_lookup` | 有沒有用 `result_recall`／`result_grep`／`result_view`／`result_list` 回存檔查（True／False） |
 | `archive_ids` | 回存檔查的參數裡包含這些編號 |
 | `guard` | 有沒有觸發執行前確認 |
-| `plan` | 有沒有先用 `plan_task set` 列清單 |
 | `memory_skill` | `modify_memory` 有沒有帶 `--skill <這個技能>`（或 `--move-last-to-skill <這個技能>`） |
 | `skill_memory_has` | `[技能, 字]`：臨時副本裡 `skills_system/memory/<技能>.md` 含有這個字（看結果，不管過程） |
 | `global_memory_lacks` | 臨時副本裡的 `Memory.md` 不含這些字 |

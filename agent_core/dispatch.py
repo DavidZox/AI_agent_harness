@@ -166,9 +166,6 @@ class DispatchMixin:
                 # process 內做；核心邏輯都在 agent_core，見 doc/架構說明.md），必須在存在性檢查前攔截，
                 # 否則會落入下面「找不到腳本」的分支。規格文件走一般的兩階段揭露，不受影響。
                 return self._result_recall(remainder)
-            if script_name == "plan_task_cmd.py":
-                # 偽技能：任務清單存在 agent 的狀態裡（TaskListMixin），同樣沒有實體腳本、在存在性檢查前攔截
-                return self._plan_task_command(remainder)
             script_path = os.path.join(self.base_path, "scripts", script_name)
 
             print(f"🛠️  Agent 啟動工具: {script_name}")

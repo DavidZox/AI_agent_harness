@@ -178,7 +178,7 @@ SKILL_DOC_PREFIX = "📘 已載入技能"
 # harness：harness 替模型做決定——大量回傳交給獨立 session 依問題擷取、附下一步建議（原本的設計）。
 # claude_code：相信模型——回傳原文直接進上下文（太大保留頭尾＋存檔編號），要查細節、要不要委派獨立 session
 #   （result_recall）由模型自己決定；harness 只提供截斷、清除舊回傳、滾動摘要這些安全網。
-# 兩種模式共用：原文存檔、檢索清單、執行前關卡、記憶、滾動摘要、任務清單。規則文字在 context_modes/<模式>.md。
+# 兩種模式共用：原文存檔、檢索清單、執行前關卡、記憶、滾動摘要。規則文字在 context_modes/<模式>.md。
 # =========================================================
 CONTEXT_MODES = ("harness", "claude_code")
 CONTEXT_MODE_DEFAULT = os.environ.get("AGENT_CONTEXT_MODE", "harness").strip().lower()
@@ -207,15 +207,6 @@ _guarded_env = os.environ.get("AGENT_GUARDED_SKILLS", _GUARDED_DEFAULT).strip()
 GUARDED_SKILLS = set() if _guarded_env.lower() in ("", "none", "off") else {s.strip() for s in _guarded_env.split(",") if s.strip()}
 GUARD_DEFAULT = os.environ.get("AGENT_GUARD", "1").strip().lower() not in ("0", "off", "false", "no")
 GUARD_DENIED_TAG = "[DENIED]"
-
-# =========================================================
-# 📋 任務清單（plan_task）：模型自己開的步驟清單，不需要使用者核准；/plan on 核准的計畫也轉成同一份清單。
-# 每次呼叫模型都顯示在送出內容的最尾端（動態區）。harness 模式由程式依執行紀錄自動打勾（步驟裡寫的技能執行
-# 成功就算完成）；claude_code 模式由模型自己用 plan_task done 勾，TODO_REMIND_AFTER 個動作沒更新就提醒。
-# =========================================================
-TODO_MAX_ITEMS = 12
-TODO_ITEM_MAX_CHARS = 120
-TODO_REMIND_AFTER = 3
 
 # =========================================================
 # ⏱️ 每次模型呼叫的耗時記錄（logs/perf.jsonl）：Ollama 回報的 prompt_eval_count 在 KV cache 命中時仍是完整值，

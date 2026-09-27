@@ -36,12 +36,10 @@ def current_mode_label():
 
 
 def build_stats():
-    done, total = agent.todo_progress()
     return {
         "mode": current_mode_label(),
         "context_mode": agent.context_mode,   # harness／claude_code（/context_mode 切換）
         "guard": agent.guard_enabled,          # 執行前關卡（/guard on|off）
-        "todo": {"done": done, "total": total, "text": agent._todo_text()} if total else None,
         "memory_dropped": agent.memory_dropped,
         "tool_summary_mode": state["tool_summary_mode"],
         "plan_mode": state["plan_mode"],
@@ -375,8 +373,8 @@ def apply_decision(action, events):
 
 
 def clear_plan_for_new_task(events):
-    """新任務送出時，把上一個已核准的計畫從 system prompt 清掉（自己規劃的任務清單全部做完也清掉，見
-    SkillAgent.end_plan_for_new_task，與 CLI 共用）。
+    """新任務送出時，把上一個已核准的計畫從 system prompt 清掉（見 SkillAgent.end_plan_for_new_task，
+    與 CLI 共用）。
 
     計畫的生命週期 = 核准後那個任務的執行期間：期間所有工具決策（manual／hybrid 的 y/n）、
     auto 迴圈、自動壓縮都不會清掉它；使用者再打字送出一句新訊息（非 slash 指令、非計畫回應、
