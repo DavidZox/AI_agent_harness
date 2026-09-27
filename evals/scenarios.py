@@ -133,8 +133,11 @@ def _docker_runcmd(args, agent):
             continue
         positional.append(args[i])
         i += 1
-    command = positional[-1] if positional else ""
-    container = positional[0] if len(positional) >= 2 else (agent.target_container or "")
+    # 比照真實腳本：第一個參數是現有容器名稱才當容器，其餘接起來是指令；否則整串都是指令（模型常忘記引號）
+    if len(positional) >= 2 and positional[0] in ("rmf_sim", "ros2_humble", "db_cache", "nav2_test", "rmf"):
+        container, command = positional[0], " ".join(positional[1:])
+    else:
+        container, command = (agent.target_container or ""), " ".join(positional)
     if container not in ("rmf_sim", "ros2_humble", "db_cache"):
         return (f"[ERROR] 在容器 '{container}' 內執行指令 失敗（exit code 1）: 找不到容器 '{container}'（名稱錯誤或尚未建立；"
                 f"請先用 docker_containers 查看現有容器的完整名稱）")
