@@ -7,7 +7,11 @@
   每次呼叫只接在送出快照的最後一則訊息後面（ask_ai），不寫進 self.messages——切目錄不再讓整段歷史重算，
   而且它們離生成點最近，小模型最看得到。"""
 import os
-from .config import MEMORY_MAX_CHARS
+import re
+from .config import CONTEXT_MODES, MEMORY_MAX_CHARS
+
+# 摘要裡「看起來是技能」的名稱：反引號包住的 snake_case（可帶 scripts/ 前綴與 _cmd.py／.py 後綴），或 scripts/<x>_cmd.py
+_SKILL_REF_RE = re.compile(r"`(?:scripts/)?([a-z][a-z0-9]*(?:_[a-z0-9]+)+?)(?:_cmd)?(?:\.py)?`|scripts/([a-z][a-z0-9_]*?)_cmd\.py")
 
 
 class PromptMixin:
@@ -110,6 +114,46 @@ class PromptMixin:
             lines.append(f"（更早還有 {self.user_words_dropped} 則沒有列出，原文在「過去的對話片段」的存檔裡）")
         return "\n".join(lines)
 
+    # ---------------------------------------------------------------- 滾動摘要（可能是之前的 session 留下的）
+    def stale_skill_names(self, text):
+        """文字裡提到、但目前不存在的技能名稱（沒有 tools/<名稱>.md，也沒有 scripts/<名稱>_cmd.py）。
+        滾動摘要跨啟動接回，裡面可能還寫著已經移除的技能（實測：plan_task 移除後，舊摘要的未完成事項寫著「指導系統
+        執行 plan_task 技能」，新 session 的模型照著去叫，拿到的是一個不存在的技能）。只看同一行有「技能」或是
+        scripts/ 路徑的名稱，上下文模式名稱（claude_code）不算，避免把一般的識別字當成技能。"""
+        names = set()
+        for line in str(text or "").splitlines():
+            for m in _SKILL_REF_RE.finditer(line):
+                name = m.group(1) or m.group(2)
+                if not name or name in CONTEXT_MODES or (m.group(1) and "技能" not in line):
+                    continue
+                if os.path.exists(os.path.join(self.tools_dir, f"{name}.md")) or \
+                        os.path.exists(os.path.join(self.base_path, "scripts", f"{name}_cmd.py")):
+                    continue
+                names.add(name)
+        return sorted(names)
+
+    def clean_summary(self, text):
+        """把摘要裡提到「目前不存在的技能」的行拿掉（標題行留著）。不在 system prompt 點名說「X 不能用」：實測（e4b，
+        舊摘要寫著 plan_task）點名之後 3 次有 3 次反而先去叫 plan_task——小模型看到名稱就被提醒，否定句沒什麼用；
+        整行拿掉之後名稱不再出現。原本的摘要檔不改，下一次壓縮時交給摘要模型的也是清過的版本，新摘要自然就沒有了。"""
+        stale = self.stale_skill_names(text)
+        if not stale:
+            return text
+        pat = re.compile("|".join(re.escape(n) for n in stale))
+        return "\n".join(ln for ln in str(text).splitlines() if ln.lstrip().startswith("#") or not pat.search(ln))
+
+    def _summary_block(self):
+        """system prompt 的滾動摘要一節（提到已不存在技能的行已拿掉，見 clean_summary）。摘要是之前的 session 留下的
+        （啟動時接回、這次還沒壓縮過）就註明：裡面的進度與未完成事項可能已經過時，使用者沒提起就不要主動接續。"""
+        if not self.rolling_summary:
+            return "No history summary yet."
+        body = self.clean_summary(self.rolling_summary)
+        if getattr(self, "summary_carried_from", None):
+            body = (f"（這份摘要是之前的對話留下的（{self.summary_carried_from}），不是這次啟動後的對話：裡面的進度、狀態與"
+                    "未完成事項可能已經過時——技能以下面的 Available Skills 為準，系統狀態以重新查詢為準；使用者沒有提起"
+                    "就不要主動接續裡面的未完成事項。）\n" + body)
+        return body
+
     # ---------------------------------------------------------------- system prompt（不常變的部分）
     def get_system_prompt(self):
         profile = ""
@@ -123,7 +167,7 @@ class PromptMixin:
             profile,
             f"## Context Mode：{self.context_mode}\n{mode_rules}" if mode_rules else f"## Context Mode：{self.context_mode}",
             f"## Long Term Memory\n{self.load_long_term_memory()}",
-            f"## Recent Compressed History Summary\n{self.rolling_summary or 'No history summary yet.'}",
+            f"## Recent Compressed History Summary\n{self._summary_block()}",
             self._user_words_block(),
             self._conversation_index_block(),
             f"## Available Skills (SKILLS.md)\n{skills}",

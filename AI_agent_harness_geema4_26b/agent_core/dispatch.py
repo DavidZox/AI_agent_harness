@@ -177,13 +177,17 @@ class DispatchMixin:
                     f[:-3] for f in sorted(os.listdir(self.tools_dir))
                     if f.endswith(".md") and (f[:-3] in stem or stem in f[:-3])
                 ] if os.path.isdir(self.tools_dir) else []
-                hint = (
-                    f"這個名稱看起來是技能 {', '.join(candidates)}，請先把 action.command 填成 `{candidates[0]}`（args 留空）"
-                    f"載入規格文件，再依規格標明的實際腳本路徑執行。"
-                    if candidates else
-                    "腳本路徑只能從規格文件取得，不可自行推測：請先以 action.command 填入 SKILLS.md 裡的技能名稱載入規格。"
-                )
-                return f"[ERROR] 找不到腳本 {script_name}。{hint}"
+                if candidates:
+                    return (f"[ERROR] 找不到腳本 {script_name}。這個名稱看起來是技能 {', '.join(candidates)}，請先把 action.command "
+                            f"填成 `{candidates[0]}`（args 留空）載入規格文件，再依規格標明的實際腳本路徑執行。")
+                if "/" not in parts[0] and not raw_token.endswith(".py"):
+                    # 填的是技能名稱、但沒有這個技能：多半是舊摘要、舊對話或記憶裡提到、後來移除的技能（實測：plan_task
+                    # 移除後，模型照舊摘要去叫它）。明說不存在，不要讓它以為只是少載了規格、再去猜腳本檔名。
+                    return (f"[ERROR] 沒有 `{raw_token}` 這個技能（SKILLS.md 與 skills_system/tools/ 都沒有）。它可能是舊摘要、"
+                            f"舊對話或記憶裡提到、但已經移除的名稱：不要再使用，也不要猜腳本檔名；改用 SKILLS.md 列出的技能完成"
+                            f"使用者的任務，沒有適合的技能就直接告訴使用者目前沒有這個功能。")
+                return (f"[ERROR] 找不到腳本 {script_name}。腳本路徑只能從規格文件取得，不可自行推測："
+                        f"請先以 action.command 填入 SKILLS.md 裡的技能名稱載入規格。")
 
             # 計畫執行前檢查（/plan_exec_guard on 才有）：不是目前這一步、又會改變狀態的技能不執行，也不必問使用者
             blocked = self.plan_block_reason(parsed)

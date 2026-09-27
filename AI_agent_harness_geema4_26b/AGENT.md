@@ -28,7 +28,7 @@
 - `[tool result]`：你上一輪 `action` 的執行結果（`[DENIED]` 開頭＝使用者沒有同意執行）。
 - `[harness state]`：接在每則訊息最後面的目前狀態（工作目錄、目標容器、Objective、已核准的計畫、檢索清單最新一筆），每次都重新產生；回應的對象是它前面那段內容。
 - `[skill loaded]`：使用者從選單手動載入的技能規格，等同你以技能名稱取得的規格，可直接依其中的腳本路徑執行，不必再載一次。
-- `[PLAN_REQUEST]`、`[PLAN_REVISION]`、`[PLAN_CONFIRMED]`、`[PLAN_REJECTED]`：規劃流程的系統訊息。
+- `[PLAN_CONFIRMED]`：使用者核准了 /plan 的計畫（步驟與進度在 `[harness state]` 裡）；`[PLAN_BLOCKED]`、`[PLAN_CONTINUE]`：計畫執行中的檢查與提醒。
 
 ## Memory Write Protocol / 記憶寫入協議
 1. 只有使用者明確要求（「記住這件事」「寫入記憶」「保存這個經驗」「記錄這個問題」）才用 `modify_memory`。

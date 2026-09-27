@@ -88,7 +88,8 @@ class CompressionMixin:
         return "\n\n".join(parts)
 
     def _summary_prompts(self, to_compress):
-        prev = self.rolling_summary or "（沒有，這是第一次壓縮）"
+        # 上一份摘要先拿掉提到已不存在技能的行（clean_summary），新摘要就不會再把已移除的技能寫回去
+        prev = self.clean_summary(self.rolling_summary) if self.rolling_summary else "（沒有，這是第一次壓縮）"
         system_prompt = f"""你是一位專業的系統分析師，負責維護一份「對話滾動摘要」，交給另一個負責決策的 AI 接續工作用（它看不到原始對話，只看得到你的摘要）。
 你會收到「上一份摘要」與「這次要併入的新對話片段」，請輸出一份更新後的完整摘要來取代上一份。
 
@@ -257,6 +258,9 @@ class CompressionMixin:
         log_dir = os.path.join(self.script_dir, "logs")
         files = sorted(f for f in os.listdir(log_dir) if f.startswith("summary_") and f.endswith(".md")) \
             if os.path.isdir(log_dir) else []
+        # 接回的摘要是之前的 session 留下的：記下它的時間，system prompt 會註明可能過時（_summary_block），壓縮一次後清掉
+        stamp = files[-1][len("summary_"):-len(".md")].split("_") if files else []
+        self.summary_carried_from = f"{stamp[0]} {stamp[1].replace('-', ':')[:5]}" if len(stamp) >= 2 else None
         if files:
             try:
                 with open(os.path.join(log_dir, files[-1][:-3] + ".json"), encoding="utf-8") as f:
@@ -391,6 +395,7 @@ class CompressionMixin:
         ids = {id(m) for m in compressed}
         with self.messages_lock:
             self.rolling_summary = markdown
+            self.summary_carried_from = None   # 已經融合了這次 session 的對話，不再只是之前留下的
             self._history_rewritten = True
             for i in range(len(self.messages) - 1, 0, -1):
                 if id(self.messages[i]) in ids:
