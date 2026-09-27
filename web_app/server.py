@@ -344,8 +344,8 @@ class ConsoleHandler(BaseHTTPRequestHandler):
             self._finish(stream, False)
             return
 
-        should_continue = apply_decision(action, stream)
-        awaiting = run_turn(stream) if should_continue else False
+        outcome = apply_decision(action, stream)   # continue／await／stop（見 flows.apply_decision）
+        awaiting = run_turn(stream) if outcome == "continue" else outcome == "await"
         self._finish_turn(stream, awaiting)
 
 

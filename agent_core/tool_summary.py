@@ -1,6 +1,5 @@
 """ToolSummaryMixin：工具回傳的任務導向擷取——summarize_tool_result（大量回傳自動摘要）與 _result_recall（回原文重新提煉），兩者共用 _extract_task_oriented。"""
 import json
-import ollama
 import os
 import re
 import shlex
@@ -91,14 +90,15 @@ class ToolSummaryMixin:
             lines += [f"- {str(q['question']).strip()}" for q in questions]
         return "\n".join(lines)
 
-    def _extract_task_oriented(self, raw_text, purpose_text, tool_tokens, omitted=0, catalog=""):
+    def _extract_task_oriented(self, raw_text, purpose_text, tool_tokens, omitted=0, catalog="", kind="tool_summary"):
         """任務導向擷取的核心呼叫（summarize_tool_result 的第一輪、自動追問的每一跳、_result_recall 共用）。
         raw_text 是要讀的原文，purpose_text 是錨點（可以是「使用者目標＋這一步的目的」，也可以是使用者的一句追問——
         呼叫端決定錨在什麼問題上，這裡不管錨點從哪來）。規則要求名稱與數值照抄、不推測、不給建議，並用 not_covered
         明說原始輸出沒有涵蓋什麼。catalog 是工具使用檢索清單（_tool_use_catalog）：獨立 session 看過完整原文後，
         順便判斷使用者的問題還需要清單裡哪幾筆（related_records），給 main session 當 recall 建議。
         結構以 format=TOOL_SUMMARY_SCHEMA 強制。回傳 (data, structured, raw_model_text)：JSON 解析失敗時
-        data=None、structured=False，呼叫端可退回 raw_model_text（模型原文，總比丟掉整段輸出好）。"""
+        data=None、structured=False，呼叫端可退回 raw_model_text（模型原文，總比丟掉整段輸出好）。
+        kind 只是 perf.jsonl 的分類（tool_summary／recall）。"""
         system_prompt = f"""你是一個「資訊過濾器」：把一支工具（腳本）執行後的完整原始輸出，依 user 訊息開頭提供的使用者目標／問題擷取成精簡的重點，交給另一個負責決策的 AI。那個 AI 看不到原始輸出，只看得到你的擷取結果。
 
 規則：
@@ -130,7 +130,8 @@ class ToolSummaryMixin:
             f"{purpose_text}\n\n{catalog_block}"
             f"【工具的完整原始輸出（約 {tool_tokens} tokens{'，過長已保留頭尾' if omitted else ''}）】\n{raw_text}"
         )
-        res = ollama.chat(
+        res = self._timed_chat(
+            kind,
             model=self.summary_model,
             messages=[
                 {'role': 'system', 'content': system_prompt},
@@ -147,16 +148,17 @@ class ToolSummaryMixin:
             return None, False, raw
         return (data, True, raw) if isinstance(data, dict) else (None, False, raw)
 
-    def _extract_with_followups(self, clipped, purpose_text, tool_tokens, omitted, result_id, exclude_ids=()):
+    def _extract_with_followups(self, clipped, purpose_text, tool_tokens, omitted, result_id, exclude_ids=(), kind="tool_summary"):
         """任務導向擷取＋有界的自動追問（summarize_tool_result 與 _result_recall 共用）：先擷取一次，若 not_covered
         還有缺口、且摘要自己給了 suggested_questions，就拿第一條的 keywords 對同一份存檔（result_id）再 result_grep
         一次（_exec_script 直接跑腳本，不經過 run_tool、不記軌跡、不產生新編號），把 grep 到的原文重新交給
         _extract_task_oriented——永遠錨回 purpose_text，不是拿上一輪的摘要文字當輸入。最多跳
         TOOL_SUMMARY_MAX_FOLLOWUP_HOPS 次；跳滿、grep 落空或沒有 keywords 可用時照實停下，not_covered 該是什麼
         就是什麼，不偽裝成已解決。每一次擷取都附工具使用檢索清單（排除 exclude_ids），最後的 related_records
-        只留清單裡真的有的編號（_validate_related）。回傳 (data, structured, raw_model_text)。"""
+        只留清單裡真的有的編號（_validate_related）。回傳 (data, structured, raw_model_text)。
+        result_id 給 None 就不做自動追問（多份 recall，或 claude_code 模式：要不要再查由模型自己決定）。"""
         catalog, allowed = self._tool_use_catalog(exclude_ids)
-        data, structured, raw_model_text = self._extract_task_oriented(clipped, purpose_text, tool_tokens, omitted, catalog)
+        data, structured, raw_model_text = self._extract_task_oriented(clipped, purpose_text, tool_tokens, omitted, catalog, kind)
         if not (structured and data is not None):
             return data, structured, raw_model_text
         self._validate_related(data, allowed)
@@ -181,7 +183,7 @@ class ToolSummaryMixin:
             print(f"🔁 [自動追問 {hops}/{TOOL_SUMMARY_MAX_FOLLOWUP_HOPS}] 關鍵字「{keywords}」對存檔 #{result_id} 再查一次…")
             grep_clipped, grep_omitted = self._clip_tool_output(grep_out)
             new_data, new_structured, _ = self._extract_task_oriented(
-                grep_clipped, purpose_text, self.count_tokens(grep_out), grep_omitted, catalog)
+                grep_clipped, purpose_text, self.count_tokens(grep_out), grep_omitted, catalog, kind)
             if not new_structured or new_data is None:
                 break
             self._validate_related(new_data, allowed)
@@ -224,11 +226,13 @@ class ToolSummaryMixin:
         data["related_records"] = out
         return out
 
-    def _followup_guidance(self, ids, data, structured, recalled=False):
+    def _followup_guidance(self, ids, data, structured, recalled=False, directive=True):
         """接在任務導向擷取後面、給 main session 的下一步建議——獨立 session 看過完整原文與檢索清單後的判斷，
         依序：還需要之前的存檔 → 把「這一份＋那幾份」一起 recall（同一個獨立 session 才比得了）；有自動追問也解不開
         的缺口 → 自然地問使用者；已經回答 → 直接回答、不必再 recall。追問一律指向 result_recall（使用者的話交給
-        獨立 session 回原文提煉），grep 只留給找字串。ids 是這次讀的存檔編號（摘要時只有一個；recall 可以有幾個）。"""
+        獨立 session 回原文提煉），grep 只留給找字串。ids 是這次讀的存檔編號（摘要時只有一個；recall 可以有幾個）。
+        directive=False（claude_code 模式）：只陳述事實（原文在哪、獨立 session 認為可能還需要哪幾份、哪裡沒涵蓋），
+        不下指令——下一步由模型自己決定。"""
         ids = [str(i) for i in (ids if isinstance(ids, (list, tuple)) else [ids]) if i]
         if not ids:
             return "你看不到原始輸出：需要其他資訊時，換更精確的參數重新執行工具，不要憑空補上。"
@@ -238,6 +242,16 @@ class ToolSummaryMixin:
         new = [r for r in related if r not in ids]
         has_gap = ok and self._gap_reported(data.get("not_covered"))
         has_questions = ok and bool(data.get("suggested_questions"))
+        if not directive:
+            parts = [f"原文在存檔 {label}。"]
+            if new:
+                reasons = "；".join(f"#{r['id']}：{r.get('reason') or '（未給理由）'}" for r in data["related_records"]
+                                   if str(r["id"]) in new)
+                parts.append(f"獨立 session 認為這個問題可能還需要之前的存檔（{reasons}）。")
+            if has_gap:
+                parts.append("「未涵蓋」的部分原文裡沒有，或這次沒讀到。")
+            parts.append("接下來怎麼做由你決定：找某個字串用 result_grep、看某一段用 result_view、換個問題再 result_recall，或直接回答。")
+            return "".join(parts)
         if recalled:
             base = f"不要再對 {label} 重複 recall 或 grep。"
         else:
@@ -388,14 +402,17 @@ class ToolSummaryMixin:
             + (f"【決策 AI 要聚焦的點】\n{focus}\n" if focus else "")
             + f"\n【{'這份' if len(ids) == 1 else '這幾份'}存檔的背景（不是現在要回答的問題）】\n" + "\n".join(background)
         )
+        # 自動追問只在 harness 模式、而且只 recall 一份時做；claude_code 模式要不要再查由模型自己決定
+        harness = self.context_mode == "harness"
         data, structured, raw_model_text = self._extract_with_followups(
-            clipped, purpose_text, tool_tokens, omitted, ids[0] if len(ids) == 1 else None, exclude_ids=ids)
+            clipped, purpose_text, tool_tokens, omitted, ids[0] if (len(ids) == 1 and harness) else None,
+            exclude_ids=ids, kind="recall")
         if structured and data is not None:
             body = self._render_tool_summary(data, "、#".join(ids))
         else:
             body = raw_model_text or "（獨立 session 沒有回傳合法結構，請改用 result_grep 自行搜尋關鍵字。）"
         gone = f"（{'、'.join('#' + m for m in missing)} 已經不在：原始檔超過保留上限被清掉，要的話告訴使用者。）\n" if missing else ""
-        guidance = self._followup_guidance(ids, data, structured, recalled=True)
+        guidance = self._followup_guidance(ids, data, structured, recalled=True, directive=harness)
         output_text = (f"{TOOL_SUMMARY_TAG}\n重新讀取存檔 {label} 的完整原文，"
                        f"針對「{primary}」{'（聚焦：' + focus + '）' if focus else ''}提煉：\n{gone}{body}\n"
                        f"（以上是獨立 session 回到完整原文、針對使用者的問題提煉的重點。{guidance}）")

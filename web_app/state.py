@@ -21,7 +21,13 @@ state = {
     "plan_mode": False,
     "parallel_cal": PARALLEL_CAL_DEFAULT,  # 軟水位壓縮改在背景執行緒做（/parallel_cal on|off）
 }
-pending = {"result": None, "mode": None, "tokens": None}  # 等待使用者決策的工具結果（hybrid / manual 模式用）
+# 等待使用者決策的事項：mode＝hybrid／manual（已執行的工具結果要不要加入上下文，result／tokens），
+# 或 guard（🛡️ 執行前關卡：會改變系統狀態的技能還沒執行，parsed＝這一輪的回覆、guard＝guard_check 的說明）
+pending = {"result": None, "mode": None, "tokens": None, "parsed": None, "guard": None}
+
+
+def clear_pending():
+    pending.update(result=None, mode=None, tokens=None, parsed=None, guard=None)
 plan_pending = {"active": False, "text": None}  # 等待使用者核准／修改意見的任務計畫（/plan 模式用）
 vision_session = VisionSession()  # 📷 尚未送出的影像附件（框選截圖／上傳的檔案），送出新任務時一次消費
 lock = threading.Lock()

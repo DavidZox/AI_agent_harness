@@ -9,8 +9,9 @@ from .config import (
     TOOL_RESULTS_DIRNAME,
     TOOL_SUMMARY_DEFAULT,
 )
+from .context_mode import CONTEXT_MODE_DESCRIPTIONS
 from .protocol import attach_skill_docs, is_exempt_result, tool_result_message
-from .turn import _append_discarded_tool_result, _content_for_context, after_turn_compression, context_kind
+from .turn import _append_discarded_tool_result, _content_for_context, after_turn_compression, context_kind, oversized_notice
 
 
 def _run_plan_flow(agent, user_task):
@@ -63,6 +64,8 @@ def _context_content_for_cli(agent, result, tool_tokens, use_summary):
     kind = context_kind(content, tool_tokens)
     if kind == "summary":
         print(f"\n🧠 獨立 session 任務導向摘要（主對話實際收到的內容）:\n{'-'*30}\n{content}\n{'-'*30}")
+    elif kind == "truncated":
+        print(f"🧠 主對話收到：原文頭尾（≈{agent.count_tokens(content)} tokens；中間省略的部分在存檔 #{agent.last_result_id}，AI 自己決定要不要回查）")
     elif kind == "reduced":
         print(f"\n🧠 主對話實際收到的內容（只有成功／失敗判定）:\n{'-'*30}\n{content}\n{'-'*30}")
     elif kind == "doc":
@@ -120,7 +123,11 @@ def main():
 
     print("\n" + "="*50)
     print("V6 Robot Agent + Token Tracker 已啟動")
+    print(f"上下文模式：{agent.context_mode}（/context_mode harness|claude_code 切換）；"
+          f"執行前關卡：{'開' if agent.guard_enabled else '關'}（/guard on|off）")
     print("="*50)
+    for notice in agent.pop_notices():   # 例如長期記憶超過載入上限
+        print(notice)
 
     while True:
         try:
@@ -217,11 +224,29 @@ def main():
                 _run_make_skill_flow(agent, user_msg[len('/make_skill'):].strip())
                 continue
             if user_msg.lower() == '/plan done':
-                if agent.current_plan:
+                if agent.current_plan or agent.todo:
                     agent.current_plan = None
-                    print("✅ 已提早清除目前的計畫（system prompt 不再提醒 AI 依計畫執行；平常會在下一個新任務送出時自動清除）")
+                    agent.clear_todo()
+                    print("✅ 已提早清除目前的計畫與任務清單（平常會在下一個新任務送出時自動清除）")
                 else:
                     print("ℹ️ 目前沒有進行中的計畫")
+                continue
+            if user_msg.lower() == '/context_mode' or user_msg.lower().startswith('/context_mode '):
+                arg = user_msg[len('/context_mode'):].strip()
+                if not arg:
+                    print(f"目前的上下文模式：{agent.context_mode}——{CONTEXT_MODE_DESCRIPTIONS[agent.context_mode]}"
+                          f"\n可切換：/context_mode harness｜/context_mode claude_code")
+                    continue
+                try:
+                    mode = agent.set_context_mode(arg)
+                    print(f"🔀 已切換上下文模式：{mode}——{CONTEXT_MODE_DESCRIPTIONS[mode]}（之後的工具回傳才照新模式處理）")
+                except ValueError as e:
+                    print(f"⚠️ {e}")
+                continue
+            if user_msg.lower() in ('/guard on', '/guard off'):
+                agent.guard_enabled = user_msg.lower() == '/guard on'
+                print("🛡️ 已開啟執行前關卡：會改變系統狀態的技能執行前會先問你" if agent.guard_enabled else
+                      "⚠️ 已關閉執行前關卡（只限這次執行）：派工單、取消任務、建容器、容器內非唯讀指令將不經確認直接執行")
                 continue
 
             # --- 🎯 OBJECTIVE 設定 ---
@@ -247,12 +272,12 @@ def main():
             agent.total_user_tokens += user_tokens
             print(f"📥 User Tokens: {user_tokens}")
 
-            # 新任務開始：上一個已核准的計畫到此結束，自動清除。計畫的生命週期 = 核准後那個任務的
-            # 執行期間（期間的工具決策、auto 迴圈、自動壓縮都不會清掉它）；再打一句新訊息就是新任務。
+            # 新任務開始：上一個已核准的計畫到此結束，自動清除（自己規劃的清單全部做完也清掉）。計畫的生命週期 = 核准後
+            # 那個任務的執行期間（期間的工具決策、auto 迴圈、自動壓縮都不會清掉它）；再打一句新訊息就是新任務。
             # 舊版要求手動 /plan done，容易忘記而讓舊計畫殘留在 system prompt 干擾之後的每個任務。
-            if agent.current_plan:
-                agent.current_plan = None
-                print("🧹 上一個已核准的計畫已隨新任務自動清除（system prompt 不再要求依舊計畫執行）")
+            cleared_note = agent.end_plan_for_new_task()
+            if cleared_note:
+                print(cleared_note)
 
             # 記下使用者這句話（任務線：最近 3 句），獨立 session 摘要或 recall 時
             # 拿它當「使用者的目標」的一部分（見 _build_task_anchor_text）
@@ -282,6 +307,9 @@ def main():
                 ai_msg = agent.ask_ai()
                 ai_tokens = agent.last_ai_tokens(ai_msg)
                 agent.total_ai_tokens += ai_tokens
+                if agent.auto_cleared:
+                    print(f"🧹 上下文超過門檻，呼叫前先把 {agent.auto_cleared['results']} 則舊的工具回傳清成存檔編號"
+                          f"（騰出約 {agent.auto_cleared['tokens']} tokens，原文仍在存檔）。")
                 if agent.auto_compressed:
                     print("📦 上下文超過門檻，呼叫前已自動壓縮並歸檔。")
                 parsed = agent.parse_reply(ai_msg)  # 回覆協議：顯示 reply／thought，執行只看 action
@@ -291,8 +319,17 @@ def main():
                 print(f"📤 AI Tokens: {ai_tokens}")
                 agent.messages.append({'role': 'assistant', 'content': ai_msg})
 
+                # --- 🛡️ 執行前關卡：會改變系統狀態的技能先問使用者（程式擋，不靠模型記得要問）---
+                guard = agent.guard_check(parsed)
+                if guard:
+                    print(f"\n{agent.guard_prompt_text(guard)}")
+                    if input("確定執行？(y/n): ").strip().lower() != 'y':
+                        agent.messages.append({'role': 'user', 'content': tool_result_message(agent.guard_denied_text(guard), parsed["action"])})
+                        print("🚫 已拒絕，這個動作沒有執行；請告訴 AI 要怎麼調整。")
+                        break
+
                 # --- 🧰 TOOL 執行（只看 action 欄位，reply 裡的文字不會被執行）---
-                result = agent.run_tool(parsed)
+                result = agent.run_tool(parsed, approved=bool(guard))
                 tool_tokens = 0
                 if result:
                     tool_tokens = agent.count_tokens(result)
@@ -303,9 +340,7 @@ def main():
                               f"之後可用 result_grep {agent.last_result_id} <關鍵字> 回查")
                     print(f"🧰 Tool Tokens: {tool_tokens}")
                     if tool_tokens > TOOL_RESULT_TOKEN_THRESHOLD and not is_exempt_result(result, tool_tokens):
-                        print(f"⚠️ 此工具回傳約 {tool_tokens} tokens，超過門檻 {TOOL_RESULT_TOKEN_THRESHOLD}，"
-                              + ("加入上下文前將交由獨立 session 依目前任務擷取重點。" if tool_summary_mode
-                                 else "加入上下文時只保留成功／失敗判定（/summarize on 可改為獨立 session 摘要）。"))
+                        print(oversized_notice(agent, tool_tokens, tool_summary_mode))
                 else:
                     print("✅ 無工具需要執行")
 

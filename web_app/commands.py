@@ -4,10 +4,12 @@ from agent_core.config import (
     KEEP_RECENT_TOKENS,
     MIN_COMPRESS_TOKENS,
     NUM_CTX,
+    RAW_RESULT_MAX_TOKENS,
     SOFT_TOKEN_THRESHOLD,
     TOKEN_THRESHOLD,
     TOOL_RESULT_TOKEN_THRESHOLD,
 )
+from agent_core.context_mode import CONTEXT_MODE_DESCRIPTIONS
 from .state import agent, load_pending_skill, state
 
 
@@ -23,11 +25,16 @@ SLASH_COMMANDS = [
     {"cmd": "/plan off", "desc": "關閉 Plan 模式", "group": "模式開關"},
     {"cmd": "/parallel_cal on", "desc": "軟水位壓縮改在背景執行緒進行", "group": "模式開關"},
     {"cmd": "/parallel_cal off", "desc": "壓縮改回序列處理", "group": "模式開關"},
+    {"cmd": "/context_mode harness", "desc": "上下文模式：harness 替模型做決定（大量回傳由獨立 session 擷取重點，預設）", "group": "模式開關"},
+    {"cmd": "/context_mode claude_code", "desc": "上下文模式：相信模型（原文進上下文、太大保留頭尾，查不查細節由 AI 決定）", "group": "模式開關"},
+    {"cmd": "/guard on", "desc": "執行前關卡：派工單、取消任務、建容器、容器內非唯讀指令先問你（預設）", "group": "模式開關"},
+    {"cmd": "/guard off", "desc": "關閉執行前關卡（只限這次執行，不建議）", "group": "模式開關"},
     {"cmd": "/skill ", "desc": "手動載入某技能的規格，隨下一則訊息送出（直接點下方技能清單更快）", "group": "動作與查詢", "args": True},
     {"cmd": "/skills", "desc": "列出所有可用技能", "group": "動作與查詢"},
     {"cmd": "/menu", "desc": "顯示完整指令說明", "group": "動作與查詢"},
     {"cmd": "/compress", "desc": "手動壓縮並歸檔目前的歷史對話", "group": "動作與查詢"},
-    {"cmd": "/plan done", "desc": "提早清除目前已核准的計畫", "group": "動作與查詢"},
+    {"cmd": "/plan done", "desc": "提早清除目前的計畫與任務清單", "group": "動作與查詢"},
+    {"cmd": "/context_mode", "desc": "查看目前的上下文模式", "group": "動作與查詢"},
     {"cmd": "/make_skill ", "desc": "把這段做對的操作步驟編譯成新技能（後接技能名稱，可再接步驟範圍如 3-7）", "group": "動作與查詢", "args": True},
     {"cmd": "/trajectory", "desc": "列出本次 session 記錄到的腳本執行軌跡（步驟編號、成功／失敗）", "group": "動作與查詢"},
     {"cmd": "/objective set ", "desc": "設定 Sticky Objective（後面接內容）", "group": "動作與查詢", "args": True},
@@ -45,7 +52,9 @@ MENU_TEXT = """可用指令：
 /summarize on / /summarize off 切換工具回傳的任務導向摘要（見下方說明，預設開啟）
 /parallel_cal on / /parallel_cal off 切換平行壓縮（回合結束後的軟水位壓縮改在背景執行緒做，預設關閉）
 /plan on / /plan off    開啟 Plan 模式：下一個新任務會先規劃步驟、經你核准後才執行；核准後自動退出（預設關閉）
-/plan done              提早清除目前已核准的計畫（正常情況下會在你送出下一個新任務時自動清除）
+/plan done              提早清除目前的計畫與任務清單（正常情況下會在你送出下一個新任務時自動清除）
+/context_mode [模式]    查看或切換上下文模式：harness（預設）／claude_code，見下方說明
+/guard on / /guard off  執行前關卡（預設開啟）：會改變系統狀態的技能執行前先問你
 /objective set <內容>   設定 Sticky Objective（最高優先任務，會持續提醒 AI）
 /objective show         查看目前的 Objective
 /objective clear        清除 Objective
@@ -84,7 +93,22 @@ AI 的每一次回覆都是固定的 JSON（thought／reply／action），由 Ol
 執行期間，不論經過多少輪工具決策、甚至觸發自動壓縮，AI 都不會忘記它；等你送出
 下一個新任務時會自動清除，不會殘留干擾新任務。若想提早清除可輸入 /plan done。
 
-單一工具回傳若超過 {threshold} tokens，不論目前是什麼模式，都不會直接進主對話：
+上下文模式（/context_mode）決定工具回傳怎麼進主對話，兩種都會把完整原文存成 #編號：
+- harness（預設，下一段的說明）：harness 替模型做決定，大量回傳由獨立 session 依問題擷取重點、附下一步建議。
+- claude_code：相信模型，原文直接進上下文；超過 {raw_max} tokens 保留頭尾、中間註明省略多少與存檔編號，
+  要不要回存檔查（result_grep／result_view／result_recall）由 AI 自己決定。上下文超過水位時，先把舊的工具回傳
+  清成「原文在存檔 #N」的佔位（不呼叫模型、可取回），不夠才做滾動摘要。任務清單由 AI 自己勾（plan_task done）。
+兩種模式可以隨時切換比較（之後的工具回傳才照新模式處理）；evals/ 有同一組情境跑兩種模式的評測。
+
+執行前關卡（/guard，預設開啟）：派工單（workpackage_send，--dry-run 除外）、取消任務、刪逾時任務、建容器、
+容器內非唯讀的指令（ls、cat、ros2 topic echo 這類唯讀指令直接放行），執行前畫面下方會出現「✅ 同意執行／🚫 拒絕」。
+auto 模式也一樣會停下來問；是由系統不執行保證的，不是提醒 AI 而已。拒絕時 AI 會收到「沒有執行」，等你說明怎麼調整。
+
+任務清單：多步驟的任務，AI 可以自己用 plan_task 列步驟（不需要你核准），清單每一輪都附在送給 AI 的內容最後面，
+標題列的 📋 顯示進度。/plan on 核准的計畫也會轉成同一份清單。harness 模式由系統依執行紀錄自動打勾，
+claude_code 模式由 AI 自己勾。
+
+單一工具回傳若超過 {threshold} tokens（harness 模式），不會直接進主對話：
 預設交給一個獨立、乾淨的 session 做「任務導向摘要」——它拿到完整原始輸出、
 使用者的目標（Objective／這一輪任務的原始敘述／已核准的計畫）與這一步的目的
 （AI 剛才的想法與執行的工具），只擷取跟任務有關的事實，名稱與數值照抄、不推測，
@@ -136,7 +160,7 @@ prompt_eval_count），使用者輸入與工具回傳以每次呼叫後校準的
 tools/ 與 scripts/ 並寫入 SKILLS.md，下一次呼叫 AI 就能用 EXECUTE: <名稱> 載入規格再執行。
 「重播驗證」會用軌跡中的原值實際跑一次草稿腳本，含會改變狀態的步驟（docker_est、workpackage_send、
 change_dir 等）時預覽會先提醒。只有一步的做對經驗請改用 modify_memory --skill 記憶，不必做技能。""".format(
-    threshold=TOOL_RESULT_TOKEN_THRESHOLD, vision_model=VISION_MODEL,
+    threshold=TOOL_RESULT_TOKEN_THRESHOLD, vision_model=VISION_MODEL, raw_max=RAW_RESULT_MAX_TOKENS,
     token_threshold=TOKEN_THRESHOLD, soft_threshold=SOFT_TOKEN_THRESHOLD,
     keep_recent=KEEP_RECENT_TOKENS, num_ctx=NUM_CTX, min_compress=MIN_COMPRESS_TOKENS,
     soft_pct=round(SOFT_TOKEN_THRESHOLD / NUM_CTX * 100), hard_pct=round(TOKEN_THRESHOLD / NUM_CTX * 100),
@@ -206,11 +230,33 @@ def handle_slash_command(message, events):
         events.append({"channel": "system", "text": "📝 已關閉 Plan 模式（恢復直接執行）"})
         return True
     if lower == "/plan done":
-        if agent.current_plan:
+        if agent.current_plan or agent.todo:
             agent.current_plan = None
-            events.append({"channel": "system", "text": "✅ 已提早清除目前的計畫（system prompt 不再提醒 AI 依計畫執行；平常會在下一個新任務送出時自動清除）"})
+            agent.clear_todo()
+            events.append({"channel": "system", "text": "✅ 已提早清除目前的計畫與任務清單（平常會在下一個新任務送出時自動清除）"})
         else:
             events.append({"channel": "system", "text": "ℹ️ 目前沒有進行中的計畫"})
+        return True
+    if lower == "/context_mode" or lower.startswith("/context_mode "):
+        arg = text[len("/context_mode"):].strip()
+        if not arg:
+            events.append({"channel": "system", "text": (
+                f"🔀 目前的上下文模式：{agent.context_mode}——{CONTEXT_MODE_DESCRIPTIONS[agent.context_mode]}。"
+                f"可切換：/context_mode harness｜/context_mode claude_code")})
+            return True
+        try:
+            mode = agent.set_context_mode(arg)
+        except ValueError as e:
+            events.append({"channel": "system", "text": f"⚠️ {e}"})
+            return True
+        events.append({"channel": "system", "text": (
+            f"🔀 已切換上下文模式：{mode}——{CONTEXT_MODE_DESCRIPTIONS[mode]}（之後的工具回傳才照新模式處理）")})
+        return True
+    if lower in ("/guard on", "/guard off"):
+        agent.guard_enabled = lower == "/guard on"
+        events.append({"channel": "system", "text": (
+            "🛡️ 已開啟執行前關卡：會改變系統狀態的技能執行前會先問你" if agent.guard_enabled else
+            "⚠️ 已關閉執行前關卡（只限這次執行）：派工單、取消任務、建容器、容器內非唯讀指令將不經確認直接執行")})
         return True
     if lower.startswith("/objective set "):
         agent.sticky_objective = text[len("/objective set "):].strip()

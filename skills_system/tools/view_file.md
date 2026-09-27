@@ -17,7 +17,7 @@ dependencies: []
 `EXECUTE: scripts/cat_cmd.py config.yaml`
 
 # 回傳
-成功：`[PASS] 檔案內容 (<path>):` + 完整文字（過長時由獨立 session 依你的目的擷取，完整原文有存檔可 `result_grep`）。失敗：`[ERROR] 原因`。
+成功：`[PASS] 檔案內容 (<path>):` + 完整文字（過長時依上下文模式處理：harness 模式由獨立 session 依你的目的擷取、claude_code 模式保留頭尾；完整原文都有存檔可 `result_grep`／`result_view`）。失敗：`[ERROR] 原因`。
 
 # 異常
 * 檔案不存在、是目錄、超過 1MB、或不是一般檔案（裝置、socket、FIFO）：`[ERROR]`，修正路徑；找檔名用 `find_file`、列目錄用 `list_dir`。

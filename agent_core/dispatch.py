@@ -114,7 +114,7 @@ class DispatchMixin:
             if line.startswith("[TARGET_CONTAINER]"):
                 self.target_container = line[len("[TARGET_CONTAINER]"):].strip()
 
-    def run_tool(self, ai_response):
+    def run_tool(self, ai_response, approved=False):
         """依 AI 回覆 JSON 的 action 欄位執行（ai_response 可以是原始 JSON 字串或 parse_reply 的結果）。
         action 為 null／回覆不是合法 JSON → 不執行、回傳 None；reply 裡的文字完全不看。
         有 action 時行為分兩種：
@@ -125,6 +125,9 @@ class DispatchMixin:
            不做技能名稱 -> 腳本檔名的猜測或對照；AI 讀完規格後，下一輪需改用
            規格書中標明的實際腳本路徑（例如 scripts/cd_cmd.py）才會真正執行。
         2. 否則將 command 視為實際腳本路徑，以 args 為參數執行對應的 CLI 腳本並回傳結果。
+
+        執行前關卡：會改變狀態的技能（guard_check）沒有 approved=True 就不執行，回 [DENIED]。CLI／Web 先用
+        guard_check 問使用者，同意後才以 approved=True 呼叫；其他呼叫端漏接確認時這裡也擋得住。
         """
         parsed = ai_response if isinstance(ai_response, dict) else parse_agent_reply(ai_response)
         action = parsed.get("action")
@@ -163,6 +166,9 @@ class DispatchMixin:
                 # process 內做；核心邏輯都在 agent_core，見 doc/架構說明.md），必須在存在性檢查前攔截，
                 # 否則會落入下面「找不到腳本」的分支。規格文件走一般的兩階段揭露，不受影響。
                 return self._result_recall(remainder)
+            if script_name == "plan_task_cmd.py":
+                # 偽技能：任務清單存在 agent 的狀態裡（TaskListMixin），同樣沒有實體腳本、在存在性檢查前攔截
+                return self._plan_task_command(remainder)
             script_path = os.path.join(self.base_path, "scripts", script_name)
 
             print(f"🛠️  Agent 啟動工具: {script_name}")
@@ -182,6 +188,11 @@ class DispatchMixin:
                 )
                 return f"[ERROR] 找不到腳本 {script_name}。{hint}"
 
+            if not approved:
+                guard = self.guard_check(parsed)
+                if guard:
+                    print(f"🛡️ {guard['skill']} 需要使用者確認才能執行，這次沒有執行。")
+                    return self.guard_blocked_text(guard)
             clean_args = self._parse_script_args(script_name, remainder)
             # 軌跡記錄用：執行「前」的狀態
             cwd_before, container_before, target_before = self.current_cwd, self.container_cwd, self.target_container

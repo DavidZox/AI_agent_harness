@@ -62,8 +62,23 @@ HARNESS_MARKERS = (
 
 # 融合摘要的長度目標（字，寫進摘要 prompt）與模型輸出硬上限（token，num_predict），
 # 讓滾動摘要不會越滾越長；輸出被硬上限截斷時 JSON 會解析失敗、退回原文，因此上限要留得夠寬。
-SUMMARY_MAX_CHARS = 600
-SUMMARY_MAX_PREDICT = 2000
+# 舊值 600 字（約 300 tokens，不到 num_ctx 的 1%）：使用者偏好與進度搶同一個額度，多次融合後一路走樣。
+# 使用者的原話另外由程式逐字保留（USER_WORDS_MAX_CHARS），摘要只需要寫歸納後的內容。
+SUMMARY_MAX_CHARS = 1500
+SUMMARY_MAX_PREDICT = 2500
+
+# 🗣️ 使用者原話：被壓縮掉的對話裡，使用者說過的話由程式逐字保留在 system prompt（不交給摘要模型改寫），
+# 超過總字數時丟最舊的並註明還有幾則、原文在哪個對話片段存檔。每則最多 USER_WORD_MAX_CHARS 字。
+USER_WORDS_MAX_CHARS = int(os.environ.get("AGENT_USER_WORDS_MAX_CHARS", "2000"))
+USER_WORD_MAX_CHARS = 300
+# 被壓縮的對話片段也存成一份工具結果存檔（同一套 #編號，可用 result_recall 取回），存檔的「腳本」欄寫這個名稱
+CONVERSATION_ARCHIVE_SCRIPT = "conversation_segment"
+CONVERSATION_ARCHIVES_SHOW = 5   # system prompt 列出最近幾份對話片段存檔的編號
+
+# 🧠 長期記憶（Memory.md）載入上限（字元）：以前只讀最後 30 行，條目變多時最舊的規則會無聲消失。
+# 現在整份載入；超過上限才丟最舊的條目，並在 system prompt 與 UI 明說還有幾條沒載入。用字元數而不是 token，
+# 載入結果才不會隨 chars_per_token 校準浮動（浮動會讓 system prompt 每輪不同、KV cache 失效）。
+MEMORY_MAX_CHARS = int(os.environ.get("AGENT_MEMORY_MAX_CHARS", "4000"))
 
 # 摘要模型（壓縮摘要與工具摘要兩種獨立 session 共用）。預設 None = 與主模型相同。
 # 可用 AGENT_SUMMARY_MODEL 指定同家族的小模型以減少摘要耗時（例如 gemma3:1b）；但注意：
@@ -157,6 +172,58 @@ RECALL_MAX_RECORDS = 3   # result_recall 一次最多讀幾份存檔（交給同
 # 對這類結果一律放行、不套用 TOOL_RESULT_TOKEN_THRESHOLD，Web Console 也不標記 ⚠️。
 # 規格書本身仍應維持精簡（以 400 tokens／約 800 字元以內為原則），節省每次載入的上下文成本。
 SKILL_DOC_PREFIX = "📘 已載入技能"
+
+# =========================================================
+# 🔀 上下文管理模式（/context_mode harness|claude_code；AGENT_CONTEXT_MODE 設預設值）
+# harness：harness 替模型做決定——大量回傳交給獨立 session 依問題擷取、附下一步建議（原本的設計）。
+# claude_code：相信模型——回傳原文直接進上下文（太大保留頭尾＋存檔編號），要查細節、要不要委派獨立 session
+#   （result_recall）由模型自己決定；harness 只提供截斷、清除舊回傳、滾動摘要這些安全網。
+# 兩種模式共用：原文存檔、檢索清單、執行前關卡、記憶、滾動摘要、任務清單。規則文字在 context_modes/<模式>.md。
+# =========================================================
+CONTEXT_MODES = ("harness", "claude_code")
+CONTEXT_MODE_DEFAULT = os.environ.get("AGENT_CONTEXT_MODE", "harness").strip().lower()
+if CONTEXT_MODE_DEFAULT not in CONTEXT_MODES:
+    CONTEXT_MODE_DEFAULT = "harness"
+CONTEXT_MODES_DIRNAME = "context_modes"
+# claude_code 模式：單一工具回傳進主對話的上限（token）。超過時保留頭尾（6:4），中間換成一行「省略多少、存檔編號、怎麼查」。
+# 預設 3000 ≈ num_ctx 32768 的 9%（Claude Code 的 Bash 輸出上限約 30000 字元，對 200K context 約 4%；小 context 給寬一點）。
+RAW_RESULT_MAX_TOKENS = int(os.environ.get("AGENT_RAW_RESULT_MAX_TOKENS", "3000"))
+# claude_code 模式：上下文超過水位時，先把舊的工具回傳清成「#編號」佔位（原文在存檔，可還原），不夠才做滾動摘要。
+# 最新 CLEAR_KEEP_RECENT_RESULTS 則不清；小於 CLEAR_MIN_TOKENS 的不清（省不了多少，還會讓 KV cache 從那裡開始失效）。
+CLEAR_KEEP_RECENT_RESULTS = int(os.environ.get("AGENT_CLEAR_KEEP_RESULTS", "3"))
+CLEAR_MIN_TOKENS = 300
+TOOL_TRUNCATED_TAG = "[tool result - 原文頭尾]"   # claude_code 模式超過上限、中間被截掉的回傳（UI 依此標示）
+TOOL_CLEARED_TAG = "[tool result - 已清除]"       # 被清成佔位的舊回傳
+
+# =========================================================
+# 🛡️ 執行前關卡：會改變實體／外部狀態的技能，執行前一律由程式要求使用者確認（不靠模型記得要問）。
+# 跟 Plan 模式同一個原則：關卡由程式路徑保證——run_tool 沒拿到 approved=True 就不執行這些技能。
+# docker_runcmd 的指令若被判定為唯讀（ls、cat、ros2 topic echo…，見 guard.is_readonly_shell）則放行；
+# workpackage_send 加 --dry-run 只顯示不送，也放行。change_dir／docker_open 只改 harness 自己的狀態，不擋。
+# AGENT_GUARDED_SKILLS 可覆寫清單（逗號分隔，none＝全部不擋）；/guard off 只對目前 session 關閉。
+# =========================================================
+_GUARDED_DEFAULT = "workpackage_send,workpackage_cancel,overpending_cancel,docker_est,docker_runcmd"
+_guarded_env = os.environ.get("AGENT_GUARDED_SKILLS", _GUARDED_DEFAULT).strip()
+GUARDED_SKILLS = set() if _guarded_env.lower() in ("", "none", "off") else {s.strip() for s in _guarded_env.split(",") if s.strip()}
+GUARD_DEFAULT = os.environ.get("AGENT_GUARD", "1").strip().lower() not in ("0", "off", "false", "no")
+GUARD_DENIED_TAG = "[DENIED]"
+
+# =========================================================
+# 📋 任務清單（plan_task）：模型自己開的步驟清單，不需要使用者核准；/plan on 核准的計畫也轉成同一份清單。
+# 每次呼叫模型都顯示在送出內容的最尾端（動態區）。harness 模式由程式依執行紀錄自動打勾（步驟裡寫的技能執行
+# 成功就算完成）；claude_code 模式由模型自己用 plan_task done 勾，TODO_REMIND_AFTER 個動作沒更新就提醒。
+# =========================================================
+TODO_MAX_ITEMS = 12
+TODO_ITEM_MAX_CHARS = 120
+TODO_REMIND_AFTER = 3
+
+# =========================================================
+# ⏱️ 每次模型呼叫的耗時記錄（logs/perf.jsonl）：Ollama 回報的 prompt_eval_count 在 KV cache 命中時仍是完整值，
+# 看不出 cache 有沒有命中；prompt_eval_duration 才看得出來（命中時只算新的部分）。每筆記呼叫種類、token、毫秒、
+# 以及主對話呼叫前「system prompt 有沒有變」「中間跑了幾次獨立 session」，evals/perf_report.py 依此分組比較。
+# =========================================================
+PERF_LOG = "perf.jsonl"
+PERF_LOG_ENABLED = os.environ.get("AGENT_PERF_LOG", "1").strip().lower() not in ("0", "off", "false", "no")
 
 # 單一工具腳本的總逾時（秒）：harness 的最後防線。各腳本自身應設定更短的逾時
 # （容器類腳本可調的上限 570 秒就是為了低於這個值），這裡只處理腳本本身卡死

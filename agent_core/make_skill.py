@@ -1,6 +1,5 @@
 """MakeSkillMixin：/make_skill——把做對的操作軌跡編譯成組合技能（草擬、驗證、預覽、重播、註冊）。"""
 import json
-import ollama
 import os
 import re
 import subprocess
@@ -259,7 +258,8 @@ class MakeSkillMixin:
             if t and t not in tasks:
                 tasks.append(t)
         system_prompt, user_prompt = self._make_skill_prompts(name, groups, trailing, plan_text, tasks, previous, feedback)
-        res = ollama.chat(
+        res = self._timed_chat(
+            "skill_draft",
             model=self.skill_model,
             messages=[{'role': 'system', 'content': system_prompt}, {'role': 'user', 'content': user_prompt}],
             format=MAKE_SKILL_SCHEMA,

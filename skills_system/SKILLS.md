@@ -6,6 +6,9 @@
 >
 > **目標容器**：容器技能的 `<container_name>` 可省略＝Current Agent State 的 CURRENT_TARGET_CONTAINER（`docker_open` 選定／切換；成功操作過的容器會自動成為目標）。已有目標時直接用，不要再問使用者要看哪個容器。
 
+## 任務規劃
+- [plan_task](tools/plan_task.md) — 多步驟任務先列步驟清單（不需要使用者核准），之後每一輪都附在最後面；可勾完成、記失敗、重列（AGENT.md 有語法，可直接執行）
+
 ## 系統內建
 - [list_dir](tools/list_dir.md) — 查看本機某一層目錄的清單（不含子目錄）；標頭算好數量與最新修改，`--filter 關鍵字` 計數、`--newest N` 找最新修改的檔案
 - [search_text](tools/search_text.md) — 在檔案「內部文字」中過濾特定關鍵字，標頭算好命中筆數與檔案數

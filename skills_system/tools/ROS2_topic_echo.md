@@ -7,7 +7,7 @@ dependencies: ["docker", "ros2"]
 ---
 
 # 用途
-在容器內執行 `ros2 topic echo`（自動補齊 ROS2 環境）。不加 `--duration`：讀一筆就結束。加 `--duration 秒`：擷取這段時間的所有訊息，回報則數、頻率、每個欄位的變化（數值 min→max、字串有幾種值、固定不變的欄位）與全部原始訊息。一段時間的輸出多半超過門檻、會由獨立 session 依你這一步的目的擷取重點，所以執行前在 reply 說清楚想確認什麼。
+在容器內執行 `ros2 topic echo`（自動補齊 ROS2 環境）。不加 `--duration`：讀一筆就結束。加 `--duration 秒`：擷取這段時間的所有訊息，回報則數、頻率、每個欄位的變化（數值 min→max、字串有幾種值、固定不變的欄位）與全部原始訊息。一段時間的輸出多半很長（harness 模式由獨立 session 依你這一步的目的擷取重點；claude_code 模式你只拿到頭尾，中間要回存檔查），所以執行前在 reply 說清楚想確認什麼。
 
 # 語法
 `EXECUTE: scripts/ROS2_topic_echo_cmd.py [container_name] <topic_name> [timeout_seconds] [--duration 秒] [--where 欄位<值]...`

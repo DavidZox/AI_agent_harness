@@ -6,23 +6,31 @@ import time
 from .archive import ArchiveMixin
 from .compression import CompressionMixin
 from .config import (
+    CONTEXT_MODE_DEFAULT,
     DEFAULT_CHARS_PER_TOKEN,
+    GUARD_DEFAULT,
     MAX_CHARS_PER_TOKEN,
     MIN_CHARS_PER_TOKEN,
     PROJECT_ROOT,
     SKILL_MODEL,
     SUMMARY_MODEL,
 )
+from .context_mode import ContextModeMixin
 from .conversation import ConversationMixin
 from .dispatch import DispatchMixin
+from .guard import GuardMixin
 from .make_skill import MakeSkillMixin
+from .perf import PerfMixin
 from .prompt import PromptMixin
+from .task_list import TaskListMixin
 from .tool_summary import ToolSummaryMixin
 from .tool_use_index import ToolUseIndexMixin
 from .trajectory import TrajectoryMixin
 
 
-class SkillAgent(ConversationMixin, PromptMixin, DispatchMixin, ToolSummaryMixin, ToolUseIndexMixin, ArchiveMixin, TrajectoryMixin, CompressionMixin, MakeSkillMixin):
+class SkillAgent(ConversationMixin, PromptMixin, DispatchMixin, GuardMixin, ContextModeMixin, TaskListMixin,
+                 ToolSummaryMixin, ToolUseIndexMixin, ArchiveMixin, TrajectoryMixin, CompressionMixin,
+                 MakeSkillMixin, PerfMixin):
     def __init__(self, model="gemma4:e4b", max_history=None, summary_model=None):
         # max_history：訊息「則數」滑動視窗，預設停用（None）。上下文大小統一以 token 門檻
         # （TOKEN_THRESHOLD）觸發壓縮歸檔；這個參數只保留作為極端情境的保險絲，需要時再開。
@@ -49,6 +57,10 @@ class SkillAgent(ConversationMixin, PromptMixin, DispatchMixin, ToolSummaryMixin
         self.messages = []
         self.max_history = max_history
 
+        # 🔀 上下文管理模式（harness／claude_code，見 config.CONTEXT_MODES 與 context_mode.py）與 🛡️ 執行前關卡
+        self.context_mode = CONTEXT_MODE_DEFAULT
+        self.guard_enabled = GUARD_DEFAULT
+
         if not os.path.exists(self.index_file):
             raise FileNotFoundError(f"找不到技能索引：{self.index_file}")
 
@@ -69,7 +81,21 @@ class SkillAgent(ConversationMixin, PromptMixin, DispatchMixin, ToolSummaryMixin
         self.last_prompt_chars = None    # 該次 prompt 的字元數，之後用來估算增量
         self.last_eval_tokens = None     # 最近一次 ask_ai 產生的 token 數（精確）
         self.auto_compressed = False     # 最近一次 ask_ai 呼叫前是否因超過門檻而自動壓縮（供 UI 顯示）
+        self.auto_cleared = None         # 最近一次 ask_ai 呼叫前 claude_code 模式清除舊工具回傳的統計（供 UI 顯示）
+        self.last_clearing = None        # 最近一次清除舊工具回傳的統計 {results, tokens}
+        self.last_tail_chars = 0         # 最近一次送出時動態區（build_state_tail）的字元數，context_tokens 估算用
         self._tokenize_unavailable = False
+
+        # ⏱️ 模型呼叫耗時（perf.py）：主對話呼叫前 system prompt 有沒有變、歷史有沒有被改寫、中間跑了幾次獨立 session
+        self.perf_calls = []
+        self.last_perf = None
+        self._side_calls_since_main = 0
+        self._last_main_sys_hash = None
+        self._history_rewritten = False
+
+        # 🧠 長期記憶載入狀態（load_long_term_memory）：超過上限沒載入的條目數，與待送給 UI 的提醒
+        self.memory_dropped = 0
+        self._memory_warning = None
 
         # =========================
         # 🎯 Sticky Objective
@@ -92,6 +118,7 @@ class SkillAgent(ConversationMixin, PromptMixin, DispatchMixin, ToolSummaryMixin
         # =========================
         self.current_task = None
         self.task_history = []          # 最近 TASK_HISTORY_KEEP 則使用者任務訊息（舊→新），見 set_current_task／_build_task_anchor_text
+        self._user_said = []            # 使用者每句話與時間（最多 200 則），壓縮時逐字保留原話用（_keep_user_words）
         self.last_result_id = None      # 最近一次 run_tool 存檔的結果編號（regard 規格載入時為 None），供摘要附註與 UI 顯示
         self.last_result_file = None
 
@@ -102,7 +129,10 @@ class SkillAgent(ConversationMixin, PromptMixin, DispatchMixin, ToolSummaryMixin
         #   啟動時從 logs/ 最新的 summary_*.md 載入，作為跨 session 的延續。
         # messages_lock：保護 self.messages 的快照與整批替換（背景壓縮執行緒會用到）。
         # =========================
-        self.rolling_summary = self._load_latest_summary()
+        # user_words：被壓縮掉的對話裡使用者的原話（程式逐字保留，不交給摘要模型改寫）；conversation_archives：
+        # 被壓縮的對話片段存檔編號。兩者跟滾動摘要一起從最新一份 summary_*.json 接回（_load_latest_summary_state）。
+        (self.rolling_summary, self.user_words, self.user_words_dropped,
+         self.conversation_archives) = self._load_latest_summary_state()
         self.messages_lock = threading.RLock()
         self._compress_thread = None          # 進行中的背景壓縮執行緒（/parallel_cal on 時才會有）
         self._compress_state_lock = threading.Lock()
@@ -121,7 +151,16 @@ class SkillAgent(ConversationMixin, PromptMixin, DispatchMixin, ToolSummaryMixin
         self.trajectory = []
         # 編號跨 session 全域遞增：從既有存檔（logs/tool_results/）的最大編號續編。純數字的 #16 才能在任何一次啟動
         # 都指到同一份存檔——工具使用檢索清單（_tool_use_index_block）就是靠這個讓模型只需要抄編號、不必抄檔名。
+        # 配號走 _next_id（上鎖：背景壓縮也會為被壓縮的對話片段配號）。
+        self._id_lock = threading.Lock()
         self.trajectory_seq = self._max_archived_id()
+
+        # =========================
+        # 📋 任務清單（task_list.py）：plan_task 或 Plan 模式核准的計畫，顯示在動態區；todo_updated_seq 是最後一次更新時的編號
+        # =========================
+        self.todo = []
+        self.todo_source = None
+        self.todo_updated_seq = self.trajectory_seq
         self.drafts_dir = os.path.join(self.base_path, "drafts")
         self.skill_model = SKILL_MODEL or self.summary_model
         self.pending_skill_draft = None
@@ -150,7 +189,8 @@ class SkillAgent(ConversationMixin, PromptMixin, DispatchMixin, ToolSummaryMixin
         return max(1, round(len(text) / self.chars_per_token))
 
     def _messages_chars(self) -> int:
-        return sum(len(m['content']) for m in self.messages)
+        """目前要送出的字元數：self.messages 加上動態區（不寫進 messages，用上一次送出時的大小估）。"""
+        return sum(len(m['content']) for m in self.messages) + (self.last_tail_chars or 0)
 
     def context_tokens(self) -> int:
         """目前主對話（system prompt + 全部 messages）的 token 數，真實尺度。

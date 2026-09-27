@@ -10,7 +10,12 @@
 
 用法：
     modify_memory_cmd.py "問題種類 | 問題描述 | 解決方法或結論" [--skill <技能名稱>]
+    modify_memory_cmd.py --move-last-to-skill <技能名稱>     # 把最新一則全域記憶改綁到該技能（使用者同意後才用）
 回傳：成功以 [PASS] 開頭、失敗以 [ERROR] 開頭（專案共同慣例）。純本機檔案讀寫，不需要逾時機制。
+
+綁不綁技能：小模型幾乎一律寫全域（評測 memory_skill_routing 實測），所以全域寫入的內容剛好提到一個技能時，
+回傳會請模型用一句話問使用者要不要改綁；同意就用 --move-last-to-skill 搬過去。預設留在全域是比較安全的一邊：
+「選技能時就要知道的規則」（例如 list_dir 不能看容器內）綁到技能上，選技能的當下反而看不到。
 
 檔案路徑一律由腳本自身位置推算：腳本執行時的 cwd 是 AI 的虛擬工作目錄（可被 change_dir 改變），
 與 harness 安裝位置無關，不可用相對路徑。
@@ -52,12 +57,20 @@ def mentioned_skills(content):
 
 
 def parse_args(argv):
-    """回傳 (content, skill)。--skill 可放在內容前或後，也容忍 --skill=名稱 的寫法。"""
+    """回傳 (content, skill, move_to)。--skill 可放在內容前或後，也容忍 --skill=名稱 的寫法；
+    --move-last-to-skill <名稱> 是另一個動作（搬移最新一則全域記憶），有它時 content 應為空。"""
     skill = None
+    move_to = None
     rest = []
     i = 0
     while i < len(argv):
         tok = argv[i]
+        if tok == "--move-last-to-skill":
+            if i + 1 >= len(argv):
+                raise ValueError("--move-last-to-skill 後面必須接技能名稱（SKILLS.md 裡的名稱）")
+            move_to = argv[i + 1]
+            i += 2
+            continue
         if tok == "--skill":
             if i + 1 >= len(argv):
                 raise ValueError("--skill 後面必須接技能名稱（SKILLS.md 裡的名稱）")
@@ -70,7 +83,7 @@ def parse_args(argv):
             continue
         rest.append(tok)
         i += 1
-    return " ".join(rest).strip(), skill
+    return " ".join(rest).strip(), skill, move_to
 
 
 def normalize_skill(name):
@@ -94,6 +107,80 @@ def existing_entries(path):
     return entries
 
 
+def _check_skill(skill, flag="--skill"):
+    """技能名稱正規化與檢查：回傳 (技能名稱, 錯誤訊息或 None)。"""
+    skill = normalize_skill(skill)
+    if skill == SELF_NAME:
+        return skill, (
+            f"[ERROR] {flag} 不能是 {SELF_NAME} 本身（它只是寫入記憶的工具，不是記憶的主題）。"
+            "這則記憶若與某個技能的用法有關，請改綁那個技能；若是通用原則、溝通風格或選技能的規則，"
+            "請不加 --skill 重新寫入全域。"
+        )
+    if not skill or not os.path.exists(os.path.join(TOOLS_DIR, f"{skill}.md")):
+        return skill, (
+            f"[ERROR] 找不到技能 '{skill}' 的規格文件（skills_system/tools/{skill}.md）。"
+            f"{flag} 後面必須是 SKILLS.md 索引裡的技能名稱；若這則記憶不屬於特定技能，請不要加 --skill。"
+        )
+    return skill, None
+
+
+def _append_skill_entry(skill, stamp, content):
+    """寫一則技能綁定記憶（檔案不存在時先寫標題）。回傳 (是否真的寫入, 目前條目數, 總字數)。"""
+    path = os.path.join(SKILL_MEMORY_DIR, f"{skill}.md")
+    if content in existing_entries(path):
+        return False, len(existing_entries(path)), 0
+    os.makedirs(SKILL_MEMORY_DIR, exist_ok=True)
+    if not os.path.exists(path):
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(
+                f"# {skill} 經驗記憶\n\n"
+                f"> 使用者要求記住、專屬於此技能的經驗。載入 `{skill}` 規格文件時會自動附在後面；"
+                f"由 `scripts/modify_memory_cmd.py \"...\" --skill {skill}` 寫入，可直接編輯或刪除過時條目。\n\n"
+            )
+    with open(path, "a", encoding="utf-8") as f:
+        f.write(f"- [{stamp}] {content}\n")
+    entries = existing_entries(path)
+    return True, len(entries), sum(len(e) for e in entries)
+
+
+def _size_warning(skill, n, total_chars):
+    if n > WARN_ENTRIES or total_chars > WARN_CHARS:
+        return (f"\n⚠️ 此技能的經驗記憶已有 {n} 則／約 {total_chars} 字，每次載入規格都會進入上下文，"
+                f"建議整併或刪除過時條目（檔案：skills_system/memory/{skill}.md）。")
+    return ""
+
+
+def move_last_to_skill(skill):
+    """把 Memory.md 最新（最後一則）的全域條目搬到 skills_system/memory/<skill>.md，保留原本的寫入時間。
+    給「全域寫入後問使用者要不要改綁、使用者同意」這一步用。"""
+    try:
+        skill, err = _check_skill(skill, "--move-last-to-skill")
+        if err:
+            return err
+        if not os.path.exists(MEMORY_FILE):
+            return "[ERROR] 目前沒有全域記憶（Memory.md 不存在），沒有可以改綁的條目。"
+        with open(MEMORY_FILE, "r", encoding="utf-8") as f:
+            lines = f.read().splitlines()
+        idx = next((i for i in range(len(lines) - 1, -1, -1)
+                    if lines[i].lstrip().startswith("[") and _ENTRY_RE.match(lines[i].strip())), None)
+        if idx is None:
+            return "[ERROR] Memory.md 裡沒有任何記憶條目，沒有可以改綁的條目。"
+        line = lines[idx].strip()
+        stamp = line[1:line.index("]")]
+        content = _ENTRY_RE.match(line).group(1).strip()
+        written, n, total = _append_skill_entry(skill, stamp, content)
+        del lines[idx]
+        if idx > 0 and idx - 1 < len(lines) and not lines[idx - 1].strip():
+            del lines[idx - 1]   # 條目之間的空行一起拿掉
+        with open(MEMORY_FILE, "w", encoding="utf-8") as f:
+            f.write("\n".join(lines).rstrip() + "\n")
+        where = "已存在於" if not written else "已移到"
+        return (f"[PASS] 最新一則全域記憶{where}技能 {skill} 的經驗記憶（全域那一則已移除）：之後只在載入 {skill} 規格時出現，"
+                f"平常不佔上下文。\nMemory: [{stamp}] {content}" + _size_warning(skill, n, total))
+    except Exception as e:
+        return f"[ERROR] 記憶改綁失敗: {e}"
+
+
 def execute(memory_content, skill=None):
     try:
         if not memory_content or not memory_content.strip():
@@ -102,44 +189,17 @@ def execute(memory_content, skill=None):
         now = datetime.now().strftime("%m-%d %H:%M")
 
         if skill is not None:
-            skill = normalize_skill(skill)
-            if skill == SELF_NAME:
-                return (
-                    f"[ERROR] --skill 不能是 {SELF_NAME} 本身（它只是寫入記憶的工具，不是記憶的主題）。"
-                    "這則記憶若與某個技能的用法有關，請改綁那個技能；若是通用原則、溝通風格或選技能的規則，"
-                    "請不加 --skill 重新寫入全域。"
-                )
-            if not skill or not os.path.exists(os.path.join(TOOLS_DIR, f"{skill}.md")):
-                return (
-                    f"[ERROR] 找不到技能 '{skill}' 的規格文件（skills_system/tools/{skill}.md）。"
-                    "--skill 後面必須是 SKILLS.md 索引裡的技能名稱；若這則記憶不屬於特定技能，請不要加 --skill。"
-                )
-            path = os.path.join(SKILL_MEMORY_DIR, f"{skill}.md")
-            if content in existing_entries(path):
+            skill, err = _check_skill(skill)
+            if err:
+                return err
+            written, n, total = _append_skill_entry(skill, now, content)
+            if not written:
                 return f"[PASS] 相同內容已存在於技能 {skill} 的經驗記憶，未重複寫入。"
-            os.makedirs(SKILL_MEMORY_DIR, exist_ok=True)
-            if not os.path.exists(path):
-                with open(path, "w", encoding="utf-8") as f:
-                    f.write(
-                        f"# {skill} 經驗記憶\n\n"
-                        f"> 使用者要求記住、專屬於此技能的經驗。載入 `{skill}` 規格文件時會自動附在後面；"
-                        f"由 `scripts/modify_memory_cmd.py \"...\" --skill {skill}` 寫入，可直接編輯或刪除過時條目。\n\n"
-                    )
-            with open(path, "a", encoding="utf-8") as f:
-                f.write(f"- [{now}] {content}\n")
-            entries = existing_entries(path)
-            total_chars = sum(len(e) for e in entries)
-            msg = (
-                f"[PASS] 成功寫入技能 {skill} 的經驗記憶（目前共 {len(entries)} 則），"
+            return (
+                f"[PASS] 成功寫入技能 {skill} 的經驗記憶（目前共 {n} 則），"
                 f"之後載入 {skill} 規格文件時會一併帶入，平常不佔上下文。\n"
-                f"Memory: [{now}] {content}"
+                f"Memory: [{now}] {content}" + _size_warning(skill, n, total)
             )
-            if len(entries) > WARN_ENTRIES or total_chars > WARN_CHARS:
-                msg += (
-                    f"\n⚠️ 此技能的經驗記憶已有 {len(entries)} 則／約 {total_chars} 字，每次載入規格都會進入上下文，"
-                    f"建議整併或刪除過時條目（檔案：skills_system/memory/{skill}.md）。"
-                )
-            return msg
 
         # 全域：Memory.md
         if content in existing_entries(MEMORY_FILE):
@@ -155,9 +215,12 @@ def execute(memory_content, skill=None):
         )
         mentioned = mentioned_skills(content)
         if len(mentioned) == 1:
+            x = mentioned[0]
             msg += (
-                f"\nℹ️ 內容提到技能 {mentioned[0]}。已寫入全域、不需重寫；若這類記憶只在使用該技能時才需要，"
-                f"下次可加 --skill {mentioned[0]} 綁定，避免常駐上下文。"
+                f"\nℹ️ 這則記憶提到技能 {x}。選技能的時候就要知道的規則（例如某技能不能用在容器內）留在全域就好；"
+                f"如果它只在使用 {x} 時才需要（參數、前置條件、錯誤處理），可以改綁在 {x}（載入它的規格時才出現、平常不佔上下文）。"
+                f"請在 reply 用一句話問使用者要不要改綁；使用者同意就執行 scripts/modify_memory_cmd.py --move-last-to-skill {x}，"
+                f"不同意就維持全域，不要自己決定。"
             )
         return msg
 
@@ -167,8 +230,8 @@ def execute(memory_content, skill=None):
 
 if __name__ == "__main__":
     try:
-        content, skill = parse_args(sys.argv[1:])
-        print(execute(content, skill))
+        content, skill, move_to = parse_args(sys.argv[1:])
+        print(move_last_to_skill(move_to) if move_to is not None else execute(content, skill))
     except Exception as e:
         print(f"[ERROR] {e}")
         sys.exit(1)

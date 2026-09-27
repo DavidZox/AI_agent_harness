@@ -13,8 +13,8 @@ from agent_core.config import (
     TOOL_RESULT_TOKEN_THRESHOLD,
 )
 from agent_core.protocol import action_text, is_exempt_result, tool_result_message
-from agent_core.turn import _append_discarded_tool_result, _content_for_context, context_kind
-from .state import agent, pending, pending_skill_names, plan_pending, state, vision_session
+from agent_core.turn import _append_discarded_tool_result, _content_for_context, context_kind, oversized_notice
+from .state import agent, clear_pending, pending, pending_skill_names, plan_pending, state, vision_session
 
 
 MAX_AUTO_ITERATIONS = 25  # 安全防護：避免 auto 模式下模型無限迴圈卡住伺服器
@@ -36,8 +36,13 @@ def current_mode_label():
 
 
 def build_stats():
+    done, total = agent.todo_progress()
     return {
         "mode": current_mode_label(),
+        "context_mode": agent.context_mode,   # harness／claude_code（/context_mode 切換）
+        "guard": agent.guard_enabled,          # 執行前關卡（/guard on|off）
+        "todo": {"done": done, "total": total, "text": agent._todo_text()} if total else None,
+        "memory_dropped": agent.memory_dropped,
         "tool_summary_mode": state["tool_summary_mode"],
         "plan_mode": state["plan_mode"],
         "current_plan": agent.current_plan or None,
@@ -83,6 +88,10 @@ def _emit_context_event(content, events, tool_tokens=None):
     n = agent.count_tokens(content)
     if kind in ("summary", "reduced"):
         events.append({"channel": "summary", "kind": kind, "text": content, "tokens": n})
+    elif kind == "truncated":
+        events.append({"channel": "summary", "kind": kind, "tokens": n, "text": (
+            f"原文頭尾（≈{n} tokens）：中間省略的部分在存檔 #{agent.last_result_id}，要不要回查由 AI 自己決定"
+            f"（claude_code 模式）。頭尾與上方系統回傳卡片相同。")})
     elif kind == "doc":
         events.append({"channel": "summary", "kind": kind, "text": f"完整規格文件（≈{n} tokens，不受門檻限制），與上方卡片相同。", "tokens": n})
     else:
@@ -228,16 +237,69 @@ def handle_skill_draft_response(text, events):
     return "revised"
 
 
-def run_turn(events):
-    """反覆執行 ask_ai -> run_tool，直到這一回合自然結束（沒有工具需要執行），
-    或是需要使用者對工具結果做決策為止（hybrid / manual 模式）。
+def _handle_tool_result(result, events):
+    """run_tool 之後的共用處理（run_turn 與執行前關卡核准後的 apply_decision 都走這裡）：推卡片、超過門檻的提醒，
+    再依模式決定結果怎麼進主對話。回傳 "end"（沒有工具結果，回合結束）／"continue"（auto：已加入，接著問 AI）
+    ／"await"（hybrid／manual：暫停等使用者對這次工具結果做決策）。"""
+    tool_tokens = 0
+    if result:
+        tool_tokens = agent.count_tokens(result)
+        agent.total_tool_tokens += tool_tokens
+        # 規格文件載入不受門檻限制（_content_for_context 會完整放行），不標 ⚠️
+        oversized = tool_tokens > TOOL_RESULT_TOKEN_THRESHOLD and not is_exempt_result(result, tool_tokens)
+        events.append({
+            "channel": "tool",
+            "text": result,
+            "tokens": tool_tokens,
+            "oversized": oversized,
+            "result_id": agent.last_result_id,      # 📄 存檔編號（規格載入時為 None）；卡片顯示並可開啟 /api/results/<id>
+            "result_file": agent.last_result_file,
+        })
+        if oversized:
+            events.append({"channel": "system", "text": (
+                oversized_notice(agent, tool_tokens, state["tool_summary_mode"])
+                + "（已標記待人工確認；🧠 卡片會顯示 AI 實際收到的內容）"
+            )})
+    else:
+        events.append({"channel": "system", "text": "✅ 無工具需要執行"})
 
-    回傳 True 代表目前正在等待使用者決策（awaiting_decision）。
+    # 硬水位的壓縮檢查統一在 ask_ai() 呼叫前（ensure_context_budget，UI 會收到 📦 事件），
+    # 軟水位在回合結束後（after_turn_compression，見 ConsoleHandler._finish_turn）。
+    # 舊版這裡壓縮後 continue，會跳過下面「把工具結果加入上下文」的步驟直接再問一次 AI，
+    # AI 拿不到剛執行的結果而重複下同一個指令；result 為 None 時也會多問一輪而不是結束回合。已移除。
+    if not result:
+        return "end"
+
+    if state["auto_mode"]:
+        content = _content_for_context(
+            result, tool_tokens, agent=agent, use_summary=state["tool_summary_mode"]
+        )
+        _emit_context_event(content, events, tool_tokens)
+        agent.messages.append({'role': 'user', 'content': tool_result_message(content, _current_tool_action())})
+        events.append({"channel": "system", "text": "♻️ Auto Continue 中..."})
+        return "continue"
+
+    # hybrid / manual 都需要暫停，等待使用者對這次工具結果做決策
+    pending["result"] = result
+    pending["mode"] = "hybrid" if state["hybrid_mode"] else "manual"
+    pending["tokens"] = tool_tokens
+    return "await"
+
+
+def run_turn(events):
+    """反覆執行 ask_ai -> run_tool，直到這一回合自然結束（沒有工具需要執行），或需要使用者決策為止：
+    hybrid／manual 模式對工具結果的決策，或 🛡️ 執行前關卡（會改變系統狀態的技能，執行前先問，任何模式都一樣）。
+
+    回傳 True 代表目前正在等待使用者決策（awaiting_decision；pending["mode"] 是 hybrid／manual／guard）。
     """
     for _ in range(MAX_AUTO_ITERATIONS):
         ai_msg = agent.ask_ai()
         ai_tokens = agent.last_ai_tokens(ai_msg)
         agent.total_ai_tokens += ai_tokens
+        if agent.auto_cleared:
+            events.append({"channel": "system", "text": (
+                f"🧹 上下文超過門檻，呼叫前先把 {agent.auto_cleared['results']} 則舊的工具回傳清成存檔編號"
+                f"（騰出約 {agent.auto_cleared['tokens']} tokens，原文仍在存檔、AI 可取回）。")})
         if agent.auto_compressed:
             events.append({"channel": "system", "text": "📦 上下文超過門檻，呼叫前已自動壓縮並歸檔。"})
         agent.messages.append({'role': 'assistant', 'content': ai_msg})
@@ -249,70 +311,41 @@ def run_turn(events):
             "action": action_text(parsed["action"]) if parsed["action"] else None,
         })
 
-        result = agent.run_tool(parsed)
-        tool_tokens = 0
-        if result:
-            tool_tokens = agent.count_tokens(result)
-            agent.total_tool_tokens += tool_tokens
-            # 規格文件載入不受門檻限制（_content_for_context 會完整放行），不標 ⚠️
-            oversized = tool_tokens > TOOL_RESULT_TOKEN_THRESHOLD and not is_exempt_result(result, tool_tokens)
-            events.append({
-                "channel": "tool",
-                "text": result,
-                "tokens": tool_tokens,
-                "oversized": oversized,
-                "result_id": agent.last_result_id,      # 📄 存檔編號（規格載入時為 None）；卡片顯示並可開啟 /api/results/<id>
-                "result_file": agent.last_result_file,
-            })
-            if oversized:
-                events.append({
-                    "channel": "system",
-                    "text": (
-                        f"⚠️ 此工具回傳約 {tool_tokens} tokens，超過門檻 "
-                        f"{TOOL_RESULT_TOKEN_THRESHOLD}，已標記待人工確認；"
-                        + ("加入上下文前將交由獨立 session 依目前任務擷取重點（🧠 卡片會顯示 AI 實際收到的內容）。"
-                           if state["tool_summary_mode"] else
-                           "AI 只會收到成功／失敗判定（/summarize on 可改為獨立 session 摘要）。")
-                    ),
-                })
-        else:
-            events.append({"channel": "system", "text": "✅ 無工具需要執行"})
+        # 🛡️ 執行前關卡：先暫停，等使用者按「同意執行／拒絕」（apply_decision 的 guard 分支）才繼續
+        guard = agent.guard_check(parsed)
+        if guard:
+            pending.update(mode="guard", parsed=parsed, guard=guard)
+            events.append({"channel": "guard", "text": agent.guard_prompt_text(guard),
+                           "skill": guard["skill"], "command": guard["command"]})
+            return True
 
-        # 硬水位的壓縮檢查統一在 ask_ai() 呼叫前（ensure_context_budget，UI 會收到 📦 事件），
-        # 軟水位在回合結束後（after_turn_compression，見 ConsoleHandler._finish_turn）。
-        # 舊版這裡壓縮後 continue，會跳過下面「把工具結果加入上下文」的步驟直接再問一次 AI，
-        # AI 拿不到剛執行的結果而重複下同一個指令；result 為 None 時也會多問一輪而不是結束回合。已移除。
-
-        if not result:
+        outcome = _handle_tool_result(agent.run_tool(parsed), events)
+        if outcome == "end":
             return False
-
-        if state["auto_mode"]:
-            content = _content_for_context(
-                result, tool_tokens, agent=agent, use_summary=state["tool_summary_mode"]
-            )
-            _emit_context_event(content, events, tool_tokens)
-            agent.messages.append({'role': 'user', 'content': tool_result_message(content, _current_tool_action())})
-            events.append({"channel": "system", "text": "♻️ Auto Continue 中..."})
-            continue
-
-        # hybrid / manual 都需要暫停，等待使用者對這次工具結果做決策
-        pending["result"] = result
-        pending["mode"] = "hybrid" if state["hybrid_mode"] else "manual"
-        pending["tokens"] = tool_tokens
-        return True
+        if outcome == "await":
+            return True
 
     events.append({"channel": "system", "text": "⚠️ 已達安全上限（連續執行過多輪工具），本回合自動中止。"})
     return False
 
 
 def apply_decision(action, events):
-    """套用使用者對待處理工具結果的決策，回傳是否要繼續本回合的迴圈。"""
-    result = pending["result"]
+    """套用使用者對待決策事項的決定。回傳 "continue"（接著跑 run_turn）／"await"（又在等下一個決策）／"stop"（回合結束）。
+    - guard（執行前關卡）：y＝以 approved=True 執行、之後照一般工具結果處理；其他＝拒絕，告訴 AI 沒有執行，回合結束等使用者說明。
+    - hybrid／manual：對已執行的工具結果決定要不要加入上下文。"""
     mode = pending["mode"]
-    tool_tokens = pending["tokens"] or 0
-    pending["result"] = None
-    pending["mode"] = None
-    pending["tokens"] = None
+    result, tool_tokens = pending["result"], pending["tokens"] or 0
+    parsed, guard = pending.get("parsed"), pending.get("guard")
+    clear_pending()
+
+    if mode == "guard":
+        if action == "y":
+            events.append({"channel": "system", "text": f"✅ 你已同意執行 {guard['skill']}。"})
+            outcome = _handle_tool_result(agent.run_tool(parsed, approved=True), events)
+            return "stop" if outcome == "end" else outcome
+        agent.messages.append({'role': 'user', 'content': tool_result_message(agent.guard_denied_text(guard), parsed["action"])})
+        events.append({"channel": "system", "text": f"🚫 已拒絕執行 {guard['skill']}，這個動作沒有執行；請告訴 AI 要怎麼調整。"})
+        return "stop"
 
     # 只有真的要把結果加入上下文時才計算 content——若是摘要模式，這會觸發
     # 一次獨立的 ollama 呼叫，使用者選擇「捨棄」時就不需要浪費這次呼叫。
@@ -325,7 +358,7 @@ def apply_decision(action, events):
             agent.messages.append({'role': 'user', 'content': tool_result_message(content, _current_tool_action())})
         else:
             _append_discarded_tool_result(agent)
-        return True  # hybrid 不論加入或捨棄，都會讓 AI 接續推論
+        return "continue"  # hybrid 不論加入或捨棄，都會讓 AI 接續推論
 
     # manual 模式
     if action == "y":
@@ -334,20 +367,21 @@ def apply_decision(action, events):
         )
         _emit_context_event(content, events, tool_tokens)
         agent.messages.append({'role': 'user', 'content': tool_result_message(content, _current_tool_action())})
-        return True
+        return "continue"
     if action == "stop":
-        return False
+        return "stop"
     _append_discarded_tool_result(agent)
-    return False
+    return "stop"
 
 
 def clear_plan_for_new_task(events):
-    """新任務送出時，把上一個已核准的計畫從 system prompt 清掉。
+    """新任務送出時，把上一個已核准的計畫從 system prompt 清掉（自己規劃的任務清單全部做完也清掉，見
+    SkillAgent.end_plan_for_new_task，與 CLI 共用）。
 
     計畫的生命週期 = 核准後那個任務的執行期間：期間所有工具決策（manual／hybrid 的 y/n）、
     auto 迴圈、自動壓縮都不會清掉它；使用者再打字送出一句新訊息（非 slash 指令、非計畫回應、
     非工具決策）就視為新任務。舊版要求手動 /plan done，實際上容易忘記，舊計畫會殘留在
     system prompt 干擾之後的每個任務。要提早清除仍可用 /plan done。"""
-    if agent.current_plan:
-        agent.current_plan = None
-        events.append({"channel": "system", "text": "🧹 上一個已核准的計畫已隨新任務自動清除（system prompt 不再要求依舊計畫執行）。"})
+    note = agent.end_plan_for_new_task()
+    if note:
+        events.append({"channel": "system", "text": note})

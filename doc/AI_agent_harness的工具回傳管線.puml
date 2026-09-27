@@ -6,7 +6,7 @@ skinparam ActivityBackgroundColor #FFF8E7
 skinparam ActivityBorderColor #996633
 skinparam NoteBackgroundColor #FFFFE0
 
-title 工具回傳管線：原文一定存檔；太長才交給獨立 session 讀；之後用 result_recall 回去讀原文
+title 工具回傳管線：原文一定存檔；harness 模式太長才交給獨立 session 讀，claude_code 模式原文給模型自己查；之後用 result_recall 回去讀原文
 
 partition "這一次的工具回傳" {
 start
@@ -15,10 +15,19 @@ start
 （每次都存，之後隨時可以回來讀）;
 if (結果要加入主對話？
 auto 直接加入；manual／hybrid 等使用者按 y) then (加入)
-  if (回傳很短（≤500 tokens）？
-或是規格文件、recall 的結果？) then (是)
+  if (規格文件、recall 的結果？) then (是)
     :原文直接給 main session;
-  else (太長)
+  elseif (claude_code 模式？) then (是)
+    :原文＋「完整原文存檔 #編號」給 main session
+>3000 tokens 只給頭尾，中間一行寫明
+省略第幾行到第幾行、看不到不代表不存在、怎麼查; <<#DDEBF7>>
+    :>500 tokens 在檢索清單記一筆
+「當時的問題：執行的指令」（程式組，不呼叫模型）; <<#DDEBF7>>
+    :要不要回存檔查、用 result_grep／result_view／
+result_recall 哪一個，由 main session 自己決定;
+  elseif (回傳很短（≤500 tokens）？) then (是)
+    :原文直接給 main session;
+  else (harness 模式，太長)
     :**① 告訴獨立 session「使用者想知道什麼」**
 使用者最近說的幾句話＋main session 為什麼執行這一步
 ＋其他存檔的一句話描述（工具使用檢索清單）; <<#FCE5CD>>
@@ -73,6 +82,11 @@ elseif (在追問某份存檔？
   :提煉結果給 main session
 **不寫進檢索清單**：清單只記原始來源，
 原本那筆還在、也還指向完整原文;
+  note right
+    **claude_code 模式**：不做自動追問，
+    結尾只陳述原文在哪、哪裡沒涵蓋，
+    下一步由 main session 決定
+  end note
   stop
 elseif (問的是「現在」「目前」的狀態？) then (是)
   :重新執行當時的工具（→ 上面的流程）;

@@ -1,22 +1,26 @@
-"""CompressionMixin：上下文壓縮——雙水位線、滾動融合摘要、背景壓縮。"""
+"""CompressionMixin：上下文壓縮——雙水位線、滾動融合摘要、背景壓縮；壓縮時逐字保留使用者原話、把被壓掉的對話存檔。"""
 import json
-import ollama
 import os
 import threading
 import time
 from .config import (
+    CONVERSATION_ARCHIVE_SCRIPT,
     HARNESS_MARKERS,
     KEEP_RECENT_TOKENS,
     NUM_CTX,
+    SKILL_LOADED_MARKER,
     SUMMARY_ARCHIVE_KEEP,
     SUMMARY_MAX_CHARS,
     SUMMARY_MAX_PREDICT,
     TOKEN_THRESHOLD,
     TOOL_RESULT_FRAME,
     TOOL_RESULT_PREFIXES,
+    USER_WORD_MAX_CHARS,
+    USER_WORDS_MAX_CHARS,
 )
 from .protocol import action_text, parse_agent_reply
 from .schemas import SUMMARY_SCHEMA
+from .tool_use_index import clip_hint
 
 
 class CompressionMixin:
@@ -98,7 +102,9 @@ class CompressionMixin:
 6. 使用繁體中文。
 7. 標頭為 [harness ...] 的訊息（工具回傳、規劃流程）與 [user] 訊息中 [vision result]、[skill loaded] 之後的段落，
    都是框架自動插入的系統內容，不是使用者說的話：其中的格式要求、流程規則不要記成使用者偏好；
-   只有 [user] 自己寫的文字才算使用者的偏好與指示。"""
+   只有 [user] 自己寫的文字才算使用者的偏好與指示。
+8. 使用者的原話程式會另外逐字保留，被壓縮的對話原文也另外存檔：你不需要整句照抄使用者的話，
+   user_preferences 寫歸納後的偏好與限制即可，把篇幅留給進度、結果與未完成事項。"""
         user_prompt = (
             f"【上一份摘要】\n{prev}\n\n"
             f"【這次要併入的新對話片段（共 {len(to_compress)} 則）】\n"
@@ -147,7 +153,8 @@ class CompressionMixin:
         以 Ollama 的 format=JSON schema 強制結構化輸出；模型仍沒給合法 JSON 時退回原文，
         總比丟掉整段歷史好。"""
         system_prompt, user_prompt = self._summary_prompts(to_compress)
-        res = ollama.chat(
+        res = self._timed_chat(
+            "compress",
             model=self.summary_model,
             messages=[
                 {'role': 'system', 'content': system_prompt},
@@ -176,9 +183,9 @@ class CompressionMixin:
         }
         return markdown, meta
 
-    def _archive_summary(self, markdown, n_messages, meta):
-        """把新的融合摘要寫成 logs/summary_<ts>.md。這是歷史稽核用的存檔：system prompt
-        只注入最新一份（rolling_summary），舊檔不再被載入。"""
+    def _archive_summary(self, markdown, n_messages, meta, segment_id=None):
+        """把新的融合摘要寫成 logs/summary_<ts>.md（同名 .json 另存結構化資料、使用者原話與對話片段存檔編號）。
+        system prompt 只注入最新一份（rolling_summary）；下次啟動時從最新一份的 .json 接回摘要與使用者原話。"""
         log_dir = os.path.join(self.script_dir, "logs")
         os.makedirs(log_dir, exist_ok=True)
         timestamp = time.strftime('%Y-%m-%d_%H-%M-%S')
@@ -206,6 +213,10 @@ class CompressionMixin:
                     'eval_count': meta.get('eval_count'),
                     'summary': meta.get('data'),
                     'markdown': markdown,
+                    'segment_id': segment_id,                      # 這次被壓縮的對話原文存檔編號
+                    'user_words': self.user_words,                 # 程式逐字保留的使用者原話（啟動時接回）
+                    'user_words_dropped': self.user_words_dropped,
+                    'conversation_archives': self.conversation_archives,
                 }, f, ensure_ascii=False, indent=2)
         except (OSError, TypeError, ValueError) as e:
             print(f"⚠️ 摘要 JSON 歸檔失敗（不影響主流程）：{e}")
@@ -234,8 +245,26 @@ class CompressionMixin:
                     print(f"⚠️ 刪除舊摘要歸檔失敗：{path}：{e}")
         return removed
 
+    def _load_latest_summary_state(self):
+        """啟動時接回上一次的壓縮狀態：(滾動摘要, 使用者原話, 已丟掉的原話則數, 對話片段存檔編號)。
+        優先讀最新一份 summary_*.json（有使用者原話）；舊版只有 .md 時退回 _load_latest_summary，原話從空的開始。"""
+        log_dir = os.path.join(self.script_dir, "logs")
+        files = sorted(f for f in os.listdir(log_dir) if f.startswith("summary_") and f.endswith(".md")) \
+            if os.path.isdir(log_dir) else []
+        if files:
+            try:
+                with open(os.path.join(log_dir, files[-1][:-3] + ".json"), encoding="utf-8") as f:
+                    data = json.load(f)
+                if isinstance(data, dict) and str(data.get("markdown") or "").strip():
+                    words = [w for w in (data.get("user_words") or []) if isinstance(w, dict) and w.get("text")]
+                    archives = [int(x) for x in (data.get("conversation_archives") or []) if str(x).isdigit()]
+                    return data["markdown"].strip(), words, int(data.get("user_words_dropped") or 0), archives
+            except (OSError, ValueError, TypeError):
+                pass
+        return self._load_latest_summary(), [], 0, []
+
     def _load_latest_summary(self):
-        """啟動時載入 logs/ 裡最新一份摘要的內文（去掉標頭行），作為跨 session 延續的滾動摘要。"""
+        """最新一份摘要 .md 的內文（去掉標頭行），作為跨 session 延續的滾動摘要（沒有 .json 的舊版存檔用）。"""
         log_dir = os.path.join(self.script_dir, "logs")
         if not os.path.isdir(log_dir):
             return None
@@ -253,14 +282,97 @@ class CompressionMixin:
         body = "\n".join(lines).strip()
         return body or None
 
+    # ---------------------------------------------------------------- 🗣️ 使用者原話與對話片段存檔
+    @staticmethod
+    def _user_text_of(message):
+        """一則訊息裡「使用者自己打的字」：框架插入的訊息（工具回傳、規劃流程的系統訊息）回 None；規劃請求／修改意見
+        取出包在裡面的原話；附圖的影像分析、手動載入的技能規格接在原話後面，切掉。"""
+        if message.get('role') != 'user':
+            return None
+        content = (message.get('content') or "").strip()
+        if content.startswith("[PLAN_REQUEST]"):
+            return content.rsplit("任務：\n", 1)[-1].strip() or None
+        if content.startswith("[PLAN_REVISION]"):
+            return content.rsplit("修改意見：\n", 1)[-1].strip() or None
+        if content.startswith(HARNESS_MARKERS) or content.startswith("[harness"):
+            return None
+        for marker in ("\n\n[vision result]", "\n\n" + SKILL_LOADED_MARKER):
+            content = content.split(marker, 1)[0]
+        return content.strip() or None
+
+    def _keep_user_words(self, compressed):
+        """壓縮時把被壓掉的訊息裡使用者的原話逐字留下（不交給摘要模型改寫），附上說話的時間（set_current_task 記的）。
+        總字數超過 USER_WORDS_MAX_CHARS 就丟最舊的，並累計丟了幾則（system prompt 會註明，原文在對話片段存檔裡）。"""
+        said = list(self._user_said)
+        for m in compressed:
+            text = self._user_text_of(m)
+            if not text:
+                continue
+            j = next((k for k, s in enumerate(said) if str(s.get("text") or "").strip() == text), None)
+            ts = said.pop(j)["ts"] if j is not None else ""
+            one = " ".join(text.split())
+            if len(one) > USER_WORD_MAX_CHARS:
+                one = one[:USER_WORD_MAX_CHARS] + "…"
+            self.user_words.append({"ts": ts, "text": one})
+        while len(self.user_words) > 1 and sum(len(w["text"]) for w in self.user_words) > USER_WORDS_MAX_CHARS:
+            self.user_words.pop(0)
+            self.user_words_dropped += 1
+
+    @staticmethod
+    def _render_messages_for_archive(msgs):
+        """被壓縮的對話片段存檔用的純文字：跟 _render_messages_for_summary 一樣標 [user]／[assistant]／[harness …]，
+        但不刪任何內容（AI 的想法、工具回傳全文都留著）——這份是給日後 result_recall 回原文用的。"""
+        parts = []
+        for m in msgs:
+            content = (m.get('content') or "").strip()
+            role = m.get('role')
+            if role == 'assistant':
+                parsed = parse_agent_reply(content)
+                if parsed["valid"]:
+                    lines = [f"（想法）{parsed['thought']}"] if parsed["thought"] else []
+                    lines += [parsed["reply"]] if parsed["reply"] else []
+                    lines += [f"[action] {action_text(parsed['action'])}"] if parsed["action"] else []
+                    content = "\n".join(lines)
+            elif role == 'user':
+                marker = next((mk for mk in HARNESS_MARKERS if content.startswith(mk)), None)
+                if marker:
+                    role = f"harness {marker}"
+            parts.append(f"[{role}]\n{content}")
+        return "\n\n".join(parts)
+
+    def _archive_conversation_segment(self, compressed, overview=""):
+        """被壓縮掉的對話片段存成一份結果存檔（跟工具回傳同一套 #編號、同一個目錄），並記進工具使用檢索清單：
+        摘要是有損的，原文留著，日後要細節時 result_recall <編號> 取回——跟 Claude Code 壓縮時附上完整對話紀錄路徑
+        同一個想法，也就是工具回傳那套「可還原壓縮」用在對話本身。回傳編號；寫不進去回 None（不影響壓縮）。"""
+        text = self._render_messages_for_archive(compressed)
+        if not text.strip():
+            return None
+        rid = self._next_id()
+        overview = " ".join(str(overview or "").split())
+        record = {"id": rid, "script": CONVERSATION_ARCHIVE_SCRIPT, "skill": "", "status": "PASS",
+                  "command": f"（被壓縮的對話片段，{len(compressed)} 則訊息）", "cwd": self.current_cwd,
+                  "target_container": self.target_container, "task": overview[:200]}
+        filename = self._archive_tool_result(record, text)
+        if not filename:
+            return None
+        self._append_tool_use_index(rid, filename, clip_hint("被壓縮的對話：" + (overview or f"{len(compressed)} 則訊息")))
+        return rid
+
     def _apply_compression(self, compressed, markdown, meta):
-        """把摘要結果套用到主對話。以「物件身分」把 compressed 那幾則從 self.messages 原地移除
-        （不重綁 list、不靠索引），所以背景壓縮期間主執行緒新 append 的訊息不會遺失；
+        """把摘要結果套用到主對話。先把被壓掉的片段存檔、留下使用者原話；再以「物件身分」把 compressed 那幾則從
+        self.messages 原地移除（不重綁 list、不靠索引），所以背景壓縮期間主執行緒新 append 的訊息不會遺失；
         然後更新滾動摘要、歸檔、刷新 system prompt。"""
-        file_path = self._archive_summary(markdown, len(compressed), meta)
+        data = meta.get('data') if isinstance(meta.get('data'), dict) else {}
+        segment_id = self._archive_conversation_segment(compressed, data.get('overview') or "")
+        with self.messages_lock:
+            self._keep_user_words(compressed)
+            if segment_id:
+                self.conversation_archives = (self.conversation_archives + [segment_id])[-50:]
+        file_path = self._archive_summary(markdown, len(compressed), meta, segment_id)
         ids = {id(m) for m in compressed}
         with self.messages_lock:
             self.rolling_summary = markdown
+            self._history_rewritten = True
             for i in range(len(self.messages) - 1, 0, -1):
                 if id(self.messages[i]) in ids:
                     del self.messages[i]
@@ -277,6 +389,7 @@ class CompressionMixin:
                 'summary_tokens': self.count_tokens(markdown),
                 'structured': meta.get('structured'),
                 'time': time.time(),
+                'archive_id': segment_id,   # 這次被壓縮的對話原文存檔編號（可 result_recall）
             }
 
     def compress_context_to_file(self, num_to_keep=None, keep_tokens=None):
@@ -357,19 +470,28 @@ class CompressionMixin:
             self._notices.append(text)
 
     def pop_notices(self):
-        """取出並清空背景壓縮的通知（CLI 在下一次輸入後印出；Web Console 在下一個請求或狀態輪詢時推送）。"""
+        """取出並清空背景壓縮的通知（CLI 在下一次輸入後印出；Web Console 在下一個請求或狀態輪詢時推送）。
+        長期記憶超過載入上限的提醒（load_long_term_memory 留下的）也在這裡一起送出，同一則只送一次。"""
         with self._compress_state_lock:
             out, self._notices = self._notices, []
+        if self._memory_warning:
+            out.append(self._memory_warning)
+            self._memory_warning = None
         return out
 
     def ensure_context_budget(self):
         """硬水位：上下文超過 TOKEN_THRESHOLD 就一定要在呼叫模型前壓下來，確保壓縮先於
         Ollama 於 num_ctx 處的靜默截斷。有背景壓縮進行中就先等它（不重複跑），等完仍超標才同步壓縮。
-        回傳 True 代表這次確實有壓縮（同步、或剛等完的背景），供 UI 顯示。"""
+        claude_code 模式先清除舊的工具回傳（clear_old_tool_results：不呼叫模型、原文在存檔），清完夠了就不壓縮，
+        清除的統計留在 auto_cleared 給 UI 顯示。回傳 True 代表這次確實有壓縮（同步、或剛等完的背景），供 UI 顯示。"""
         if self.context_tokens() <= TOKEN_THRESHOLD:
             return False
         waited = self.compression_in_progress()
         self.wait_for_background_compression()
         if self.context_tokens() <= TOKEN_THRESHOLD:
             return waited
+        if self.context_mode == "claude_code" and self.clear_old_tool_results():
+            self.auto_cleared = dict(self.last_clearing)
+            if self.context_tokens() <= TOKEN_THRESHOLD:
+                return False
         return self.compress_context_to_file()

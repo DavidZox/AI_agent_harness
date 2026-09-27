@@ -29,12 +29,24 @@ class ToolUseIndexMixin:
         這份檔案只有觸發過任務導向擷取（summarize_tool_result／_result_recall）的回傳才有一筆，不是每次工具
         呼叫都有；檔案本身不裁剪、跨 session（甚至跨這支程式的重新啟動）持續累加，這裡只裁「顯示視窗」——
         目的是讓再久以前的工具回傳，只要現在的問題看起來有關，都有機會被發現，而不必模型自己記得存檔編號。
-        跟 _build_plan_context_prompt／_build_objective_prompt 同一種模式：每次組 system prompt 都重新讀檔案、
-        重新塞入，不會被滑動視窗或壓縮摘要沖掉。TOOL_USE_INDEX_SHOW<=0 時關閉（環境變數可調／可關）。"""
+        每次組 system prompt 都重新讀檔案、重新塞入，不會被滑動視窗或壓縮摘要沖掉；只在多一筆時才變，KV cache 大多命中
+        （最新一筆另外在動態區提示一次，見 tool_use_index_pointer）。說明文字依上下文模式不同：harness 模式照獨立 session 的
+        判斷下指令，claude_code 模式只列線索、怎麼取回由模型決定。TOOL_USE_INDEX_SHOW<=0 時關閉（環境變數可調／可關）。"""
         rows = self._tool_use_index_rows()
         if not rows:
             return ""
         rows_text = "\n".join(f"- #{rid}（{ts}）：{hint}" for rid, ts, hint in rows)
+        if getattr(self, "context_mode", "harness") == "claude_code":
+            # claude_code 模式：清單只是線索（程式寫的「當時的問題＋指令」），怎麼取回、要不要取回由模型決定
+            return f"""
+            ## 工具使用檢索清單（Tool Use Index）
+            以下每筆是過去某次工具回傳的存檔（可能是很早之前、甚至上次啟動的）：當時使用者的問題與執行的指令，最上面最新；原文不在這裡：
+            {rows_text}
+
+            需要舊資料時由你決定怎麼取回：看某一段用 result_view <編號>、找某個字串用 result_grep <編號> "<關鍵字>"、
+            要依問題整理一大份內容用 result_recall <編號> "<問題>"（交給獨立 session，只回重點）。
+            問的是「現在」「目前」的狀態 → 重新執行工具；跟清單都無關 → 當作新問題。
+            """
         return f"""
             ## 工具使用檢索清單（Tool Use Index）
             以下每筆是過去某次工具回傳的存檔（可能是很早之前、甚至上次啟動的）跟當時問題的關聯描述，最上面最新；只是線索，原文不在這裡：
@@ -51,6 +63,16 @@ class ToolUseIndexMixin:
             4. 都不像 → 當作新問題，不要牽強附會，也不要反問使用者「你指的是哪一筆」
             result_recall 回報「找不到結果」＝原始檔已超過保留上限被清掉：誠實告訴使用者這筆資料已經不在，不要用猜的。
             """
+
+    def tool_use_index_pointer(self):
+        """送出內容最尾端（動態區）的一行：檢索清單最新一筆。完整清單留在 system prompt（一千多 tokens、很少變，放那裡
+        KV cache 才划算）；但對話一長，system prompt 的尾端就落在整段上下文的中間，模型容易忽略，這一行把它拉回眼前。"""
+        rows = self._tool_use_index_rows()
+        if not rows:
+            return ""
+        rid, ts, hint = rows[0]
+        return (f"工具使用檢索清單（完整的在 system prompt 尾端，共 {len(rows)} 筆）最新一筆：#{rid}（{ts}）：{hint}。"
+                f"使用者這句話若在接續清單裡的某一筆，照清單的規則取回原文再回答。")
 
     def _tool_use_index_rows(self, exclude=()):
         """tools_use_index.md 最近 TOOL_USE_INDEX_SHOW 筆（新→舊）→ [(編號, 時間, 描述)]，同一編號只留最新一筆。

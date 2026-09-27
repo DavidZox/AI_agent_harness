@@ -21,12 +21,16 @@ rectangle NodeUser #F5F5F5 [
 rectangle NodeAgent #D1E5F0 [
   **SkillAgent（agent_core/，唯一核心）**
   ----
-  * 每輪重組 system prompt（尾端附工具使用檢索清單）
-  * 呼叫主 session，**只看 action** 派發
+  * system prompt 只放不常變的（尾端附工具使用檢索清單）；
+    工作目錄、目標容器、任務清單每次接在最後一則訊息後（動態區）
+  * 呼叫主 session，**只看 action** 派發；
+    會改變實體狀態的動作先由程式請使用者確認
   * 執行腳本 → 記軌跡 → 原文存檔 #編號
-  * 決定工具回傳怎麼進主對話（原文／摘要／成功失敗）
-  * 替模型維護狀態：工作目錄、目標容器、任務線、計畫
-  * 上下文超過水位就壓成滾動摘要
+  * 依上下文模式決定工具回傳怎麼進主對話：
+    harness＝獨立 session 擷取重點；claude_code＝原文（太大保留頭尾）
+  * 替模型維護狀態：工作目錄、目標容器、任務線、任務清單
+  * 上下文超過水位就壓成滾動摘要（使用者原話逐字保留、
+    被壓掉的對話存檔）
 ]
 
 rectangle NodeLLM #FFE6CC [
@@ -34,13 +38,14 @@ rectangle NodeLLM #FFE6CC [
   ----
   每輪固定回 JSON {thought, reply, action}
   action 只能是：技能名稱、規格標明的腳本路徑、
-  或 result_recall；reply 裡的文字不會被執行
+  result_recall 或 plan_task；reply 裡的文字不會被執行
 ]
 
 rectangle NodeSub #FCE5CD [
   **一次性獨立 session（不碰主對話、做完即丟）**
   ----
   * 工具摘要 summarize_tool_result：>500 tokens 的回傳
+    （只在 harness 模式）
   * 回原文提煉 result_recall：main session 主動選
     （兩者共用 _extract_task_oriented：回答／事實／未涵蓋／
      延伸方向／index_hint／related_records ＋下一步建議）
@@ -73,8 +78,10 @@ rectangle NodeStore #E1D5E7 [
     （編號跨 session 唯一；留最近 200 檔／50 MB）＋ index.md
   * tool_results/tools_use_index.md：大量回傳的一句話關聯描述
     （「#編號｜使用者想知道什麼：原文有什麼」，永久累加）
-  * trajectory.jsonl（操作軌跡）、summary_*.md（滾動摘要歸檔）
-  * Memory.md（全域常駐）、skills_system/memory/<name>.md（綁技能）
+  * 被壓縮的對話片段也存成 #編號（conversation_segment）
+  * trajectory.jsonl（操作軌跡）、summary_*.md／.json（滾動摘要＋
+    使用者原話）、perf.jsonl（每次模型呼叫的耗時）
+  * Memory.md（整份常駐）、skills_system/memory/<name>.md（綁技能）
 ]
 
 NodeUser -down-> NodeAgent : 任務／slash／附圖
@@ -88,8 +95,8 @@ NodeAgent -[#CC6600,bold]down-> NodeSkills : 腳本路徑 → subprocess
 NodeSkills -down-> NodeWorld : docker exec／HTTP／檔案操作
 NodeWorld -up-> NodeSkills : 原始輸出
 NodeSkills -[#009933,bold]up-> NodeAgent : [PASS]／[ERROR] 完整輸出\n+ [CWD_CHANGED]／[TARGET_CONTAINER]
-NodeAgent -left-> NodeStore : 存檔原文、檢索描述、軌跡、摘要歸檔
-NodeStore -right-> NodeAgent : 檢索清單、最新摘要、常駐記憶；\nrecall 讀回原文
+NodeAgent -left-> NodeStore : 存檔原文、檢索描述、軌跡、\n摘要歸檔、耗時
+NodeStore -right-> NodeAgent : 檢索清單、最新摘要與使用者原話、\n常駐記憶；recall 讀回原文
 NodeLLM -[hidden]down-> NodeSub
 
 note right of NodeLLM
@@ -102,9 +109,11 @@ end note
 
 note bottom of NodeWorld
   **安全邊界：**模型不產生程式碼，
-  能做的只有既有腳本；Plan 模式的
-  核准關卡靠「規劃階段不呼叫
-  run_tool」保證。
+  能做的只有既有腳本；派工單、取消任務、
+  建容器、容器內非唯讀指令執行前一律
+  由程式請使用者確認（run_tool 沒有
+  approved 就不執行）；Plan 模式的核准
+  關卡靠「規劃階段不呼叫 run_tool」保證。
 end note
 
 @enduml

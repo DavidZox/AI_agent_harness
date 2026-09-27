@@ -38,12 +38,19 @@ class TrajectoryMixin:
             mapping.setdefault(s, skill)
         return mapping
 
+    def _next_id(self):
+        """配一個新的全域編號（軌跡、工具結果存檔、被壓縮的對話片段存檔共用同一個序列，跨 session 不重複）。
+        背景壓縮執行緒也會配編號（對話片段存檔），所以要上鎖。"""
+        with self._id_lock:
+            self.trajectory_seq += 1
+            return self.trajectory_seq
+
     def _record_trajectory(self, script_name, args, output_text, cwd, container_cwd, target_container=""):
-        """run_tool 每執行一支腳本（成功、失敗、逾時都算；找不到腳本的猜測不算）記一筆。"""
+        """run_tool 每執行一支腳本（成功、失敗、逾時都算；找不到腳本的猜測不算）記一筆。
+        記完交給任務清單（todo_auto_tick）：harness 模式下，步驟裡寫的技能執行成功就自動打勾。"""
         status = "ERROR" if output_text.lstrip().startswith("[ERROR]") else "PASS"
-        self.trajectory_seq += 1
         record = {
-            "id": self.trajectory_seq,
+            "id": self._next_id(),
             "kind": "exec",
             "ts": time.strftime("%m-%d %H:%M:%S"),
             "script": script_name,
@@ -63,6 +70,7 @@ class TrajectoryMixin:
         self.last_result_file = record["result_file"]
         self.trajectory.append(record)
         self._append_trajectory_log(record)
+        self.todo_auto_tick(record)
         return record
 
     def add_trajectory_boundary(self, reason, **extra):
@@ -71,8 +79,7 @@ class TrajectoryMixin:
             return None  # 什麼都還沒執行（例如啟動時的 reset_conversation），不需要起點
         if self.trajectory[-1]["kind"] == "boundary" and not extra:
             return None  # 連續的一般起點只留一個；帶資料的起點（計畫核准、make_skill）一律記
-        self.trajectory_seq += 1
-        record = {"id": self.trajectory_seq, "kind": "boundary", "ts": time.strftime("%m-%d %H:%M:%S"),
+        record = {"id": self._next_id(), "kind": "boundary", "ts": time.strftime("%m-%d %H:%M:%S"),
                   "reason": reason, **extra}
         self.trajectory.append(record)
         self._append_trajectory_log(record)

@@ -1,4 +1,6 @@
-"""ConversationMixin：對話與主模型呼叫——set_current_task（任務線）、/clear、ask_ai（含空白回覆重試）。"""
+"""ConversationMixin：對話與主模型呼叫——set_current_task（任務線）、/clear、ask_ai（動態區、空白回覆重試）。"""
+import hashlib
+import time
 import ollama
 from .config import NUM_CTX, TASK_HISTORY_KEEP
 from .protocol import action_text, parse_agent_reply
@@ -8,15 +10,19 @@ from .schemas import AGENT_REPLY_SCHEMA
 class ConversationMixin:
 
     def set_current_task(self, text):
-        """使用者送出新任務（或回答追問）時呼叫：current_task 是最新一句，task_history 保留最近幾句當任務線。"""
+        """使用者送出新任務（或回答追問）時呼叫：current_task 是最新一句、task_history 保留最近幾句當任務線；
+        另外記下說話的時間（_user_said），壓縮時逐字保留使用者原話（_keep_user_words）要用。"""
         self.current_task = text
         if text:
             self.task_history = (self.task_history + [text])[-TASK_HISTORY_KEEP:]
+            self._user_said.append({"ts": time.strftime("%m-%d %H:%M"), "text": text})
+            del self._user_said[:-200]
 
     def reset_conversation(self):
         self.current_plan = None  # /clear 時一併清掉進行中的計畫，避免舊計畫殘留誤導新任務
         self.current_task = None  # 同上，避免舊任務敘述殘留誤導下一次的摘要 session
         self.task_history = []
+        self.clear_todo()         # 任務清單跟計畫同一種生命週期
         self.add_trajectory_boundary("clear")  # 軌跡本身保留（/trajectory 仍看得到），只記一個起點
         # 原地替換而不重綁 list：背景壓縮執行緒若正在對舊 list 做原地刪除，不會操作到已被丟棄的物件
         with self.messages_lock:
@@ -30,6 +36,19 @@ class ConversationMixin:
             with self.messages_lock:
                 self.messages[:] = [self.messages[0]] + self.messages[-self.max_history:]
 
+    def _with_state_tail(self, snapshot):
+        """送出快照的最後一則訊息後面接上動態區（build_state_tail：目前狀態、Objective、任務清單、檢索清單最新一筆）。
+        只改這次送出的副本，不寫進 self.messages：下一輪動態區換新的，歷史本身一個字都沒變，Ollama 的 KV cache
+        從 system prompt 一路命中到上一則訊息。跟 Claude Code 把 <system-reminder> 接在最新訊息後面同一種做法；
+        接在同一則訊息裡（不另開一則 user 訊息），小模型才不會把狀態當成要回應的對象。"""
+        tail = self.build_state_tail()
+        self.last_tail_chars = len(tail) + 2
+        if snapshot and snapshot[-1]['role'] == 'user':
+            snapshot[-1] = {**snapshot[-1], 'content': snapshot[-1]['content'] + "\n\n" + tail}
+        else:
+            snapshot.append({'role': 'user', 'content': tail})
+        return snapshot
+
     def ask_ai(self):
         try:
             with self.messages_lock:
@@ -40,13 +59,14 @@ class ConversationMixin:
 
             # 硬水位：呼叫模型前的最後一道檢查（唯一的硬水位檢查點）。使用者貼了一大段文字或工具
             # 回傳剛加入之後就直接送模型，這裡確保壓縮一定發生在 Ollama 於 num_ctx 處靜默截斷之前。
-            # 軟水位（回合結束後順手壓縮）在 after_turn_compression。
+            # 軟水位（回合結束後順手壓縮）在 after_turn_compression。claude_code 模式會先清除舊的工具回傳（auto_cleared）。
+            self.auto_cleared = None
             self.auto_compressed = self.ensure_context_budget()
 
             # 送出的是快照：背景壓縮執行緒可能在這次呼叫期間原地修改 self.messages，
-            # 校準（_record_usage）也必須以真正送出的這份為準。
+            # 校準（_record_usage）也必須以真正送出的這份為準。動態區只接在快照上。
             with self.messages_lock:
-                snapshot = list(self.messages)
+                snapshot = self._with_state_tail(list(self.messages))
 
             self.last_reply_retry = None
             raw_content, eval_tokens = self._chat_once(snapshot)
@@ -85,14 +105,28 @@ class ConversationMixin:
         關閉 Ollama 的獨立 thinking 模式：此版本 Ollama 會把推理過程放進 message.thinking 欄位，若不關閉，
         模型有時會把整個決策都留在 thinking 裡，導致 content 回傳空字串。
         num_ctx：若不指定，Ollama 會用內建預設值（4096）而非模型實際支援的上限，對話還沒到我們的門檻
-        Ollama 就已經在背後截斷最舊的內容；這裡統一用 NUM_CTX（各水位與它同一尺度）。"""
+        Ollama 就已經在背後截斷最舊的內容；這裡統一用 NUM_CTX（各水位與它同一尺度）。
+        每次呼叫記一筆 perf.jsonl（_perf_record）：system prompt 跟上一次比有沒有變、歷史有沒有被清除或壓縮改寫、
+        中間跑了幾次獨立 session——這三件事決定 KV cache 能命中多少，prompt_ms 會反映出來。"""
+        t0 = time.time()
         response = ollama.chat(
             model=self.model,
             messages=snapshot,
-            format=AGENT_REPLY_SCHEMA,  # 回覆協議：{thought, reply, action}，見檔尾 AGENT_REPLY_SCHEMA 說明
+            format=AGENT_REPLY_SCHEMA,  # 回覆協議：{thought, reply, action}，見 schemas.AGENT_REPLY_SCHEMA
             options={'temperature': 0.2, 'num_ctx': NUM_CTX},
             think=False
         )
+        sys_text = snapshot[0]['content'] if snapshot and snapshot[0]['role'] == 'system' else ""
+        sys_hash = hashlib.sha1(sys_text.encode("utf-8")).hexdigest()[:12]
+        self._perf_record(
+            "main", response, self.model, wall_ms=round((time.time() - t0) * 1000, 1),
+            system_changed=None if self._last_main_sys_hash is None else sys_hash != self._last_main_sys_hash,
+            history_rewritten=self._history_rewritten, side_calls_before=self._side_calls_since_main,
+            tail_chars=self.last_tail_chars, messages=len(snapshot),
+        )
+        self._last_main_sys_hash = sys_hash
+        self._history_rewritten = False
+        self._side_calls_since_main = 0
         self._record_usage(response, snapshot)
         raw_content = response['message']['content'].strip()
         if "<thought>" in raw_content:
