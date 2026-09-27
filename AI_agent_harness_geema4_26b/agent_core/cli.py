@@ -86,7 +86,7 @@ def _run_make_skill_flow(agent, arg_text):
 
 def main():
     agent = SkillAgent(
-        model="gemma4:e4b",
+        model="gemma4:26b",
         max_history=None,  # 則數視窗停用，統一以 token 門檻壓縮
     )
     agent.reset_conversation()

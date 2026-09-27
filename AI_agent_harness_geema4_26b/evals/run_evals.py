@@ -128,7 +128,7 @@ def main():
     ap.add_argument("--modes", default="harness,claude_code")
     ap.add_argument("--runs", type=int, default=1)
     ap.add_argument("--only", default="", help="只跑這些情境（逗號分隔）")
-    ap.add_argument("--model", default=os.environ.get("EVAL_MODEL", "gemma4:e4b"))
+    ap.add_argument("--model", default=os.environ.get("EVAL_MODEL", "gemma4:26b"))
     ap.add_argument("--fake", action="store_true", help="假模型，只驗證評測流程")
     ap.add_argument("--timeout", type=int, default=900, help="單一情境的逾時秒數")
     ap.add_argument("--keep", action="store_true", help="保留每一次的臨時專案副本（除錯用）")

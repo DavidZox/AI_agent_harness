@@ -1,6 +1,6 @@
 # AI_agent_harness
 
-以本地 Ollama 模型（預設 `gemma4:e4b`）為核心的機器人維運助理，提供 CLI 與 Web 兩種介面。核心想法是**模型不寫程式、只挑技能**：可用的能力拆成一份輕量索引，加上一批規格文件與既有腳本；模型需要時才載入某個技能的規格，再依規格標明的腳本路徑執行。操作對象包含宿主機檔案系統、Docker 容器與容器內的 ROS2，以及 fih_rmf_system 的任務調度 web_console。決策模型刻意只用本地模型（離線的工廠環境）。
+以本地 Ollama 模型（這份副本預設 `gemma4:26b`；原專案 `AI_agent_harness/` 預設 `gemma4:e4b`）為核心的機器人維運助理，提供 CLI 與 Web 兩種介面。核心想法是**模型不寫程式、只挑技能**：可用的能力拆成一份輕量索引，加上一批規格文件與既有腳本；模型需要時才載入某個技能的規格，再依規格標明的腳本路徑執行。操作對象包含宿主機檔案系統、Docker 容器與容器內的 ROS2，以及 fih_rmf_system 的任務調度 web_console。決策模型刻意只用本地模型（離線的工廠環境）。
 
 ## 目前狀態（2026-09）
 
@@ -29,7 +29,7 @@
 
 ## 快速開始
 
-**需要**：已在執行的 [Ollama](https://ollama.com/)（先 `ollama pull gemma4:e4b`）、Python 3.10+ 與 `pip install ollama`。附圖功能需要 `Pillow`；容器與 ROS2 技能需要宿主機的 `docker` CLI；調度系統技能需要 fih_rmf_system 的 web_console（:8020），離線時可用 `skills_system/scripts/mock_server.py` 代替。
+**需要**：已在執行的 [Ollama](https://ollama.com/)（先 `ollama pull gemma4:26b`）、Python 3.10+ 與 `pip install ollama`。附圖功能需要 `Pillow`；容器與 ROS2 技能需要宿主機的 `docker` CLI；調度系統技能需要 fih_rmf_system 的 web_console（:8020），離線時可用 `skills_system/scripts/mock_server.py` 代替。
 
 ```bash
 python3 web_console.py      # Web：http://127.0.0.1:8765（只綁本機）
@@ -55,14 +55,14 @@ Web 左欄是對話，右欄是系統與工具回傳：每次工具回傳有兩�
 
 | 常用設定（環境變數） | 預設 | 說明 |
 |---|---|---|
-| `WEB_CONSOLE_MODEL` | `gemma4:e4b` | Web 用的主模型（CLI 寫在 `main()`） |
+| `WEB_CONSOLE_MODEL` | `gemma4:26b` | Web 用的主模型（CLI 寫在 `main()`） |
 | `WEB_CONSOLE_HOST`／`WEB_CONSOLE_PORT` | `127.0.0.1`／`8765` | Web 綁定位址 |
 | `AGENT_NUM_CTX` | `32768` | context 上限；記憶體小的設備可調低 |
 | `AGENT_CONTEXT_MODE` | `harness` | 啟動時的上下文模式（`harness`／`claude_code`） |
 | `AGENT_GUARDED_SKILLS` | 派工單、取消、刪逾時任務、建容器、容器內指令 | 執行前要確認的技能（逗號分隔） |
 | `AGENT_SUMMARY_MODEL` | 同主模型 | 獨立 session 用的模型 |
 | `RMF_WEB_CONSOLE_URL` | `http://localhost:8020` | 調度系統的位址 |
-| `VISION_MODEL` | `gemma4:e4b` | 附圖分析用的模型 |
+| `VISION_MODEL` | `gemma4:26b` | 附圖分析用的模型 |
 
 其他門檻與保留上限見〈[架構說明 §10](doc/架構說明.md#10-常數與環境變數)〉。
 

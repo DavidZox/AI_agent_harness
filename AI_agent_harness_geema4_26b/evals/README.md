@@ -13,7 +13,7 @@ python3 evals/perf_report.py evals/results/<時間>/runs.jsonl   # 這次評測�
 python3 evals/perf_report.py                # 平常使用 CLI／Web 累積的 logs/perf.jsonl
 ```
 
-需要本機 Ollama 與 `gemma4:e4b`（`--model` 可換）。評測期間不要同時開 CLI／Web：同一個模型只有一個 slot，會互相排隊、也會互相洗掉 KV cache，時間數字就不準了。
+需要本機 Ollama 與 `gemma4:26b`（`--model` 可換）。評測期間不要同時開 CLI／Web：同一個模型只有一個 slot，會互相排隊、也會互相洗掉 KV cache，時間數字就不準了。
 
 結果在 `evals/results/<時間>/`（已在 `.gitignore`）：
 

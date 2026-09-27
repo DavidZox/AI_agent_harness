@@ -32,7 +32,7 @@ from .trajectory import TrajectoryMixin
 class SkillAgent(ConversationMixin, PromptMixin, DispatchMixin, GuardMixin, ContextModeMixin, PlanMixin,
                  ToolSummaryMixin, ToolUseIndexMixin, ArchiveMixin, TrajectoryMixin, CompressionMixin,
                  MakeSkillMixin, PerfMixin):
-    def __init__(self, model="gemma4:e4b", max_history=None, summary_model=None):
+    def __init__(self, model="gemma4:26b", max_history=None, summary_model=None):
         # max_history：訊息「則數」滑動視窗，預設停用（None）。上下文大小統一以 token 門檻
         # （TOKEN_THRESHOLD）觸發壓縮歸檔；這個參數只保留作為極端情境的保險絲，需要時再開。
         # summary_model：壓縮摘要與工具摘要這兩種獨立 session 用的模型，預設與主模型相同；

@@ -1,7 +1,7 @@
 """跑一個評測情境（run_evals.py 在臨時的專案副本裡呼叫它；不要直接在正式專案目錄執行）。
 
     python3 evals/worker.py <情境 id> <輸出 json>
-環境變數：AGENT_CONTEXT_MODE（harness／claude_code）、EVAL_MODEL（預設 gemma4:e4b）、EVAL_FAKE=1（假模型，只測流程）。
+環境變數：AGENT_CONTEXT_MODE（harness／claude_code）、EVAL_MODEL（預設 gemma4:26b）、EVAL_FAKE=1（假模型，只測流程）。
 
 流程比照 CLI 的 auto 模式（工具結果自動加入上下文、連續執行到模型不再下 action），差別只有：外部工具換成
 scenarios 的假資料、執行前關卡依情境自動回答、每一句使用者訊息最多 MAX_STEPS 次模型回覆。"""
@@ -110,7 +110,7 @@ def main():
     from agent_core.protocol import action_text, tool_result_message
     from agent_core.turn import _content_for_context, after_turn_compression
 
-    agent = SkillAgent(model=os.environ.get("EVAL_MODEL", "gemma4:e4b"))
+    agent = SkillAgent(model=os.environ.get("EVAL_MODEL", "gemma4:26b"))
     agent.reset_conversation()
     for k, v in (sc.get("state") or {}).items():
         setattr(agent, k, v)

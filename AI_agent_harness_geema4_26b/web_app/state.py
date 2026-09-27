@@ -11,7 +11,7 @@ from agent_core.config import PARALLEL_CAL_DEFAULT, TOOL_SUMMARY_DEFAULT
 # Agent 狀態（單一使用者、單一 Agent 實例）
 # =========================================================
 
-agent = SkillAgent(model=os.environ.get("WEB_CONSOLE_MODEL", "gemma4:e4b"), max_history=None)  # 則數視窗停用，統一以 token 門檻壓縮
+agent = SkillAgent(model=os.environ.get("WEB_CONSOLE_MODEL", "gemma4:26b"), max_history=None)  # 則數視窗停用，統一以 token 門檻壓縮
 agent.reset_conversation()
 
 state = {

@@ -15,7 +15,7 @@ try:  # ollama python client 底層用 httpx；用它的例外型別分類逾時
 except ImportError:  # pragma: no cover
     httpx = None
 
-DEFAULT_MODEL = os.environ.get("VISION_MODEL", "gemma4:e4b")
+DEFAULT_MODEL = os.environ.get("VISION_MODEL", "gemma4:26b")
 DEFAULT_TIMEOUT = int(os.environ.get("VISION_TIMEOUT", "180"))   # 秒；CPU 推論多張圖可能需要一兩分鐘
 DEFAULT_OPTIONS = {"temperature": 0.2, "num_ctx": 12288}
 

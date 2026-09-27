@@ -15,7 +15,7 @@ Gemma4 Vision Web Sniper（薄殼版）
 執行方式：
     python3 subagent/screen_gemma4_web.py
     然後瀏覽器打開 http://127.0.0.1:8766
-環境變數：SCREEN_GEMMA_WEB_MODEL（預設同 vision 的 VISION_MODEL / gemma4:e4b）、
+環境變數：SCREEN_GEMMA_WEB_MODEL（預設同 vision 的 VISION_MODEL / gemma4:26b）、
         SCREEN_GEMMA_WEB_HOST、SCREEN_GEMMA_WEB_PORT
 """
 
