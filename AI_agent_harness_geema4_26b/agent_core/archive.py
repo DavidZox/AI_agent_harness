@@ -42,7 +42,7 @@ class ArchiveMixin:
             with open(os.path.join(d, filename), "w", encoding="utf-8") as f:
                 f.write("\n".join(header) + "\n" + output_text + ("\n" if not output_text.endswith("\n") else ""))
             line = (f"#{record['id']} | {time.strftime('%Y-%m-%d %H:%M')} | {record['script']} | {record['status']} | "
-                    f"{len(output_text)} 字 | {filename} | 任務：{task[:60]} | 回答：")
+                    f"{len(output_text)} 字 | {filename} | 任務：{task} | 回答：")   # 任務與回答整句照存、不截斷（result_list 直接列這一行）
             with open(os.path.join(d, TOOL_RESULTS_INDEX), "a", encoding="utf-8") as f:
                 f.write(line + "\n")
             self._prune_tool_results(d)
@@ -88,7 +88,7 @@ class ArchiveMixin:
             key = f"#{result_id} | "
             for i, ln in enumerate(lines):
                 if ln.startswith(key) and f"| {self.session_id}_" in ln:
-                    lines[i] = ln.rsplit("| 回答：", 1)[0] + "| 回答：" + " ".join(answer.split())[:120]
+                    lines[i] = ln.rsplit("| 回答：", 1)[0] + "| 回答：" + " ".join(answer.split())
                     break
             else:
                 return False
