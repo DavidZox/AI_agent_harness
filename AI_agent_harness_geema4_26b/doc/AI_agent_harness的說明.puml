@@ -1,0 +1,119 @@
+@startuml
+' --- 樣式精準控制 ---
+skinparam RectangleWidthMax 340
+skinparam ranksep 60
+skinparam nodesep 60
+skinparam shadowing false
+skinparam defaultFontName "Microsoft JhengHei"
+
+title AI_agent_harness 架構：一個主 session 負責「挑技能」，一次性獨立 session 負責「讀原文」
+
+rectangle NodeUser #F5F5F5 [
+  **使用者介面**
+  CLI：agent_core/cli.py（python3 Agent_Runner.py）
+  Web：web_app/（python3 web_console.py；重用 SkillAgent，不重寫規則）
+  ----
+  * 輸入：自然語言任務、slash 指令、附圖、/skill 手動載入規格
+  * 顯示：reply；每次工具回傳兩張卡——完整原文（#編號）
+    與「AI 實際收到的內容」；決策／Plan／make_skill 按鈕
+]
+
+rectangle NodeAgent #D1E5F0 [
+  **SkillAgent（agent_core/，唯一核心）**
+  ----
+  * system prompt 只放不常變的（尾端附工具使用檢索清單）；
+    工作目錄、目標容器、核准的計畫每次接在最後一則訊息後（動態區）
+  * 呼叫主 session，**只看 action** 派發；
+    會改變實體狀態的動作先由程式請使用者確認
+  * 執行腳本 → 記軌跡 → 原文存檔 #編號
+  * 依上下文模式決定工具回傳怎麼進主對話：
+    harness＝獨立 session 擷取重點；claude_code＝原文（太大保留頭尾）
+  * 替模型維護狀態：工作目錄、目標容器、任務線、計畫
+  * 上下文超過水位就壓成滾動摘要（使用者原話逐字保留、
+    被壓掉的對話存檔）
+]
+
+rectangle NodeLLM #FFE6CC [
+  **主 session（Ollama gemma4:e4b，有對話歷史）**
+  ----
+  每輪固定回 JSON {thought, reply, action}
+  action 只能是：技能名稱、規格標明的腳本路徑、
+  或 result_recall；reply 裡的文字不會被執行
+]
+
+rectangle NodeSub #FCE5CD [
+  **一次性獨立 session（不碰主對話、做完即丟）**
+  ----
+  * 工具摘要 summarize_tool_result：>500 tokens 的回傳
+    （只在 harness 模式）
+  * 回原文提煉 result_recall：main session 主動選
+    （兩者共用 _extract_task_oriented：回答／事實／未涵蓋／
+     延伸方向／index_hint／related_records ＋下一步建議）
+  * 滾動壓縮 summarize_messages：舊對話 → 融合摘要
+  * 視覺 sub-session：附圖 → 文字
+  * /make_skill 草擬：操作軌跡 → 技能草稿 JSON
+]
+
+rectangle NodeSkills #D5E8D4 [
+  **skills_system/（模型能做的事只有這些）**
+  ----
+  * SKILLS.md：一行一個技能（常駐 system prompt）
+  * tools/<name>.md：規格（按需載入，附技能經驗記憶）
+  * scripts/<name>_cmd.py：真正執行的腳本
+  * 檔案系統／容器與 ROS2／調度系統／存檔回查／記憶
+  * 慣例：stdout 以 [PASS]／[ERROR] 開頭；計數、排序、門檻由腳本算
+]
+
+rectangle NodeWorld #FFF2CC [
+  **被操作的環境**
+  ----
+  宿主機檔案系統、Docker 容器與容器內 ROS2、
+  fih_rmf_system web_console（:8020）
+]
+
+rectangle NodeStore #E1D5E7 [
+  **logs/ 與記憶（logs/ 已 .gitignore）**
+  ----
+  * tool_results/<session>_<編號>_<腳本>.md：每次執行的完整原文
+    （編號跨 session 唯一；留最近 200 檔／50 MB）＋ index.md
+  * tool_results/tools_use_index.md：大量回傳的一句話關聯描述
+    （「#編號｜使用者想知道什麼：原文有什麼」，永久累加）
+  * 被壓縮的對話片段也存成 #編號（conversation_segment）
+  * trajectory.jsonl（操作軌跡）、summary_*.md／.json（滾動摘要＋
+    使用者原話）、perf.jsonl（每次模型呼叫的耗時）
+  * Memory.md（整份常駐）、skills_system/memory/<name>.md（綁技能）
+]
+
+NodeUser -down-> NodeAgent : 任務／slash／附圖
+NodeAgent -up-> NodeUser : reply、原文卡片、\nAI 實際收到的內容
+NodeAgent -right-> NodeLLM : system prompt + 對話歷史
+NodeLLM -left-> NodeAgent : {thought, reply, action}
+NodeAgent -[#996633]right-> NodeSub : 原文 + 使用者問題 +\n檢索清單／舊對話／影像／軌跡
+NodeSub -[#996633]left-> NodeAgent : 重點 + 下一步建議／\n新摘要／影像文字／草稿
+NodeAgent -down-> NodeSkills : 技能名稱 → 回規格文件（不執行）
+NodeAgent -[#CC6600,bold]down-> NodeSkills : 腳本路徑 → subprocess
+NodeSkills -down-> NodeWorld : docker exec／HTTP／檔案操作
+NodeWorld -up-> NodeSkills : 原始輸出
+NodeSkills -[#009933,bold]up-> NodeAgent : [PASS]／[ERROR] 完整輸出\n+ [CWD_CHANGED]／[TARGET_CONTAINER]
+NodeAgent -left-> NodeStore : 存檔原文、檢索描述、軌跡、\n摘要歸檔、耗時
+NodeStore -right-> NodeAgent : 檢索清單、最新摘要與使用者原話、\n常駐記憶；recall 讀回原文
+NodeLLM -[hidden]down-> NodeSub
+
+note right of NodeLLM
+  **兩階段按需載入：**
+  沒有「技能名稱 → 腳本」對照表。
+  填技能名稱只會拿到規格書，
+  讀到規格裡的真實腳本路徑
+  才執行得了——由程式保證。
+end note
+
+note bottom of NodeWorld
+  **安全邊界：**模型不產生程式碼，
+  能做的只有既有腳本；派工單、取消任務、
+  建容器、容器內非唯讀指令執行前一律
+  由程式請使用者確認（run_tool 沒有
+  approved 就不執行）；Plan 模式的核准
+  關卡靠「規劃階段不呼叫 run_tool」保證。
+end note
+
+@enduml

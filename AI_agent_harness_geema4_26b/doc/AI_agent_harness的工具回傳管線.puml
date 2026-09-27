@@ -1,0 +1,100 @@
+@startuml
+' --- 樣式精準控制 ---
+skinparam shadowing false
+skinparam defaultFontName "Microsoft JhengHei"
+skinparam ActivityBackgroundColor #FFF8E7
+skinparam ActivityBorderColor #996633
+skinparam NoteBackgroundColor #FFFFE0
+
+title 工具回傳管線：原文一定存檔；harness 模式太長才交給獨立 session 讀，claude_code 模式原文給模型自己查；之後用 result_recall 回去讀原文
+
+partition "這一次的工具回傳" {
+start
+:main session 決定執行一個腳本（action＝腳本路徑）;
+:執行腳本，完整原文存成 **#編號**
+（每次都存，之後隨時可以回來讀）;
+if (結果要加入主對話？
+auto 直接加入；manual／hybrid 等使用者按 y) then (加入)
+  if (規格文件、recall 的結果？) then (是)
+    :原文直接給 main session;
+  elseif (claude_code 模式？) then (是)
+    :原文＋「完整原文存檔 #編號」給 main session
+>3000 tokens 只給頭尾，中間一行寫明
+省略第幾行到第幾行、看不到不代表不存在、怎麼查; <<#DDEBF7>>
+    :>500 tokens 在檢索清單記一筆
+「當時的問題：執行的指令」（程式組，不呼叫模型）; <<#DDEBF7>>
+    :要不要回存檔查、用 result_grep／result_view／
+result_recall 哪一個，由 main session 自己決定;
+  elseif (回傳很短（≤500 tokens）？) then (是)
+    :原文直接給 main session;
+  else (harness 模式，太長)
+    :**① 告訴獨立 session「使用者想知道什麼」**
+使用者最近說的幾句話＋main session 為什麼執行這一步
+＋其他存檔的一句話描述（工具使用檢索清單）; <<#FCE5CD>>
+    :**② 獨立 session 讀完整原文，回答四件事**
+・重點：回答、相關事實、錯誤
+・還缺什麼：原文裡找不到的（未涵蓋）
+・這份存檔的一句話描述（等一下寫進清單）
+・還需要清單裡哪幾份舊存檔（程式會檢查編號真的存在）; <<#FCE5CD>>
+    if (缺的東西可能就在這份原文裡？
+（有缺口，而且沒指到別份存檔）) then (是)
+      :**③ 自動追問**（最多 2 次）
+用獨立 session 自己建議的關鍵字，在這份原文裡搜；
+搜到就針對搜到的段落再讀一次、補進②的結果；
+搜不到就停，缺口照實寫出來; <<#FCE5CD>>
+    else (否)
+    endif
+    :**④ 一句話描述寫進工具使用檢索清單**
+logs/tool_results/tools_use_index.md;
+    :**⑤ 附上下一步建議，連同重點交給 main session**
+・還需要舊存檔 → 下一輪執行 result_recall 這份,那份
+・缺口補不到 → 用自然的一句話問使用者
+・已經回答 → 直接回答，不用 recall;
+  endif
+else (捨棄)
+  :只告訴 main session「已執行，結果未加入」;
+endif
+stop
+}
+
+partition "之後任何一回合（可以是下一次啟動）" {
+start
+:每一輪的 system prompt 尾端都附上 **工具使用檢索清單**
+（最近 30 筆「#編號（時間）：一句話描述」）;
+:使用者說一句話;
+if (對話裡已經有使用者要的那個名稱或數值？) then (有)
+  :直接回答（不用 recall）;
+  stop
+elseif (在追問某份存檔？
+（清單裡的舊紀錄、或剛才那份摘要）) then (是)
+  :**result_recall <編號>[,<編號>] "使用者的話"**;
+  :回去讀那一份（或幾份）存檔的**完整原文**，
+走上面 ①②③⑤ 同一套流程重新提煉; <<#FCE5CD>>
+  note right
+    **①「使用者想知道什麼」改成：**
+    使用者最近 3 句話（最新那句常常只有
+    「第一個」這種短回答，要靠前幾句補上意思）
+    ＋ main session 自己寫的問題（只當補充重點，
+    因為它有時會把清單描述抄來當問題）
+    **③ 自動追問只在讀一份時做**：
+    一次讀好幾份時，原文已經全部給了
+  end note
+  :提煉結果給 main session
+**不寫進檢索清單**：清單只記原始來源，
+原本那筆還在、也還指向完整原文;
+  note right
+    **claude_code 模式**：不做自動追問，
+    結尾只陳述原文在哪、哪裡沒涵蓋，
+    下一步由 main session 決定
+  end note
+  stop
+elseif (問的是「現在」「目前」的狀態？) then (是)
+  :重新執行當時的工具（→ 上面的流程）;
+  stop
+else (都不像)
+  :當作新問題;
+  stop
+endif
+}
+
+@enduml

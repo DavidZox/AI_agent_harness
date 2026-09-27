@@ -1,0 +1,149 @@
+@startuml
+' --- 樣式精準控制 ---
+skinparam RectangleWidthMax 360
+skinparam ranksep 45
+skinparam nodesep 55
+skinparam shadowing false
+skinparam defaultFontName "Microsoft JhengHei"
+
+title AI_agent_harness 一回合的狀態機：從使用者訊息到使用者看到結果
+
+rectangle State1 #D1E5F0 [
+  **1. Input（收到使用者訊息）**
+  * slash 指令由 harness 直接處理，不進模型
+  * 文字任務：set_current_task 記任務線（最近 3 句）與說話時間；
+    上一個已核准的計畫自動清除
+  * 附圖：先由視覺 session 轉成文字附在訊息後
+  * /skill：規格以 [skill loaded] 附在訊息後
+]
+
+rectangle State2 #F5F5F5 [
+  **2. Prompt**
+  system prompt（只放不常變的）：AGENT.md → Context Mode 規則
+  → Memory.md（整份）→ 滾動摘要 → 使用者原話
+  → SKILLS.md → **工具使用檢索清單（最近 30 筆）**
+  動態區（接在最後一則訊息後、不寫進歷史）：
+  Current Agent State → Objective → 核准的計畫 → 清單最新一筆
+  ----
+  超過硬水位（NUM_CTX×75%）→ claude_code 先清除舊回傳，
+  不夠再同步壓縮，然後才呼叫模型
+]
+
+rectangle State3 #FFE6CC [
+  **3. Reply（主 session 回 JSON）**
+  * {thought, reply, action}，Ollama format= 強制
+  * 不是合法 JSON → 只顯示文字、本輪不執行
+  * 空白回覆 → 帶暫時提醒自動重試一次
+]
+
+rectangle StateGuard #F4CCCC [
+  **3b. 執行前關卡（guard_check）**
+  * 派工單、取消任務、建容器、容器內非唯讀指令
+    → CLI 問 y／n；Web 暫停，顯示「同意執行／拒絕」
+  * auto 模式也一樣會停；其他動作直接往下
+  * 拒絕 → [DENIED] 加入主對話，回合結束（7）
+]
+
+rectangle State4 #FFF2CC [
+  **4. Dispatch（run_tool，只看 action）**
+  * null → 回合結束（7）
+  * 技能名稱 → 回規格文件，不執行、不存檔
+  * result_recall_cmd.py → 在本程序內 recall（5）
+  * 腳本路徑 → 執行（5）；找不到 → [ERROR] 指引先載規格；
+    被擋的技能沒有 approved → [DENIED]
+]
+
+rectangle State5 #D5E8D4 [
+  **5. Execute**
+  * 一般技能：subprocess 執行腳本（cwd＝工作目錄；
+    env 帶目標容器、存檔目錄；腳本自帶逾時＋600 秒防線）
+  * result_recall：讀出存檔原文 → 獨立 session 依
+    使用者的問題提煉（見「工具回傳管線」圖）
+]
+
+rectangle State6a #FFE0B2 [
+  **6a. 落地（每次執行都做）**
+  * 同步 [CWD_CHANGED]／[TARGET_CONTAINER]
+  * 記軌跡 trajectory.jsonl
+  * 完整原文存成 #編號（編號跨 session 唯一）
+  * 完整原文顯示給使用者（#編號）
+]
+
+rectangle State6b #FFD580 [
+  **6b. 模式決策**
+  * auto：直接加入主對話、續推（Web 最多 25 輪）
+  * hybrid：問 y／n；n 改加「已捨棄」通知；都續推
+  * manual：y 加入並續推；n 捨棄後結束；stop 結束
+]
+
+rectangle State6c #FFCC80 [
+  **6c. 決定進主對話的內容（只在「加入」時算）**
+  harness 模式：
+  * (A) 規格文件、≤500 tokens、或本身已是提煉結果 → 原文
+  * (B) >500 tokens → 工具摘要 session：重點 + 下一步建議，
+    並把一句話描述寫進工具使用檢索清單
+  * (C) /summarize off 或摘要失敗 → 只給成功／失敗
+  claude_code 模式：
+  * (D) 原文＋存檔編號；>3000 tokens 保留頭尾、標出省略的行號
+  ----
+  包成 [tool result] +「系統回傳、不是使用者提供」框架句
+]
+
+rectangle State7 #E1D5E7 [
+  **7. End of turn（回合結束）**
+  * 使用者看到最終 reply
+  * 超過軟水位（NUM_CTX×60%）：claude_code 先清除舊回傳；
+    還超過且可壓內容夠多 → 舊訊息 + 上一份摘要融合成新摘要、
+    歸檔（使用者原話逐字保留、被壓掉的對話存成 #編號）
+]
+
+rectangle State8 #DDEBF7 [
+  **8. 下一句話（main session 依序判斷）**
+  * 對話裡的摘要已經有那個名稱／數值 → 直接回答
+  * 在接續某份存檔（清單或剛才的摘要）
+    → result_recall <編號>[,<編號>] "使用者的話"
+  * 問的是「現在」「目前」→ 重新執行工具
+]
+
+rectangle StatePlan #F8CECC [
+  **Plan 模式（/plan on 或 Plan 鈕）**
+  * 模型只產出步驟清單，harness 不呼叫 run_tool
+  * y 核准 → 計畫顯示在動態區、自動退出 Plan 模式
+  * n 取消；其他文字＝修改意見重新規劃
+]
+
+rectangle StateSkill #ECECEC [
+  **/make_skill（回合之外）**
+  * 把上一個起點後做對的步驟交給草擬 session 填 JSON
+  * harness 驗證、產生規格＋組合腳本，使用者核准才註冊
+]
+
+' --- 邏輯流向 ---
+State1 -down-> State2
+State2 -down-> State3
+State3 -down-> StateGuard
+StateGuard -down-> State4 : 不用確認／同意
+StateGuard -[#CC0000]left-> State7 : 拒絕
+State4 -[#CC6600,bold]down-> State5 : **腳本路徑／recall**
+State4 -[#3366CC]right-> State6c : 技能名稱：規格文件\n（不執行，完整放行）
+State5 -down-> State6a
+State6a -down-> State6b
+State6b -down-> State6c : 加入
+State6c -[#009933,bold]up-> State3 : **結果加入上下文，續推**
+State4 -[#CC0000,bold]left-> State7 : **action null**
+State6b -[#CC0000]left-> State7 : manual 的 n／stop
+State7 -[#6A5ACD,dashed]down-> State8 : 使用者再說一句
+State8 -[#6A5ACD,dashed]up-> State1
+State1 -right-> StatePlan : /plan on
+StatePlan -[#009933,bold]down-> State2 : **核准**
+State7 -[#999999]down-> StateSkill : 做對之後 /make_skill
+
+note right of State4
+  **狀態轉移的單一來源：**
+  只有 action 欄位驅動轉移；
+  reply／thought 裡的指令文字
+  都不算——由程式保證，
+  不依賴模型自律。
+end note
+
+@enduml
