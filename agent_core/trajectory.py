@@ -70,6 +70,7 @@ class TrajectoryMixin:
         self.last_result_file = record["result_file"]
         self.trajectory.append(record)
         self._append_trajectory_log(record)
+        self.plan_on_exec(record)   # /plan 執行中：這一步的技能成功就換下一步
         return record
 
     def add_trajectory_boundary(self, reason, **extra):

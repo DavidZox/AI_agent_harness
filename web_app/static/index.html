@@ -136,6 +136,7 @@
   <div id="status">
     <span id="stat-mode">mode: manual</span>
     <span id="stat-cmode" title="上下文模式（/context_mode 切換）：harness＝大量回傳由獨立 session 擷取重點；claude_code＝原文進上下文，查不查細節由 AI 決定">ctx-mode: -</span>
+    <span id="stat-plan" title="計畫進度（/plan）"></span>
     <span id="stat-cwd">cwd: -</span>
     <span id="stat-container" title="目前的目標容器：預設空白；AI 成功操作某個容器後自動帶入，之後容器技能可省略名稱。要換容器直接跟 AI 說。">container: -</span>
     <span id="stat-tokens">tokens: -</span>
@@ -167,7 +168,7 @@
     <button class="danger" id="decision-stop" onclick="sendDecision('stop')">⏹️ 停止本回合</button>
   </div>
   <div id="plan-bar">
-    <span>📝 有計畫待你核准（也可以直接在下方輸入修改意見送出，AI 會重新規劃）：</span>
+    <span>📝 計畫草稿待你核准（下方可打 /plan add、/plan edit N、/plan del N 直接改，或用說的改——AI 只會改你提到的那幾條）：</span>
     <button onclick="sendPlanDecision('y')">✅ 核准並執行</button>
     <button class="danger" onclick="sendPlanDecision('n')">🚫 取消任務</button>
   </div>
@@ -278,7 +279,7 @@ function renderEvents(events) {
     } else if (ev.channel === 'guard') {
       renderEntry(chatLog, 'guard', '🛡️ 執行前確認（下方按鈕：同意執行／拒絕）', ev.text);
     } else if (ev.channel === 'plan') {
-      renderEntry(chatLog, 'plan', '📝 計畫（待你確認）', ev.text);
+      renderEntry(chatLog, 'plan', '📝 計畫', ev.text);
     } else if (ev.channel === 'skilldraft') {
       renderEntry(chatLog, 'skilldraft', `🧩 技能草稿 ${ev.name}（待你決定：核准／重播驗證／取消，或送出修改意見）`, ev.text);
     } else if (ev.channel === 'system') {
@@ -300,6 +301,11 @@ function updateStatus(stats) {
   planBtn.title = planModeOn
     ? '切換 Plan 模式：目前已開啟，點一下關閉（不影響已在等待核准的計畫）'
     : '切換 Plan 模式：開啟後，下一個新任務會先規劃步驟、你核准才執行';
+  const planEl = document.getElementById('stat-plan');
+  const p = stats.plan;
+  const planLabels = { draft: '草稿', active: '執行中', done: '完成', aborted: '已退出' };
+  planEl.textContent = p ? `📝 計畫${planLabels[p.status] || p.status} ${p.done}/${p.total}` + (p.exec_guard ? ' · 🔒' : '') : '';
+  planEl.title = p ? '計畫（/plan show 看詳細；🔒＝/plan_exec_guard on）：\n' + p.text : '';
   document.getElementById('stat-cwd').textContent = 'cwd: ' + stats.current_cwd;
   document.getElementById('stat-container').textContent = 'container: ' + (stats.target_container || '-');
   const tokensEl = document.getElementById('stat-tokens');

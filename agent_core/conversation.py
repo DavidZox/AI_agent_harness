@@ -19,7 +19,7 @@ class ConversationMixin:
             del self._user_said[:-200]
 
     def reset_conversation(self):
-        self.current_plan = None  # /clear 時一併清掉進行中的計畫，避免舊計畫殘留誤導新任務
+        self.plan_clear()         # /clear 時一併清掉草稿與進行中的計畫，避免舊計畫殘留誤導新任務
         self.current_task = None  # 同上，避免舊任務敘述殘留誤導下一次的摘要 session
         self.task_history = []
         self.add_trajectory_boundary("clear")  # 軌跡本身保留（/trajectory 仍看得到），只記一個起點

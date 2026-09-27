@@ -161,6 +161,16 @@ class GuardMixin:
         技能名稱（只載入規格）、找不到的腳本、偽技能（result_recall）都不需要確認。"""
         if not getattr(self, "guard_enabled", True) or not GUARDED_SKILLS:
             return None
+        # 計畫執行前檢查（/plan_exec_guard）會擋下的動作不必再問使用者：run_tool 會直接回 [PLAN_BLOCKED]、不執行
+        if self.plan_block_reason(parsed):
+            return None
+        return self.state_change_info(parsed)
+
+    def state_change_info(self, parsed):
+        """這個 action 會不會改變實體／外部狀態（不看 /guard 開關）：回傳 None 或 {skill, script, command, reason}。
+        guard_check（執行前問使用者）與 PlanMixin 的計畫執行前檢查共用。"""
+        if not GUARDED_SKILLS:
+            return None
         action = (parsed or {}).get("action") if isinstance(parsed, dict) else None
         if not action:
             return None

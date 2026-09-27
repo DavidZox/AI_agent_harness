@@ -28,7 +28,6 @@ pending = {"result": None, "mode": None, "tokens": None, "parsed": None, "guard"
 
 def clear_pending():
     pending.update(result=None, mode=None, tokens=None, parsed=None, guard=None)
-plan_pending = {"active": False, "text": None}  # 等待使用者核准／修改意見的任務計畫（/plan 模式用）
 vision_session = VisionSession()  # 📷 尚未送出的影像附件（框選截圖／上傳的檔案），送出新任務時一次消費
 lock = threading.Lock()
 

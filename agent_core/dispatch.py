@@ -185,6 +185,12 @@ class DispatchMixin:
                 )
                 return f"[ERROR] 找不到腳本 {script_name}。{hint}"
 
+            # 計畫執行前檢查（/plan_exec_guard on 才有）：不是目前這一步、又會改變狀態的技能不執行，也不必問使用者
+            blocked = self.plan_block_reason(parsed)
+            if blocked:
+                print("📝 計畫執行前檢查：不是目前這一步的技能，這次沒有執行。")
+                self._plan_fail("執行了計畫外會改變狀態的技能")
+                return blocked
             if not approved:
                 guard = self.guard_check(parsed)
                 if guard:

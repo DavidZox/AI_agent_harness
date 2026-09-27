@@ -50,7 +50,8 @@ rectangle State4 #FFF2CC [
   * 技能名稱 → 回規格文件，不執行、不存檔
   * result_recall_cmd.py → 在本程序內 recall（5）
   * 腳本路徑 → 執行（5）；找不到 → [ERROR] 指引先載規格；
-    被擋的技能沒有 approved → [DENIED]
+    被擋的技能沒有 approved → [DENIED]；
+    計畫外會改狀態（/plan_exec_guard on）→ [PLAN_BLOCKED]
 ]
 
 rectangle State5 #D5E8D4 [
@@ -67,6 +68,7 @@ rectangle State6a #FFE0B2 [
   * 記軌跡 trajectory.jsonl
   * 完整原文存成 #編號（編號跨 session 唯一）
   * 完整原文顯示給使用者（#編號）
+  * 計畫執行中：這一步的技能成功 → 換下一步
 ]
 
 rectangle State6b #FFD580 [
@@ -106,10 +108,12 @@ rectangle State8 #DDEBF7 [
 ]
 
 rectangle StatePlan #F8CECC [
-  **Plan 模式（/plan on 或 Plan 鈕）**
-  * 模型只產出步驟清單，harness 不呼叫 run_tool
-  * y 核准 → 計畫顯示在動態區、自動退出 Plan 模式
-  * n 取消；其他文字＝修改意見重新規劃
+  **Plan 模式（/plan on、Plan 鈕，或直接 /plan add）**
+  * 規劃 session 產生草稿（不進主對話），系統保存
+  * /plan add／edit／del／move 直接改；用說的改＝AI 只給操作
+  * y 核准 → 任務＋計畫進主對話、進度在動態區、自動推進
+  * /plan_exec_guard on：計畫外會改狀態的技能不執行、
+    停下來自動提醒；連續失敗 3 次退出計畫
 ]
 
 rectangle StateSkill #ECECEC [
