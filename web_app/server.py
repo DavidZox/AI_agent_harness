@@ -295,7 +295,7 @@ class ConsoleHandler(BaseHTTPRequestHandler):
             return
 
         # 📷📘 只有「新任務」才消費附件與手動載入的技能規格（slash 指令與計畫核准／修改意見不會）
-        attachments = vision_session.take_all()
+        attachments = vision_session.take_all_items()
         skill_items = take_all_pending_skills()
 
         user_tokens = agent.count_tokens(message)

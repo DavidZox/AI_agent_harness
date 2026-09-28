@@ -1,9 +1,9 @@
 """回合流程：run_turn（ask_ai → run_tool 迴圈）、工具結果的決策、Plan 模式、技能草稿、附圖的視覺 sub-session、狀態列。"""
 from vision import (
-    analyze as vision_analyze,
     DEFAULT_MODEL as VISION_MODEL,
-    SUBSESSION_SYSTEM_PROMPT,
     VisionError,
+    describe_sources,
+    extract as vision_extract,
 )
 from agent_core.config import (
     KEEP_RECENT_TOKENS,
@@ -98,42 +98,60 @@ def _emit_context_event(content, events, tool_tokens=None):
 
 
 DEFAULT_VISION_PROMPT = "請描述這些影像的內容，並逐字列出可見的文字、數值、錯誤訊息與任何值得注意的異常。"
+# 視覺提取結果的長度提醒門檻（每張影像）：結構化提取（文字、畫面、個體、背景、線索）一張通常 400～700 tokens，
+# 套用工具回傳的 500 門檻幾乎每次附圖都會誤報；超過這個量才代表異常地長（例如整頁 log 都抄進來）。只影響 ⚠️ 提醒。
+VISION_WARN_TOKENS_PER_IMAGE = 600
 
 
-def _run_vision_subsession(message, images, events):
+def _run_vision_subsession(message, items, events):
     """📷 附圖的獨立視覺 sub-session（跟 SkillAgent.summarize_tool_result 同一種模式）：
     影像 + 使用者訊息交給視覺模型得到文字，主對話只收到文字、不接觸影像 bytes，
     所以 compress_context_to_file / count_tokens / _truncate_memory 全都不用改。
     代價是主 Agent 看到的是描述而非原圖，追問時要重新附圖。
+    提取的順序與格式在 vision.extraction（文字 → 畫面 → 個體 → 背景、線索、重點）；使用者打的字是視覺模型的
+    關注方向與命名提示，只附圖沒打字時（DEFAULT_VISION_PROMPT）視覺模型拿到的是「沒有說明」，照順序完整提取。
+    items 是 VisionSession.take_all_items() 的影像項目（{"img", "source"}）。
     回傳要放進主對話的完整使用者訊息內容（原文 + [vision result] 區塊）。"""
-    n = len(images)
-    events.append({"channel": "system", "text": f"🖼️ 視覺推論中（{n} 張影像，模型 {VISION_MODEL}）..."})
+    n = len(items)
+    events.append({"channel": "system", "text": f"🖼️ 視覺提取中（{n} 張影像，模型 {VISION_MODEL}）..."})
+    user_text = "" if message == DEFAULT_VISION_PROMPT else message
+    data = None
     try:
-        result = vision_analyze(images, message, system_prompt=SUBSESSION_SYSTEM_PROMPT)
+        result, data = vision_extract([it["img"] for it in items], user_text, describe_sources(items))
+        if data is None:
+            events.append({"channel": "system", "text": "⚠️ 視覺模型沒有給出結構化的提取結果，以下是它的原文。"})
     except VisionError as e:
         result = f"[ERROR] 視覺分析失敗：{e}"
     tokens = agent.count_tokens(result)
     agent.total_tool_tokens += tokens
     # 不套用 TOOL_RESULT_TOKEN_THRESHOLD 的精簡：這段文字是影像唯一的表示，砍成成功／失敗
-    # 就沒有資訊了。超過門檻只標 ⚠️ 提醒使用者留意長度（sub-session prompt 已要求精簡）。
-    oversized = tokens > TOOL_RESULT_TOKEN_THRESHOLD
+    # 就沒有資訊了。超過門檻（依張數，VISION_WARN_TOKENS_PER_IMAGE）只標 ⚠️ 提醒使用者留意長度。
+    warn_tokens = VISION_WARN_TOKENS_PER_IMAGE * max(n, 1)
+    oversized = tokens > warn_tokens
     events.append({"channel": "vision", "text": result, "tokens": tokens, "count": n, "oversized": oversized})
     if oversized:
         events.append({
             "channel": "system",
             "text": (
-                f"⚠️ 視覺分析結果約 {tokens} tokens，超過門檻 {TOOL_RESULT_TOKEN_THRESHOLD}，已標記待人工確認；"
+                f"⚠️ 視覺分析結果約 {tokens} tokens，超過門檻 {warn_tokens}（每張 {VISION_WARN_TOKENS_PER_IMAGE}），已標記待人工確認；"
                 f"因為它是影像唯一的文字表示，內容仍會完整交給主 Agent。"
             ),
         })
     # 這段接在使用者訊息尾端、以 user 角色送進主對話，模型容易把它當成「使用者寫的」而回覆
     # 「你提供的視覺分析」。這裡明確標示來源是系統的視覺模型；AGENT.md「Harness Messages」也有對應說明。
+    # 有結構化結果時再告訴主 Agent 怎麼用：照抄的文字與線索可以直接當技能參數、〔使用者說明〕的名稱不是影像裡讀到的、
+    # 影像只是某一刻的畫面——這幾句只在真的附圖時才出現在上下文（2.9：影像相關的稱呼不寫進 AGENT.md）。
+    usage = (
+        "「文字」與「線索」是照畫面原文抄的，名稱、編號、路徑、錯誤訊息可以直接當技能的參數（不要改寫）；"
+        "標〔使用者說明〕的名稱是使用者告訴系統的，不是影像裡讀到的；「無法判斷」的不要自己補。"
+        "影像只是某一刻的畫面，使用者要的是系統現在的狀態時，用技能重新查詢。"
+    ) if data is not None else ""
     return (
         f"{message}\n\n"
         f"[vision result]\n"
         f"【系統影像分析】使用者只提供了 {n} 張影像，沒有寫下面這段文字；以下由系統的視覺模型（{VISION_MODEL}）"
-        f"針對上述訊息自動產生。你看不到原圖，請把它當作系統回傳的分析結果來回應或決定下一步，"
-        f"回覆時稱「影像分析結果」，不要說成使用者提供的分析。\n{result}"
+        f"依使用者的訊息從影像提取。你看不到原圖，請把它當作系統回傳的分析結果來回應或決定下一步，"
+        f"回覆時稱「影像分析結果」，不要說成使用者提供的分析。{usage}\n{result}"
     )
 
 

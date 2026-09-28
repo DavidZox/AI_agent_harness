@@ -2,6 +2,8 @@
 
 這是整個 library 唯一會呼叫模型的地方。所有來源（Web Console 附圖、獨立 sniper、
 image_inspect 技能、未來的相機／ROS 影像）都走 analyze()，逾時與錯誤分類只維護一份。
+Web Console 附圖給決策 AI 用的結構化提取（提取順序、使用者說明的用法、輸出格式）在 extraction.py，
+它也是呼叫這裡的 analyze()。
 """
 import os
 
@@ -19,17 +21,6 @@ DEFAULT_MODEL = os.environ.get("VISION_MODEL", "gemma4:e4b")
 DEFAULT_TIMEOUT = int(os.environ.get("VISION_TIMEOUT", "180"))   # 秒；CPU 推論多張圖可能需要一兩分鐘
 DEFAULT_OPTIONS = {"temperature": 0.2, "num_ctx": 12288}
 
-# Web Console 附圖時使用的 sub-session system prompt：主對話看不到原圖，
-# 所以這裡除了回答問題，還要把影像中跟問題相關的事實一併寫出來，
-# 讓主 Agent 能據此決定下一步（例如影像裡的錯誤訊息文字可以拿去 grep）。
-SUBSESSION_SYSTEM_PROMPT = """你是視覺分析助手。使用者附上了影像並提出問題或指令。
-另一個負責決策的 AI 看不到原圖，只會看到你的文字回覆，因此請：
-1. 直接針對使用者的問題回答。
-2. 逐字抄錄影像中與問題相關的文字、數值、錯誤訊息、狀態指示（不要改寫或翻譯）。
-3. 若有多張影像，分別標明「影像 1」「影像 2」…。
-4. 不確定的地方明說「看不清楚」或「無法判斷」，不要猜。
-5. 回覆精簡，一般控制在 300 字以內；只有使用者明確要求逐字抄錄大量文字時才可更長。
-使用繁體中文回答，簡潔、條列。"""
 
 
 def _to_bytes(item, index):
@@ -42,8 +33,9 @@ def _to_bytes(item, index):
     raise VisionError(f"第 {index} 張影像型別不支援: {type(item).__name__}（需為 PIL.Image 或 bytes）")
 
 
-def analyze(images, prompt, model=None, timeout=None, system_prompt=None, options=None):
+def analyze(images, prompt, model=None, timeout=None, system_prompt=None, options=None, format=None):
     """對 images（PIL.Image 或 PNG/JPEG bytes 的列表）依 prompt 推論，回傳文字。
+    format 是 Ollama 的結構化輸出（JSON schema）；給了就回傳 JSON 字串，由呼叫端解析（見 extraction.py）。
     失敗一律拋出 VisionError，訊息可直接顯示。"""
     model = model or DEFAULT_MODEL
     timeout = DEFAULT_TIMEOUT if timeout is None else timeout
@@ -67,6 +59,7 @@ def analyze(images, prompt, model=None, timeout=None, system_prompt=None, option
             model=model,
             messages=messages,
             options=options or DEFAULT_OPTIONS,
+            format=format,
             think=False,
         )
     except Exception as e:  # 分類成可行動的說明

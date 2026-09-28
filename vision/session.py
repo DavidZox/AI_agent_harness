@@ -101,8 +101,13 @@ class VisionSession:
             return [it["img"] for it in self.items]
 
     def take_all(self):
-        """取出全部影像並清空清單（Web Console 送出訊息時一次消費）。"""
+        """取出全部影像並清空清單。"""
+        return [it["img"] for it in self.take_all_items()]
+
+    def take_all_items(self):
+        """取出全部影像項目（{"img", "source"}）並清空清單（Web Console 送出訊息時一次消費）：
+        來源（螢幕框選／上傳的檔名）會一起告訴視覺模型，見 extraction.describe_sources。"""
         with self._lock:
-            imgs = [it["img"] for it in self.items]
+            items = [{"img": it["img"], "source": it["source"]} for it in self.items]
             self.items = []
-            return imgs
+            return items
