@@ -4,7 +4,7 @@
 （影像裡的錯誤訊息、機器人編號、容器、topic 可以直接當技能的參數）。所以提取的順序與格式由程式保證
 （format=extraction_schema(張數)），不是靠模型自己遵守範本——跟工具回傳的任務導向擷取同一個想法：
   每張影像：文字（逐字）→ 畫面的系統性描述（沒有文字時要完整）→ 明確的個體 → 個體以外的背景
-  全部影像：影像之間的關係 → 可以拿去查系統的線索 → 看不清楚的地方 → 針對使用者說明的重點
+  全部影像：影像之間的關係 → 可以拿去查系統的線索 → 看不清楚的地方 → 針對使用者說明的重點 → 檢索清單的描述
 JSON 的欄位順序就是模型生成的順序：重點（focus）放最後，讓它根據已經提取出來的內容回答，而不是先下結論
 再找證據；排版（render_extraction）時才把重點移到最上面，決策 AI 第一眼就知道這些資訊跟使用者要的事有什麼關係。
 
@@ -25,7 +25,7 @@ NAME_SOURCES = ["影像中的文字", "使用者說明", "外觀判斷"]
 # 排版會退回最後一個完整的句子（_prose）。images 的張數固定等於附上的張數，模型不會少描述一張，也不會把一張拆成兩筆。
 TEXTS_MAX, ENTITIES_MAX, CLUES_MAX, UNCLEAR_MAX = 40, 20, 12, 8
 LIMITS = {"kind": 30, "text": 300, "overview": 600, "name": 60, "details": 250, "background": 200,
-          "relations": 300, "clue_kind": 20, "clue_value": 300, "unclear": 200, "focus": 400}
+          "relations": 300, "clue_kind": 20, "clue_value": 300, "unclear": 200, "focus": 400, "index_hint": 200}
 
 
 def extraction_schema(n_images):
@@ -60,8 +60,9 @@ def extraction_schema(n_images):
             "clues": {"type": "array", "items": clue, "maxItems": CLUES_MAX},
             "unclear": texts("unclear", UNCLEAR_MAX),
             "focus": text("focus"),
+            "index_hint": text("index_hint"),
         },
-        "required": ["images", "relations", "clues", "unclear", "focus"],
+        "required": ["images", "relations", "clues", "unclear", "focus", "index_hint"],
     }
 
 
@@ -79,6 +80,7 @@ images 每張影像一筆，依附上的順序（影像 1、影像 2…），每
 7. clues：可以拿去查系統的線索。畫面裡出現的每個機器人／站點／任務編號、容器、topic／node、檔案路徑、網址或 IP 都各列一項，再加上錯誤訊息、關鍵數值、看得出來的異常狀態。每項寫 kind（種類）與 value（照抄原文）；沒有就給空陣列。只列畫面裡真的有的（或使用者說明提到的），不要推測。
 8. unclear：看不清楚、被遮住、無法判斷的地方；沒有就給空陣列。不確定的寫在這裡，不要猜。
 9. focus：針對使用者說明的重點，一到三句，用第三人稱陳述（不要對使用者說話、不要建議操作）。使用者問了問題就直接回答；使用者提到的狀況（例如「被擋住」「有問題」）要說明畫面裡對應的是哪個個體、看起來怎樣，看不出來就說看不出來；只提示了關注方向或畫面裡的東西，就說在那個方向上看到了什麼；沒有說明就用一句話總結這些影像在呈現什麼。只根據上面提取到的內容，影像裡沒有答案就直說「影像中沒有…」。
+10. index_hint：這次的分析會存檔，之後可能是完全不同的一次對話，要靠這一句話判斷「使用者那時問的事跟這次附的影像有沒有關」。寫法「<使用者想知道什麼>：<影像是什麼、關鍵的名稱或結果>」，名稱照抄、放前面，寫成完整的一句話；沒有說明時前半寫影像的主題。例：「amr_03 為什麼停下來：終端機日誌，amr_03 lidar timeout、停在 station a3、電量 18%」。不要用「…」或「等等」收尾。
 
 使用者說明的用法：它決定你的關注方向——跟它有關的文字、個體、細節要優先而且更完整地提取。說明裡指出畫面中某個東西是什麼（例如「左邊那台是 amr_03」）或補充了屬性時，照使用者說的命名與描述，name_from 填「使用者說明」；使用者的說法跟畫面明顯矛盾時，照畫面寫，並在 unclear 註明。說明裡要系統做的事（例如「幫我派車」）不是給你的，你只負責提取影像內容。
 
@@ -201,6 +203,17 @@ def render_extraction(data, n_images):
         out.append("無法判斷：")
         out += [f"- {u}" for u in unclear]
     return "\n".join(out)
+
+
+def index_hint(data, user_text, text):
+    """這次附圖分析在工具使用檢索清單上的描述：視覺模型寫的 index_hint；沒有（純文字退路）就用使用者的說明＋提取結果的
+    第一行（通常是「重點：…」）組一句。整句照存、不截斷（跟工具回傳的描述同一個原則）。"""
+    hint = _text((data or {}).get("index_hint"))
+    if hint:
+        return hint
+    first = next((ln.strip() for ln in str(text or "").splitlines() if ln.strip()), "")
+    first = first[len("重點："):] if first.startswith("重點：") else first
+    return f"{_text(user_text) or '附圖（沒有說明）'}：{_text(first)}"
 
 
 def extract(images, user_text="", sources=None, model=None, timeout=None):

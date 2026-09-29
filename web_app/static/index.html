@@ -261,7 +261,8 @@ function renderEvents(events) {
     } else if (ev.channel === 'skillload') {
       renderEntry(toolLog, 'skillload', `📘 手動載入技能規格：${ev.name}（≈${ev.tokens} tokens，隨下一則訊息送出）`, ev.text);
     } else if (ev.channel === 'vision') {
-      renderEntry(toolLog, 'vision', `🖼️ 視覺分析（獨立 session，${ev.count} 張影像）`, ev.text, ev.oversized);
+      renderEntry(toolLog, 'vision', `🖼️ 視覺分析（獨立 session，${ev.count} 張影像）` + (ev.result_id ? ` · 📄 已存檔 #${ev.result_id}` : ''), ev.text, ev.oversized);
+      if (ev.result_id) attachResultLink(toolLog, ev.result_id);
     } else if (ev.channel === 'tool') {
       renderEntry(toolLog, 'tool', '系統回傳' + (ev.result_id ? ` · 📄 已存檔 #${ev.result_id}` : ''), ev.text, ev.oversized);
       if (ev.result_id) attachResultLink(toolLog, ev.result_id);

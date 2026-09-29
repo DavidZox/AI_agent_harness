@@ -77,6 +77,10 @@ CONVERSATION_ARCHIVE_SCRIPT = "conversation_segment"
 # 對話片段少、價值高，不該被大量工具回傳擠出顯示視窗，也不該被工具存檔的輪替刪掉。
 CONVERSATION_ARCHIVES_SHOW = int(os.environ.get("AGENT_CONVERSATION_ARCHIVES_SHOW", "10"))
 CONVERSATION_SEGMENTS_KEEP = int(os.environ.get("AGENT_CONVERSATION_SEGMENTS_KEEP", "100"))
+# 附圖的視覺分析結果也存成一份存檔（同一套 #編號，檢索清單標〔附圖分析〕、可以 result_recall），「腳本」欄寫這個名稱。
+# 原圖不保存，這份文字是那次附圖唯一留下來的東西、沒辦法重跑拿回來，所以保留上限跟工具回傳分開算。
+VISION_ARCHIVE_SCRIPT = "vision_extract"
+VISION_RESULTS_KEEP = int(os.environ.get("AGENT_VISION_RESULTS_KEEP", "100"))
 
 # 🧠 長期記憶（Memory.md）載入上限（字元）：以前只讀最後 30 行，條目變多時最舊的規則會無聲消失。
 # 現在整份載入；超過上限才丟最舊的條目，並在 system prompt 與 UI 明說還有幾條沒載入。用字元數而不是 token，

@@ -50,7 +50,8 @@ rectangle NodeSub #FCE5CD [
     （兩者共用 _extract_task_oriented：回答／事實／未涵蓋／
      延伸方向／index_hint／related_records ＋下一步建議）
   * 滾動壓縮 summarize_messages：舊對話 → 融合摘要
-  * 視覺 sub-session：附圖 → 文字
+  * 視覺 sub-session：附圖 → 結構化提取（文字→畫面→個體→背景、
+    線索、重點、index_hint），存成 #編號
   * /make_skill 草擬：操作軌跡 → 技能草稿 JSON
 ]
 
@@ -80,6 +81,8 @@ rectangle NodeStore #E1D5E7 [
     （「#編號｜使用者想知道什麼：原文有什麼」，整句不截斷，永久累加）
   * 被壓縮的對話片段也存成 #編號（conversation_segment），描述只講那一段；
     system prompt 另列「過去的對話片段」，保留上限另計（100 份）
+  * 附圖的視覺分析也存成 #編號（vision_extract），檢索清單標〔附圖分析〕，
+    可以 result_recall；原圖不保存，保留上限另計（100 份）
   * trajectory.jsonl（操作軌跡）、summary_*.md／.json（滾動摘要＋
     使用者原話）、perf.jsonl（每次模型呼叫的耗時）
   * Memory.md（整份常駐）、skills_system/memory/<name>.md（綁技能）

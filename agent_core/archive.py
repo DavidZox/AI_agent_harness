@@ -10,8 +10,10 @@ from .config import (
     TOOL_RESULTS_INDEX,
     TOOL_RESULTS_KEEP,
     TOOL_RESULTS_MAX_MB,
+    VISION_ARCHIVE_SCRIPT,
+    VISION_RESULTS_KEEP,
 )
-from .tool_use_index import is_conversation_file
+from .tool_use_index import result_kind
 
 
 class ArchiveMixin:
@@ -52,11 +54,12 @@ class ArchiveMixin:
 
     def _prune_tool_results(self, d):
         """工具回傳只留最近 TOOL_RESULTS_KEEP 個檔、總大小不超過 TOOL_RESULTS_MAX_MB；被壓縮的對話片段另外只看
-        CONVERSATION_SEGMENTS_KEEP——兩種分開算，工具跑得再多也不會把對話原文擠掉（對話片段少、價值高，而且沒辦法重跑
-        一次拿回來）。刪最舊的並把 index.md 裡對應的行拿掉。"""
+        CONVERSATION_SEGMENTS_KEEP、附圖分析只看 VISION_RESULTS_KEEP——三種分開算，工具跑得再多也不會把對話原文或附圖分析
+        擠掉（這兩種沒辦法重跑一次拿回來：對話已經過去、原圖沒有保存）。刪最舊的並把 index.md 裡對應的行拿掉。"""
         names = sorted(fn for fn in os.listdir(d) if TOOL_RESULT_FILE_RE.match(fn))   # 檔名＝session_id + 三位數編號，排序即時間順序
-        convs = [fn for fn in names if is_conversation_file(fn)]
-        tools = [fn for fn in names if not is_conversation_file(fn)]
+        convs = [fn for fn in names if result_kind(fn) == "conversation"]
+        visions = [fn for fn in names if result_kind(fn) == "vision"]
+        tools = [fn for fn in names if result_kind(fn) == "tool"]
         sizes = {fn: os.path.getsize(os.path.join(d, fn)) for fn in tools}
         total, removed = sum(sizes.values()), []
         while tools and (len(tools) > TOOL_RESULTS_KEEP or total > TOOL_RESULTS_MAX_MB * 1024 * 1024):
@@ -64,10 +67,11 @@ class ArchiveMixin:
             total -= sizes[fn]
             os.remove(os.path.join(d, fn))
             removed.append(fn)
-        while len(convs) > max(CONVERSATION_SEGMENTS_KEEP, 1):
-            fn = convs.pop(0)
-            os.remove(os.path.join(d, fn))
-            removed.append(fn)
+        for pool, keep in ((convs, CONVERSATION_SEGMENTS_KEEP), (visions, VISION_RESULTS_KEEP)):
+            while len(pool) > max(keep, 1):
+                fn = pool.pop(0)
+                os.remove(os.path.join(d, fn))
+                removed.append(fn)
         if removed:
             index = os.path.join(d, TOOL_RESULTS_INDEX)
             if os.path.exists(index):
@@ -76,6 +80,26 @@ class ArchiveMixin:
                 with open(index, "w", encoding="utf-8") as f:
                     f.write("\n".join(lines) + ("\n" if lines else ""))
         return removed
+
+    def archive_vision_result(self, text, hint, sources, answer=""):
+        """附圖的視覺分析結果存成一份存檔（跟工具回傳同一套 #編號、同一個目錄，腳本欄寫 vision_extract），index.md 的
+        「回答」欄填視覺模型的重點，並記進工具使用檢索清單（描述是視覺模型寫的 index_hint，system prompt 顯示時標〔附圖分析〕）。
+        以前視覺分析只併進那一則使用者訊息：訊息被壓縮或換了 session 之後，main session 與獨立 session 都找不到它，也沒辦法
+        像工具回傳一樣 result_recall。原圖不存（只存給決策 AI 看的文字），所以 recall 時只能根據這份文字回答（見 _result_recall）。
+        不記進操作軌跡：它不是執行腳本，/make_skill 不該把它當成一個步驟。回傳編號；寫不進去回 None（不影響主流程）。"""
+        if not str(text or "").strip():
+            return None
+        rid = self._next_id()
+        listed = "；".join(f"影像 {i} {src}" for i, src in enumerate(sources or [], 1))
+        record = {"id": rid, "script": VISION_ARCHIVE_SCRIPT, "skill": "", "status": "PASS",
+                  "command": f"（附圖的視覺分析，{len(sources or [])} 張影像" + (f"：{listed}" if listed else "") + "）",
+                  "cwd": self.current_cwd, "target_container": self.target_container, "task": self.current_task or ""}
+        filename = self._archive_tool_result(record, text)
+        if not filename:
+            return None
+        self.update_result_answer(rid, answer)
+        self._append_tool_use_index(rid, filename, hint)
+        return rid
 
     def update_result_answer(self, result_id, answer):
         """摘要 session 產出「回答」後回填到 index.md 該筆的「回答：」欄，result_list 一眼就能看到每個存檔在講什麼。"""

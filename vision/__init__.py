@@ -18,13 +18,13 @@ from .images import (
     MAX_IMAGE_BYTES, crop_by_preview, from_bytes, from_data_url, from_file, to_data_url, to_png_bytes,
 )
 from .inference import DEFAULT_MODEL, DEFAULT_TIMEOUT, analyze
-from .extraction import EXTRACTION_SYSTEM_PROMPT, describe_sources, extract, extraction_schema, render_extraction
+from .extraction import EXTRACTION_SYSTEM_PROMPT, describe_sources, extract, extraction_schema, index_hint, render_extraction
 from .capture import backend as capture_backend, capture_screen, list_screens
 from .session import VisionSession
 
 __all__ = [
     "VisionError", "MAX_IMAGE_BYTES", "crop_by_preview", "from_bytes", "from_data_url", "from_file",
     "to_data_url", "to_png_bytes", "DEFAULT_MODEL", "DEFAULT_TIMEOUT", "analyze",
-    "EXTRACTION_SYSTEM_PROMPT", "describe_sources", "extract", "extraction_schema", "render_extraction",
+    "EXTRACTION_SYSTEM_PROMPT", "describe_sources", "extract", "extraction_schema", "index_hint", "render_extraction",
     "capture_backend", "capture_screen", "list_screens", "VisionSession",
 ]

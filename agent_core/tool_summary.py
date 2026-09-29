@@ -17,6 +17,7 @@ from .config import (
     TOOL_SUMMARY_MAX_PREDICT,
     TOOL_SUMMARY_TAG,
     TOOL_USE_INDEX_HINT_TARGET,
+    VISION_ARCHIVE_SCRIPT,
 )
 from .protocol import action_text, parse_agent_reply
 from .schemas import TOOL_SUMMARY_SCHEMA
@@ -387,7 +388,8 @@ class ToolSummaryMixin:
             clipped_one, om = self._clip_tool_output(raw, per_budget)
             omitted += om
             is_conv = meta.get("script") == CONVERSATION_ARCHIVE_SCRIPT
-            kind_label = "過去的對話片段" if is_conv else (meta.get('script') or '?')
+            is_vision = meta.get("script") == VISION_ARCHIVE_SCRIPT
+            kind_label = "過去的對話片段" if is_conv else "附圖分析" if is_vision else (meta.get('script') or '?')
             chunks.append(clipped_one if len(loaded) == 1 else f"===== 存檔 #{rid}（{kind_label}）=====\n{clipped_one}")
             hint = self._tool_use_index_hint(rid)
             if is_conv:
@@ -396,6 +398,12 @@ class ToolSummaryMixin:
                                   f"[user] 是使用者當時說的話、[assistant] 是 AI 當時的想法與回覆、[harness …] 是當時的工具回傳；"
                                   f"回答時說明當時談了什麼、查到什麼、決定了什麼，使用者的原話與名稱、數值照抄"
                                   + (f"；檢索清單對這一段的描述：{hint}" if hint else ""))
+            elif is_vision:
+                # 附圖分析：原圖沒有保存，只有當時視覺模型提取的文字——文字裡沒有的不能補，要更多細節只能請使用者重新附圖
+                background.append(f"#{rid}：這份是過去使用者附圖時系統的影像分析結果（{meta.get('command') or ''}），不是工具輸出；"
+                                  f"原圖沒有保存，只能根據這份文字回答，文字裡沒有的就寫進 not_covered（例如「當時的影像分析沒有提到…，"
+                                  f"需要的話請使用者重新附圖」），不要推測影像內容；當時使用者的說明：{meta.get('task') or '(沒有)'}"
+                                  + (f"；檢索清單對它的描述：{hint}" if hint else ""))
             else:
                 background.append(f"#{rid}：當時的任務：{meta.get('task') or '(未知)'}；執行的指令：{meta.get('command') or meta.get('script') or '(未知)'}"
                                   + (f"；檢索清單對它的描述：{hint}" if hint else ""))

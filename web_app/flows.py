@@ -4,6 +4,7 @@ from vision import (
     VisionError,
     describe_sources,
     extract as vision_extract,
+    index_hint as vision_index_hint,
 )
 from agent_core.config import (
     KEEP_RECENT_TOKENS,
@@ -110,16 +111,21 @@ def _run_vision_subsession(message, items, events):
     代價是主 Agent 看到的是描述而非原圖，追問時要重新附圖。
     提取的順序與格式在 vision.extraction（文字 → 畫面 → 個體 → 背景、線索、重點）；使用者打的字是視覺模型的
     關注方向與命名提示，只附圖沒打字時（DEFAULT_VISION_PROMPT）視覺模型拿到的是「沒有說明」，照順序完整提取。
+    分析成功時存成一份 #編號 存檔並記進工具使用檢索清單（agent.archive_vision_result）：之後不論訊息有沒有被壓縮、是不是
+    同一個 session，main session 與獨立 session 都能像工具回傳一樣從清單認出它、result_recall 取回；失敗（[ERROR]）不存。
     items 是 VisionSession.take_all_items() 的影像項目（{"img", "source"}）。
     回傳要放進主對話的完整使用者訊息內容（原文 + [vision result] 區塊）。"""
     n = len(items)
     events.append({"channel": "system", "text": f"🖼️ 視覺提取中（{n} 張影像，模型 {VISION_MODEL}）..."})
     user_text = "" if message == DEFAULT_VISION_PROMPT else message
-    data = None
+    sources = describe_sources(items)
+    data, result_id = None, None
     try:
-        result, data = vision_extract([it["img"] for it in items], user_text, describe_sources(items))
+        result, data = vision_extract([it["img"] for it in items], user_text, sources)
         if data is None:
             events.append({"channel": "system", "text": "⚠️ 視覺模型沒有給出結構化的提取結果，以下是它的原文。"})
+        result_id = agent.archive_vision_result(result, vision_index_hint(data, user_text, result), sources,
+                                                answer=(data or {}).get("focus") or "")
     except VisionError as e:
         result = f"[ERROR] 視覺分析失敗：{e}"
     tokens = agent.count_tokens(result)
@@ -128,7 +134,8 @@ def _run_vision_subsession(message, items, events):
     # 就沒有資訊了。超過門檻（依張數，VISION_WARN_TOKENS_PER_IMAGE）只標 ⚠️ 提醒使用者留意長度。
     warn_tokens = VISION_WARN_TOKENS_PER_IMAGE * max(n, 1)
     oversized = tokens > warn_tokens
-    events.append({"channel": "vision", "text": result, "tokens": tokens, "count": n, "oversized": oversized})
+    events.append({"channel": "vision", "text": result, "tokens": tokens, "count": n, "oversized": oversized,
+                   "result_id": result_id})   # 📄 存檔編號；卡片顯示並可開啟 /api/results/<id>
     if oversized:
         events.append({
             "channel": "system",
@@ -146,12 +153,14 @@ def _run_vision_subsession(message, items, events):
         "標〔使用者說明〕的名稱是使用者告訴系統的，不是影像裡讀到的；「無法判斷」的不要自己補。"
         "影像只是某一刻的畫面，使用者要的是系統現在的狀態時，用技能重新查詢。"
     ) if data is not None else ""
+    # 存檔編號跟工具回傳的「完整原文存檔 #編號」同一個用意：之後這則訊息被壓縮掉，清單上的同一個編號還找得到它
+    archived = f"這份分析存檔為 #{result_id}（工具使用檢索清單標〔附圖分析〕）。" if result_id else ""
     return (
         f"{message}\n\n"
         f"[vision result]\n"
         f"【系統影像分析】使用者只提供了 {n} 張影像，沒有寫下面這段文字；以下由系統的視覺模型（{VISION_MODEL}）"
         f"依使用者的訊息從影像提取。你看不到原圖，請把它當作系統回傳的分析結果來回應或決定下一步，"
-        f"回覆時稱「影像分析結果」，不要說成使用者提供的分析。{usage}\n{result}"
+        f"回覆時稱「影像分析結果」，不要說成使用者提供的分析。{archived}{usage}\n{result}"
     )
 
 

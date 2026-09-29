@@ -1,9 +1,15 @@
 """ToolUseIndexMixin：工具使用檢索清單（logs/tool_results/tools_use_index.md）的寫入、讀取、交給獨立 session 的清單，
-以及 system prompt 裡的兩區顯示：工具回傳（尾端）與過去的對話片段（被壓縮的對話原文存檔）。"""
+以及 system prompt 裡的兩區顯示：工具回傳與附圖分析（尾端）、過去的對話片段（被壓縮的對話原文存檔）。"""
 import os
 import re
 import time
-from .config import CONVERSATION_ARCHIVE_SCRIPT, CONVERSATION_ARCHIVES_SHOW, TOOL_USE_INDEX_NAME, TOOL_USE_INDEX_SHOW
+from .config import (
+    CONVERSATION_ARCHIVE_SCRIPT,
+    CONVERSATION_ARCHIVES_SHOW,
+    TOOL_USE_INDEX_NAME,
+    TOOL_USE_INDEX_SHOW,
+    VISION_ARCHIVE_SCRIPT,
+)
 
 
 _TRAILING_ELLIPSIS_RE = re.compile(r"(\s*(…|\.{3,}))+$")
@@ -16,10 +22,20 @@ def tidy_hint(text):
     return _TRAILING_ELLIPSIS_RE.sub("", " ".join(str(text or "").split())).strip()
 
 
-def is_conversation_file(filename):
-    """檢索清單的一行是不是被壓縮的對話片段：看存檔檔名的腳本欄（<session>_<編號>_conversation_segment.md），
-    不另外加欄位，舊的清單行也分得出來。"""
-    return str(filename or "").strip().endswith(f"_{CONVERSATION_ARCHIVE_SCRIPT}.md")
+# 存檔的三種來源：工具回傳、附圖的視覺分析、被壓縮的對話片段（交給獨立 session 的清單用這些名稱標種類）
+KIND_LABELS = {"tool": "工具回傳", "vision": "附圖分析", "conversation": "過去的對話片段"}
+VISION_MARK = "〔附圖分析〕"   # system prompt 的工具使用檢索清單裡，附圖分析那幾行的開頭
+
+
+def result_kind(filename):
+    """存檔（或檢索清單的一行）是哪一種：看檔名的腳本欄（<session>_<編號>_<腳本>.md），不另外加欄位，舊的清單行也分得出來。"""
+    name = str(filename or "").strip()
+    if name.endswith(f"_{CONVERSATION_ARCHIVE_SCRIPT}.md"):
+        return "conversation"
+    if name.endswith(f"_{VISION_ARCHIVE_SCRIPT}.md"):
+        return "vision"
+    return "tool"
+
 
 
 class ToolUseIndexMixin:
@@ -40,7 +56,8 @@ class ToolUseIndexMixin:
             # claude_code 模式：清單只是線索（程式寫的「當時的問題＋指令」），怎麼取回、要不要取回由模型決定
             return f"""
             ## 工具使用檢索清單（Tool Use Index）
-            以下每筆是過去某次工具回傳的存檔（可能是很早之前、甚至上次啟動的）：當時使用者的問題與執行的指令，最上面最新；原文不在這裡：
+            以下每筆是過去某次工具回傳的存檔（可能是很早之前、甚至上次啟動的）：當時使用者的問題與執行的指令，最上面最新；
+            開頭標〔附圖分析〕的是使用者附圖時系統的影像分析（原圖沒有保存，只有這份文字）。原文不在這裡：
             {rows_text}
 
             需要舊資料時由你決定怎麼取回：看某一段用 result_view <編號>、找某個字串用 result_grep <編號> "<關鍵字>"、
@@ -49,7 +66,8 @@ class ToolUseIndexMixin:
             """
         return f"""
             ## 工具使用檢索清單（Tool Use Index）
-            以下每筆是過去某次工具回傳的存檔（可能是很早之前、甚至上次啟動的）跟當時問題的關聯描述，最上面最新；只是線索，原文不在這裡：
+            以下每筆是過去某次工具回傳的存檔（可能是很早之前、甚至上次啟動的）跟當時問題的關聯描述，最上面最新；開頭標〔附圖分析〕的
+            是使用者附圖時系統的影像分析（原圖沒有保存，只有這份文字，追問一樣用 result_recall）。只是線索，原文不在這裡：
             {rows_text}
 
             每次回答前依序判斷:
@@ -92,11 +110,9 @@ class ToolUseIndexMixin:
         return (f"工具使用檢索清單（完整的在 system prompt 尾端，共 {len(rows)} 筆）最新一筆：#{rid}（{ts}）：{hint}。"
                 f"使用者這句話若在接續清單裡的某一筆，照清單的規則取回原文再回答。")
 
-    def _tool_use_index_rows(self, exclude=(), kind="tool", limit=None):
-        """tools_use_index.md 最近 limit 筆（預設 TOOL_USE_INDEX_SHOW；新→舊）→ [(編號, 時間, 描述)]，同一編號只留最新一筆。
-        kind：tool＝工具回傳、conversation＝被壓縮的對話片段（看檔名分，見 is_conversation_file）、None＝兩種都要，
-        兩種各自計名額。system prompt 的兩區（_tool_use_index_block、_conversation_index_block）與交給獨立 session
-        判斷 related_records 的清單（_tool_use_catalog）共用；exclude 排除特定編號（例如正在被摘要或被 recall 的那一筆自己）。"""
+    def _index_entries(self, exclude=(), kinds=("tool", "vision"), limit=None):
+        """tools_use_index.md 最近 limit 筆（預設 TOOL_USE_INDEX_SHOW；新→舊）→ [{"id", "ts", "hint", "kind"}]，同一編號只留
+        最新一筆；kinds 決定要哪幾種（result_kind），各自計名額。exclude 排除特定編號（例如正在被摘要或被 recall 的那一筆自己）。"""
         limit = TOOL_USE_INDEX_SHOW if limit is None else limit
         if limit <= 0:
             return []
@@ -106,28 +122,35 @@ class ToolUseIndexMixin:
         except OSError:
             return []
         excluded = {str(x).lstrip("#") for x in exclude if x}
-        rows, seen = [], set()
+        entries, seen = [], set()
         for ln in reversed(lines):
             parts = ln.split(" | ", 4)
             rid = parts[0].strip().lstrip("#") if len(parts) >= 5 else ""
             if not rid.isdigit() or rid in seen or rid in excluded:
                 continue
             seen.add(rid)
-            is_conv = is_conversation_file(parts[3])
-            if (kind == "tool" and is_conv) or (kind == "conversation" and not is_conv):
+            kind = result_kind(parts[3])
+            if kind not in kinds:
                 continue
-            rows.append((int(rid), parts[1].strip(), parts[4].strip()))
-            if len(rows) >= limit:
+            entries.append({"id": int(rid), "ts": parts[1].strip(), "hint": parts[4].strip(), "kind": kind})
+            if len(entries) >= limit:
                 break
-        return rows
+        return entries
+
+    def _tool_use_index_rows(self, exclude=(), kind="tool", limit=None):
+        """system prompt 顯示用的 [(編號, 時間, 描述)]：kind="tool" 是工具使用檢索清單那一區（工具回傳與附圖分析混在一起、
+        依時間排，附圖分析的描述前面加〔附圖分析〕）；"conversation" 是過去的對話片段那一區；None 是全部。
+        system prompt 的兩區（_tool_use_index_block、_conversation_index_block）與動態區的最新一筆共用。"""
+        kinds = {"tool": ("tool", "vision"), "conversation": ("conversation",)}.get(kind, ("tool", "vision", "conversation"))
+        return [(e["id"], e["ts"], (VISION_MARK if e["kind"] == "vision" else "") + e["hint"])
+                for e in self._index_entries(exclude, kinds, limit)]
 
     def _tool_use_catalog(self, exclude=()):
         """交給獨立 session 的檢索清單文字與可接受的編號集合（_validate_related 用）；清單空時回 ("", set())。"""
-        tools = self._tool_use_index_rows(exclude, kind="tool")
-        convs = self._tool_use_index_rows(exclude, kind="conversation", limit=CONVERSATION_ARCHIVES_SHOW)
-        lines = [f"#{rid}（{ts}，工具回傳）：{hint}" for rid, ts, hint in tools]
-        lines += [f"#{rid}（{ts}，過去的對話片段）：{hint}" for rid, ts, hint in convs]
-        return "\n".join(lines), {rid for rid, _, _ in tools + convs}
+        entries = self._index_entries(exclude, ("tool", "vision"))
+        entries += self._index_entries(exclude, ("conversation",), CONVERSATION_ARCHIVES_SHOW)
+        lines = [f"#{e['id']}（{e['ts']}，{KIND_LABELS[e['kind']]}）：{e['hint']}" for e in entries]
+        return "\n".join(lines), {e["id"] for e in entries}
 
     def _tool_use_index_hint(self, result_id):
         """tools_use_index.md 裡某編號的關聯敘述（同編號有多筆時以最後一筆為準）；沒有就回空字串。_result_recall 拿它當背景。"""
@@ -149,9 +172,10 @@ class ToolUseIndexMixin:
         """把這筆任務導向擷取記進 tools_use_index.md：日後（可能是完全不同一次啟動、不同 session）main
         session 才有機會發現「現在的問題」跟「某次工具回傳」有關，進而用 result_recall 依編號重新讀原文提煉——
         這不是給模型翻找細節用的（細節查 result_grep／result_view），只存一句話關聯敘述，不存原文。
-        三個地方會呼叫：summarize_tool_result 處理「原始工具」的大量回傳（result_* 這類看舊存檔的衍生輸出不記，見
+        四個地方會呼叫：summarize_tool_result 處理「原始工具」的大量回傳（result_* 這類看舊存檔的衍生輸出不記，見
         DERIVED_RESULT_SCRIPTS）、claude_code 模式的大量原文（raw_result_for_context）、壓縮時存下的對話片段
-        （_archive_conversation_segment，描述是 segment_hint）。永遠 append、不受 _prune_tool_results 影響，即使原始檔
+        （_archive_conversation_segment，描述是 segment_hint）、附圖的視覺分析（archive_vision_result，描述是視覺模型寫的
+        index_hint）。永遠 append、不受 _prune_tool_results 影響，即使原始檔
         之後被清掉也留著當歷史軌跡；system prompt 依種類分兩區各顯示最近幾筆（_tool_use_index_block、_conversation_index_block）。沒有 result_id、拿不到檔名、或
         模型沒給出 index_hint 時不寫——沒檔名代表原文根本沒存成功，寫了也是死線索。描述整句照存、不截斷（tidy_hint）。
         檔名只是給人看／除錯用，模型只需要抄編號（編號從啟動時的最大存檔編號續編，跨 session 不重複）。"""
