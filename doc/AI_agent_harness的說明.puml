@@ -6,16 +6,34 @@ skinparam nodesep 60
 skinparam shadowing false
 skinparam defaultFontName "Microsoft JhengHei"
 
-title AI_agent_harness 架構：一個主 session 負責「挑技能」，一次性獨立 session 負責「讀原文」
+title AI_agent_harness 架構：一個主 session 負責「挑技能」，一次性獨立 session 負責「讀原文」與「看影像」
 
 rectangle NodeUser #F5F5F5 [
   **使用者介面**
   CLI：agent_core/cli.py（python3 Agent_Runner.py）
   Web：web_app/（python3 web_console.py；重用 SkillAgent，不重寫規則）
   ----
-  * 輸入：自然語言任務、slash 指令、附圖、/skill 手動載入規格
+  * 輸入：自然語言任務、slash 指令、/skill 手動載入規格、
+    附圖（Web：框選螢幕或上傳；CLI 沒有附圖）
   * 顯示：reply；每次工具回傳兩張卡——完整原文（#編號）
-    與「AI 實際收到的內容」；決策／Plan／make_skill 按鈕
+    與「AI 實際收到的內容」；視覺分析卡（#編號）；
+    決策／Plan／make_skill 按鈕
+]
+
+rectangle NodeVision #DDEEF6 [
+  **vision/（多模態影像 library：影像只在這裡，不進主對話）**
+  ----
+  * session.py：擷取螢幕 → 框選裁切，或上傳 → 影像清單
+    （每張記來源：螢幕框選／檔名）；送出新任務時一次取出
+  * extraction.py：extract()＝給決策 AI 的結構化提取
+    每張：文字（照抄）→ 畫面 → 個體〔名稱來源〕→ 背景；
+    全部：影像之間 → 線索 → 無法判斷 → 重點 → index_hint
+    使用者的說明＝關注方向、命名提示、補充屬性
+    schema 固定張數、陣列與字串有上限；JSON 壞掉改問純文字
+  * inference.py：analyze()＝唯一呼叫視覺模型的地方
+    （VISION_MODEL、逾時與錯誤分類）
+  * 另外兩個使用者：image_inspect 技能（對影像檔路徑）、
+    subagent/screen_gemma4_web.py（獨立的框選工具）
 ]
 
 rectangle NodeAgent #D1E5F0 [
@@ -31,6 +49,8 @@ rectangle NodeAgent #D1E5F0 [
   * 替模型維護狀態：工作目錄、目標容器、任務線、計畫
   * 上下文超過水位就壓成滾動摘要（使用者原話逐字保留、
     被壓掉的對話存檔）
+  * 附圖：主對話只收到 [vision result] 文字（附存檔編號），
+    存成 #編號〔附圖分析〕；壓縮時當系統內容、不算使用者原話
 ]
 
 rectangle NodeLLM #FFE6CC [
@@ -50,8 +70,7 @@ rectangle NodeSub #FCE5CD [
     （兩者共用 _extract_task_oriented：回答／事實／未涵蓋／
      延伸方向／index_hint／related_records ＋下一步建議）
   * 滾動壓縮 summarize_messages：舊對話 → 融合摘要
-  * 視覺 sub-session：附圖 → 結構化提取（文字→畫面→個體→背景、
-    線索、重點、index_hint），存成 #編號
+  * 視覺 sub-session：在 vision/（附圖 → 結構化提取），同樣做完即丟
   * /make_skill 草擬：操作軌跡 → 技能草稿 JSON
 ]
 
@@ -61,7 +80,9 @@ rectangle NodeSkills #D5E8D4 [
   * SKILLS.md：一行一個技能（常駐 system prompt）
   * tools/<name>.md：規格（按需載入，附技能經驗記憶）
   * scripts/<name>_cmd.py：真正執行的腳本
-  * 檔案系統／容器與 ROS2／調度系統／存檔回查／記憶
+  * 檔案系統／容器與 ROS2／調度系統／多模態／存檔回查／記憶
+  * image_inspect：對影像檔路徑呼叫 vision.analyze()，
+    結果跟一般工具回傳一樣存檔、摘要
   * 慣例：stdout 以 [PASS]／[ERROR] 開頭；計數、排序、門檻由腳本算
 ]
 
@@ -88,20 +109,23 @@ rectangle NodeStore #E1D5E7 [
   * Memory.md（整份常駐）、skills_system/memory/<name>.md（綁技能）
 ]
 
-NodeUser -down-> NodeAgent : 任務／slash／附圖
+NodeUser -down-> NodeAgent : 任務／slash
 NodeAgent -up-> NodeUser : reply、原文卡片、\nAI 實際收到的內容
 NodeAgent -right-> NodeLLM : system prompt + 對話歷史
 NodeLLM -left-> NodeAgent : {thought, reply, action}
-NodeAgent -[#996633]right-> NodeSub : 原文 + 使用者問題 +\n檢索清單／舊對話／影像／軌跡
-NodeSub -[#996633]left-> NodeAgent : 重點 + 下一步建議／\n新摘要／影像文字／草稿
+NodeAgent -[#996633]right-> NodeSub : 原文 + 使用者問題 +\n檢索清單／舊對話／軌跡
+NodeSub -[#996633]left-> NodeAgent : 重點 + 下一步建議／\n新摘要／草稿
+NodeUser -[#1F77B4,bold]right-> NodeVision : **附圖＋使用者的說明（Web）**
+NodeVision -[#1F77B4,bold]down-> NodeAgent : **[vision result] 提取文字**\n（併進那則使用者訊息）\n＋存成 #編號〔附圖分析〕
 NodeAgent -down-> NodeSkills : 技能名稱 → 回規格文件（不執行）
 NodeAgent -[#CC6600,bold]down-> NodeSkills : 腳本路徑 → subprocess
 NodeSkills -down-> NodeWorld : docker exec／HTTP／檔案操作
 NodeWorld -up-> NodeSkills : 原始輸出
 NodeSkills -[#009933,bold]up-> NodeAgent : [PASS]／[ERROR] 完整輸出\n+ [CWD_CHANGED]／[TARGET_CONTAINER]
-NodeAgent -left-> NodeStore : 存檔原文、檢索描述、軌跡、\n摘要歸檔、耗時
+NodeAgent -left-> NodeStore : 存檔原文、附圖分析、檢索描述、\n軌跡、摘要歸檔、耗時
 NodeStore -right-> NodeAgent : 檢索清單、最新摘要與使用者原話、\n常駐記憶；recall 讀回原文
 NodeLLM -[hidden]down-> NodeSub
+NodeVision -[hidden]down-> NodeLLM
 
 note right of NodeLLM
   **兩階段按需載入：**

@@ -13,15 +13,29 @@ rectangle State1 #D1E5F0 [
   * slash 指令由 harness 直接處理，不進模型
   * 文字任務：set_current_task 記任務線（最近 3 句）與說話時間；
     上一個已核准的計畫自動清除
-  * 附圖：先由視覺 session 轉成文字附在訊息後
+  * 附圖（Web）：只有新任務會取出影像清單，先做視覺提取（1b）；
+    只附圖沒打字時，使用者訊息用預設的描述提示詞
   * /skill：規格以 [skill loaded] 附在訊息後
+]
+
+rectangle StateVision #DDEEF6 [
+  **1b. 附圖的視覺提取（Web，這則新任務有附圖時）**
+  * 輸入：影像＋來源（螢幕框選／檔名、尺寸）＋使用者的說明
+    （關注方向、命名提示、補充屬性；沒打字＝依順序完整提取）
+  * 視覺 session（VISION_MODEL，做完即丟）回結構化 JSON，排成：
+    重點 → 每張 文字（照抄）→ 畫面 → 個體〔名稱來源〕→ 背景
+    → 影像之間 → 線索 → 無法判斷
+  * 成功 → 存成 #編號（vision_extract），index.md 回答＝重點，
+    檢索清單記一筆（index_hint，標〔附圖分析〕）；失敗 → [ERROR]，不存
+  * 併成一則使用者訊息：原文 ＋ [vision result]（存檔編號、
+    用法說明、提取文字）——影像本身永遠不進主對話
 ]
 
 rectangle State2 #F5F5F5 [
   **2. Prompt**
   system prompt（只放不常變的）：AGENT.md → Context Mode 規則
   → Memory.md（整份）→ 滾動摘要 → 使用者原話
-  → SKILLS.md → **工具使用檢索清單（最近 30 筆）**
+  → SKILLS.md → **工具使用檢索清單（最近 30 筆，含〔附圖分析〕）**
   動態區（接在最後一則訊息後、不寫進歷史）：
   Current Agent State → Objective → 核准的計畫 → 清單最新一筆
   ----
@@ -58,6 +72,8 @@ rectangle State5 #D5E8D4 [
   **5. Execute**
   * 一般技能：subprocess 執行腳本（cwd＝工作目錄；
     env 帶目標容器、存檔目錄；腳本自帶逾時＋600 秒防線）
+  * image_inspect（對影像檔路徑）也是一般技能：腳本裡呼叫
+    vision.analyze()，結果照一般工具回傳處理
   * result_recall：讀出存檔原文 → 獨立 session 依
     使用者的問題提煉（見「工具回傳管線」圖）
 ]
@@ -97,6 +113,8 @@ rectangle State7 #E1D5E7 [
   * 超過軟水位（NUM_CTX×60%）：claude_code 先清除舊回傳；
     還超過且可壓內容夠多 → 舊訊息 + 上一份摘要融合成新摘要、
     歸檔（使用者原話逐字保留、被壓掉的對話存成 #編號）
+  * [vision result] 當系統內容：不算使用者原話、不寫成偏好；
+    整段留在被壓掉的對話存檔裡，附圖分析本身另有 #編號
 ]
 
 rectangle State8 #DDEBF7 [
@@ -104,6 +122,8 @@ rectangle State8 #DDEBF7 [
   * 對話裡的摘要已經有那個名稱／數值 → 直接回答
   * 在接續某份存檔（清單或剛才的摘要）
     → result_recall <編號>[,<編號>] "使用者的話"
+  * 追問之前附的圖（清單標〔附圖分析〕）→ result_recall <編號>
+    （原圖沒有保存，只能根據當時的分析文字；沒寫到的請使用者重新附圖）
   * 問的是「現在」「目前」→ 重新執行工具
 ]
 
@@ -111,6 +131,7 @@ rectangle StatePlan #F8CECC [
   **Plan 模式（/plan on、Plan 鈕，或直接 /plan add）**
   * 規劃 session 產生草稿（不進主對話），系統保存
   * /plan add／edit／del／move 直接改；用說的改＝AI 只給操作
+  * 有附圖時先做 1b：規劃 session 拿到的是併好提取文字的訊息
   * y 核准 → 任務＋計畫進主對話、進度在動態區、自動推進
   * /plan_exec_guard on：計畫外會改狀態的技能不執行、
     停下來自動提醒；連續失敗 3 次退出計畫
@@ -123,7 +144,9 @@ rectangle StateSkill #ECECEC [
 ]
 
 ' --- 邏輯流向 ---
-State1 -down-> State2
+State1 -down-> State2 : 沒有附圖
+State1 -[#1F77B4,bold]left-> StateVision : **有附圖（Web）**
+StateVision -[#1F77B4,bold]down-> State2 : 原文＋[vision result]
 State2 -down-> State3
 State3 -down-> StateGuard
 StateGuard -down-> State4 : 不用確認／同意

@@ -11,9 +11,9 @@
 
 | 圖 | 來源 | 內容 |
 |---|---|---|
-| ![架構](images/AI_agent_harness的說明.png) | `AI_agent_harness的說明.puml` | 元件與資料流 |
-| ![一回合](images/AI_agent_harness的狀態轉移.png) | `AI_agent_harness的狀態轉移.puml` | 一回合的狀態機 |
-| ![工具回傳管線](images/AI_agent_harness的工具回傳管線.png) | `AI_agent_harness的工具回傳管線.puml` | 原文存檔 → 摘要 → 檢索清單 → result_recall |
+| ![架構](images/AI_agent_harness的說明.png) | `AI_agent_harness的說明.puml` | 元件與資料流；`vision/`（框選／上傳 → 結構化提取 → `[vision result]`）與使用者介面、SkillAgent、技能、存檔的關係 |
+| ![一回合](images/AI_agent_harness的狀態轉移.png) | `AI_agent_harness的狀態轉移.puml` | 一回合的狀態機；附圖時的視覺提取（1b），以及附圖分析在 prompt、壓縮、下一句話裡的位置 |
+| ![工具回傳管線](images/AI_agent_harness的工具回傳管線.png) | `AI_agent_harness的工具回傳管線.puml` | 原文存檔 → 摘要 → 檢索清單 → result_recall；中段是附圖的影像分析（提取 → 存成 #編號 → 〔附圖分析〕進清單 → 併進訊息），同一套 recall |
 
 改完 `.puml` 後重新產生 PNG（純標準庫，透過 PlantUML 官方伺服器，需要網路）：
 

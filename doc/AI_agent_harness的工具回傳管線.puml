@@ -6,11 +6,16 @@ skinparam ActivityBackgroundColor #FFF8E7
 skinparam ActivityBorderColor #996633
 skinparam NoteBackgroundColor #FFFFE0
 
-title 工具回傳管線：原文一定存檔；harness 模式太長才交給獨立 session 讀，claude_code 模式原文給模型自己查；之後用 result_recall 回去讀原文
+title 工具回傳管線：原文一定存檔；harness 模式太長才交給獨立 session 讀，claude_code 模式原文給模型自己查；\n附圖的影像分析也存成 #編號、進同一份檢索清單；之後用 result_recall 回去讀原文
 
 partition "這一次的工具回傳" {
 start
 :main session 決定執行一個腳本（action＝腳本路徑）;
+note right
+  image_inspect（對影像檔路徑做視覺分析）
+  也是一般腳本，走這一套；
+  Web 附圖不走這裡，見下一段
+end note
 :執行腳本，完整原文存成 **#編號**
 （每次都存，之後隨時可以回來讀）;
 if (結果要加入主對話？
@@ -30,7 +35,8 @@ result_recall 哪一個，由 main session 自己決定;
   else (harness 模式，太長)
     :**① 告訴獨立 session「使用者想知道什麼」**
 使用者最近說的幾句話＋main session 為什麼執行這一步
-＋其他存檔的一句話描述（工具使用檢索清單）; <<#FCE5CD>>
+＋其他存檔的一句話描述（工具使用檢索清單，
+每筆標種類：工具回傳／附圖分析／過去的對話片段）; <<#FCE5CD>>
     :**② 獨立 session 讀完整原文，回答四件事**
 ・重點：回答、相關事實、錯誤
 ・還缺什麼：原文裡找不到的（未涵蓋）
@@ -57,10 +63,40 @@ endif
 stop
 }
 
+partition "附圖的影像分析（Web：框選螢幕或上傳，跟工具回傳並列的另一種來源）" {
+start
+:使用者附圖並送出新任務
+（使用者的說明＝關注方向、命名提示、補充屬性；
+只附圖沒打字＝依順序完整提取）;
+:**視覺 session 讀影像**（VISION_MODEL，做完即丟）
+依 schema 依序提取——每張：文字（照抄）→ 畫面 → 個體〔名稱來源〕→ 背景；
+全部：影像之間 → 線索 → 無法判斷 → 重點 → 一句話描述（index_hint）
+（張數固定、陣列與字串有上限，輸出不會失控）; <<#DDEEF6>>
+if (JSON 能解析？) then (能)
+  :排成固定格式的文字
+（重點放最上面，index_hint 不放進去）; <<#DDEEF6>>
+else (不能)
+  :極少數例外（例如碰到輸出上限）：
+改用純文字格式再問一次（斷掉的 JSON 不進主對話）; <<#DDEEF6>>
+endif
+:存成 **#編號**（vision_extract）；index.md 的回答欄＝重點；
+**一句話描述寫進工具使用檢索清單**（顯示時標〔附圖分析〕）;
+:原文 ＋ [vision result]（存檔編號、用法說明、提取文字）
+併成一則使用者訊息交給 main session;
+note right
+  **不經過工具摘要**：這段文字是影像唯一的表示，
+  砍成成功／失敗就沒有資訊了（太長只標 ⚠️）
+  **原圖不保存**：保留上限另計（100 份），
+  工具回傳的輪替不會刪到它
+  **分析失敗**（[ERROR]）不存、不進清單
+end note
+stop
+}
+
 partition "之後任何一回合（可以是下一次啟動）" {
 start
 :每一輪的 system prompt 尾端都附上 **工具使用檢索清單**
-（最近 30 筆「#編號（時間）：一句話描述」）;
+（最近 30 筆「#編號（時間）：一句話描述」，附圖分析標〔附圖分析〕）;
 :使用者說一句話;
 if (對話裡已經有使用者要的那個名稱或數值？) then (有)
   :直接回答（不用 recall）;
@@ -86,6 +122,9 @@ elseif (在追問某份存檔？
     **claude_code 模式**：不做自動追問，
     結尾只陳述原文在哪、哪裡沒涵蓋，
     下一步由 main session 決定
+    **〔附圖分析〕的存檔**：原圖沒有保存，
+    獨立 session 只能根據當時的分析文字回答，
+    沒寫到的細節請使用者重新附圖
   end note
   stop
 elseif (問的是「現在」「目前」的狀態？) then (是)
