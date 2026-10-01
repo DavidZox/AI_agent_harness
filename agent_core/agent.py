@@ -72,9 +72,6 @@ class SkillAgent(ConversationMixin, PromptMixin, DispatchMixin, GuardMixin, Cont
 
         # 技能規格文件（OKF：Open Knowledge Format）目錄，每個技能一份 tools/<name>.md
         self.tools_dir = os.path.join(self.base_path, "tools")
-        # 技能綁定的經驗記憶目錄，每個技能一份 memory/<name>.md（由 modify_memory --skill 寫入）。
-        # 載入規格文件時自動附在後面，跟規格文件同一套按需載入；全域記憶仍在 Memory.md 常駐。
-        self.skill_memory_dir = os.path.join(self.base_path, "memory")
 
         # =========================
         # 🧠 Token Tracker（真實 token 尺度，見檔尾 NUM_CTX / TOKEN_THRESHOLD 說明）
@@ -147,14 +144,20 @@ class SkillAgent(ConversationMixin, PromptMixin, DispatchMixin, GuardMixin, Cont
         self.last_tool_summary = None         # 最近一次工具回傳任務導向摘要的統計（structured／input_tokens／omitted_chars…）
 
         # =========================
-        # 🧩 操作軌跡與 make_skill（見檔尾 SKILL_MODEL / MAKE_SKILL_SCHEMA 說明）
+        # 🧩 操作軌跡、對話紀錄與 make_skill
         # trajectory：run_tool 每執行一支腳本就記一筆（指令、參數、當時的 cwd、成功／失敗、輸出開頭），
-        #   另有 kind="boundary" 的起點記錄（/clear、計畫核准、上一次 make_skill）。存在 messages 之外，
-        #   上下文壓縮不會沖掉，/make_skill 從這裡取「做對的步驟」編譯成組合技能，而不是靠模型回憶。
+        #   另有 kind="boundary" 的起點記錄（/clear、計畫核准、上一次 make_skill）。
+        # transcript：這個 session 每一則對話訊息的副本（使用者的話、AI 的想法／回覆／action、當時進上下文的工具回傳），
+        #   只增不減；transcript_starts 記每個起點在 transcript 的位置。兩者都在 messages 之外，壓縮、/clear、
+        #   claude_code 的清除都不會沖掉——/make_skill 從這裡取「整段對話＋工具回傳」交給草擬 session 寫流程技能的規格。
         # pending_skill_draft：等待使用者核准／修改／取消的技能草稿（CLI 與 Web 共用同一份狀態）。
         # =========================
         self.session_id = time.strftime("%Y%m%d_%H%M%S")
         self.trajectory = []
+        self.transcript = []
+        self._transcript_refs = []     # 記過的訊息 dict 本身（留著參照，id() 才不會被新物件重複使用）
+        self._transcript_ids = set()
+        self.transcript_starts = [{"reason": "start", "pos": 0, "ts": time.strftime("%m-%d %H:%M:%S")}]
         # 編號跨 session 全域遞增：從既有存檔（logs/tool_results/）的最大編號續編。純數字的 #16 才能在任何一次啟動
         # 都指到同一份存檔——工具使用檢索清單（_tool_use_index_block）就是靠這個讓模型只需要抄編號、不必抄檔名。
         # 配號走 _next_id（上鎖：背景壓縮也會為被壓縮的對話片段配號）。

@@ -44,5 +44,5 @@
 - [result_list](tools/result_list.md) — 檢索清單裡沒有相關的一筆、或要瀏覽更早／更多的存檔時，列出存檔索引（編號、腳本、任務、摘要回答）
 
 ## 記憶修改
-- [modify_memory](tools/modify_memory.md) — 寫入經驗記憶：預設全域常駐；加 `--skill <技能名稱>` 綁定該技能，只在載入其規格時出現
+- [modify_memory](tools/modify_memory.md) — 寫入經驗記憶：使用者明確要求記住時，寫進每輪常駐的 Memory.md
 

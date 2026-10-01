@@ -99,11 +99,14 @@ SUMMARY_MODEL = os.environ.get("AGENT_SUMMARY_MODEL", "").strip() or None
 # /parallel_cal 的預設值（CLI 與 Web Console 啟動時的初始狀態），可用 AGENT_PARALLEL_CAL=1 開啟。
 PARALLEL_CAL_DEFAULT = os.environ.get("AGENT_PARALLEL_CAL", "").strip().lower() in ("1", "on", "true", "yes")
 
-# 🧩 make_skill：把使用者引導 Agent「做對」的操作軌跡編譯成新的組合技能（SkillAgent.start_skill_draft 起）。
-# 草擬用的模型預設同摘要模型（AGENT_SUMMARY_MODEL，再退回主模型）；這是離線、一次性的工作，記憶體夠的話可用
-# AGENT_SKILL_MODEL 指定較大的模型（例如 gemma4:26b）提高參數化與描述的品質。模型只填 JSON，不寫程式。
+# 🧩 make_skill：把使用者引導 Agent「做對」的一段對話（使用者的話、AI 的判斷、工具回傳）整理成流程技能的規格
+# （SkillAgent.start_skill_draft 起）。不產生腳本：步驟只呼叫既有技能的腳本，其餘是向使用者確認、檢查回傳、告知。
+# 草擬用的模型預設同摘要模型（AGENT_SUMMARY_MODEL，再退回主模型）；這是離線、一次性的工作，要從整段對話推論流程，
+# 記憶體夠的話建議用 AGENT_SKILL_MODEL 指定較大的模型（例如 gemma4:26b）。模型只填 JSON，排版由程式做。
 SKILL_MODEL = os.environ.get("AGENT_SKILL_MODEL", "").strip() or None
-MAKE_SKILL_MAX_PREDICT = 3000
+MAKE_SKILL_MAX_PREDICT = 4000
+# 交給草擬 session 的對話紀錄上限（tokens）：超過時先縮短工具回傳（保留頭尾），還不夠才從最舊的訊息開始省略
+MAKE_SKILL_TRANSCRIPT_TOKENS = int(os.environ.get("AGENT_MAKE_SKILL_TRANSCRIPT_TOKENS", "16000"))
 TRAJECTORY_LOG = "trajectory.jsonl"   # logs/ 下的軌跡稽核記錄（每次腳本執行一行，跨 session 追加；已 .gitignore）
 
 # 📄 工具結果存檔：每次腳本執行的完整原始輸出都存成 logs/tool_results/<session>_<id>_<腳本>.md（key: value 檔頭 + 原文），
@@ -134,7 +137,7 @@ TASK_HISTORY_KEEP = 3   # 任務線：摘要錨點帶最近幾則使用者訊息
 TRAJECTORY_OUTPUT_HEAD = 300          # 每筆軌跡保留的輸出開頭字元數（讓草擬模型知道結果長什麼樣）
 DEFAULT_SKILL_CATEGORY = "自建技能"   # 模型選的分類不在 SKILLS.md 裡時的落點（沒有這個段落會自動建立）
 SKILL_NAME_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_]{1,40}$")
-# 會改變狀態（建容器、送工單、寫記憶、切換目錄／容器）的技能：組合技能含這些步驟時，預覽會提醒「重播驗證會真的執行」
+# 會改變狀態（建容器、送工單、寫記憶、切換目錄／容器）的技能：流程技能的步驟用到它們時，草稿預覽與規格會提醒（執行時照常確認）
 NON_READONLY_SKILLS = {"docker_est", "workpackage_send", "workpackage_cancel", "overpending_cancel", "modify_memory", "change_dir", "docker_open"}
 
 # 使用者角色但實為工具回傳的訊息前綴（見 _split_for_compression 的配對規則）
@@ -180,6 +183,9 @@ RECALL_MAX_RECORDS = 3   # result_recall 一次最多讀幾份存檔（交給同
 # 對這類結果一律放行、不套用 TOOL_RESULT_TOKEN_THRESHOLD，Web Console 也不標記 ⚠️。
 # 規格書本身仍應維持精簡（以 400 tokens／約 800 字元以內為原則），節省每次載入的上下文成本。
 SKILL_DOC_PREFIX = "📘 已載入技能"
+# /make_skill 產生的流程技能：規格 frontmatter 的 type。沒有自己的腳本，步驟是「執行既有技能／向使用者確認／檢查回傳／告知」，
+# 載入時告訴模型照步驟一步一步做（dispatch），也不拿它來對照「腳本屬於哪個技能」（trajectory._script_skill_map）。
+PROCEDURE_DOC_TYPE = "Procedure"
 
 # =========================================================
 # 🔀 上下文管理模式（/context_mode harness|claude_code；AGENT_CONTEXT_MODE 設預設值）

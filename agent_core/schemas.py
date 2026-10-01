@@ -25,43 +25,63 @@ AGENT_REPLY_SCHEMA = {
     "required": ["thought", "reply", "action"],
 }
 
-# 技能草稿的 JSON schema（Ollama format=）：欄位意義見 SkillAgent._make_skill_prompts，驗證見 _normalize_skill_draft。
+# /make_skill 的流程技能草稿（Ollama format=）：欄位意義見 SkillAgent._make_skill_prompts，驗證見 _normalize_skill_draft。
+# 欄位順序＝生成順序：先讀完對話寫用途，再逐條列出使用者的要求（requirements），然後才寫需要的資訊與步驟——實測
+# 直接寫步驟時，e4b 與 26b 都會漏掉使用者說過的條件（「低電量的車不要派任務」「派之前先跟我確認」）；
+# 最後才寫標題與索引描述（根據寫好的內容總結）。
+# 陣列與字串都有上限（同視覺提取的教訓：小模型偶爾會在陣列或字串裡失控，有上限就一定是合法的 JSON）。
+MAKE_SKILL_STEP_KINDS = ["執行", "確認", "檢查", "告知"]
+
+
+def _text(n):
+    return {"type": "string", "maxLength": n}
+
+
 MAKE_SKILL_SCHEMA = {
     "type": "object",
     "properties": {
-        "title": {"type": "string"},
-        "description": {"type": "string"},
-        "category": {"type": "string"},
-        "purpose": {"type": "string"},
-        "parameters": {
+        "purpose": _text(400),
+        "requirements": {
             "type": "array",
+            "maxItems": 8,
             "items": {
                 "type": "object",
-                "properties": {
-                    "name": {"type": "string"},
-                    "description": {"type": "string"},
-                    "example": {"type": "string"},
-                },
-                "required": ["name", "description", "example"],
+                "properties": {"said": _text(150), "rule": _text(150), "step": {"type": "integer"}},
+                "required": ["said", "rule", "step"],
+            },
+        },
+        "inputs": {
+            "type": "array",
+            "maxItems": 8,
+            "items": {
+                "type": "object",
+                "properties": {"name": _text(40), "description": _text(120), "source": _text(80), "example": _text(120)},
+                "required": ["name", "description", "source", "example"],
             },
         },
         "steps": {
             "type": "array",
+            "maxItems": 15,
             "items": {
                 "type": "object",
                 "properties": {
-                    "step_id": {"type": "integer"},
-                    "include": {"type": "boolean"},
-                    "purpose": {"type": "string"},
-                    "args": {"type": "array", "items": {"type": "string"}},
+                    "kind": {"type": "string", "enum": MAKE_SKILL_STEP_KINDS},
+                    "instruction": _text(300),
+                    "skill": _text(40),
+                    "command": _text(300),
+                    "on_failure": _text(200),
                 },
-                "required": ["step_id", "include", "purpose", "args"],
+                "required": ["kind", "instruction", "skill", "command", "on_failure"],
             },
         },
-        "success_criteria": {"type": "string"},
-        "pitfalls": {"type": "array", "items": {"type": "string"}},
+        "success_criteria": _text(200),
+        "pitfalls": {"type": "array", "maxItems": 8, "items": _text(150)},
+        "title": _text(30),
+        "description": _text(100),
+        "category": _text(40),
     },
-    "required": ["title", "description", "category", "purpose", "parameters", "steps", "success_criteria", "pitfalls"],
+    "required": ["purpose", "requirements", "inputs", "steps", "success_criteria", "pitfalls", "title", "description",
+                 "category"],
 }
 
 # 融合摘要的 JSON schema：交給 Ollama 的 format= 做結構化輸出，再由 _render_summary_markdown 排版。

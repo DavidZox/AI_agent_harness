@@ -43,7 +43,8 @@ rectangle NodeAgent #D1E5F0 [
     工作目錄、目標容器、核准的計畫每次接在最後一則訊息後（動態區）
   * 呼叫主 session，**只看 action** 派發；
     會改變實體狀態的動作先由程式請使用者確認
-  * 執行腳本 → 記軌跡 → 原文存檔 #編號
+  * 執行腳本 → 記軌跡 → 原文存檔 #編號；
+    每則訊息另留一份對話紀錄（/make_skill 用，壓縮與 /clear 都不影響）
   * 依上下文模式決定工具回傳怎麼進主對話：
     harness＝獨立 session 擷取重點；claude_code＝原文（太大保留頭尾）
   * 替模型維護狀態：工作目錄、目標容器、任務線、計畫
@@ -71,14 +72,16 @@ rectangle NodeSub #FCE5CD [
      延伸方向／index_hint／related_records ＋下一步建議）
   * 滾動壓縮 summarize_messages：舊對話 → 融合摘要
   * 視覺 sub-session：在 vision/（附圖 → 結構化提取），同樣做完即丟
-  * /make_skill 草擬：操作軌跡 → 技能草稿 JSON
+  * /make_skill 草擬：整段對話＋工具回傳＋操作軌跡 → 流程技能的規格
+    （步驟：執行既有技能／確認／檢查／告知；不產生腳本）
 ]
 
 rectangle NodeSkills #D5E8D4 [
   **skills_system/（模型能做的事只有這些）**
   ----
   * SKILLS.md：一行一個技能（常駐 system prompt）
-  * tools/<name>.md：規格（按需載入，附技能經驗記憶）
+  * tools/<name>.md：規格（按需載入；/make_skill 產生的流程技能
+    type: Procedure，沒有自己的腳本）
   * scripts/<name>_cmd.py：真正執行的腳本
   * 檔案系統／容器與 ROS2／調度系統／多模態／存檔回查／記憶
   * image_inspect：對影像檔路徑呼叫 vision.analyze()，
@@ -106,7 +109,7 @@ rectangle NodeStore #E1D5E7 [
     可以 result_recall；原圖不保存，保留上限另計（100 份）
   * trajectory.jsonl（操作軌跡）、summary_*.md／.json（滾動摘要＋
     使用者原話）、perf.jsonl（每次模型呼叫的耗時）
-  * Memory.md（整份常駐）、skills_system/memory/<name>.md（綁技能）
+  * Memory.md（長期記憶，整份常駐；記憶只寫這裡）
 ]
 
 NodeUser -down-> NodeAgent : 任務／slash

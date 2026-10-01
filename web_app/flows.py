@@ -202,15 +202,13 @@ def handle_plan_response(text, events):
 
 
 def handle_skill_draft_response(text, events):
-    """處理使用者對待決定技能草稿的回應（比照計畫核准）：y 核准並註冊、t 先重播驗證再註冊、
-    n／空白取消、其他文字＝修改意見重擬。狀態在 agent.pending_skill_draft（與 CLI 共用）。
-    回傳 "registered" / "cancelled" / "revised" / "failed"（失敗時草稿仍待決定）。"""
+    """處理使用者對待決定技能草稿的回應（比照計畫核准）：y 核准並註冊、n／空白取消、其他文字＝修改意見重擬。
+    狀態在 agent.pending_skill_draft（與 CLI 共用）。回傳 "registered" / "cancelled" / "revised" / "failed"
+    （失敗時草稿仍待決定，例如草稿還引用了不存在的腳本）。"""
     choice = text.strip()
     lower = choice.lower()
-    if lower in ("y", "t"):
-        if lower == "t":
-            events.append({"channel": "system", "text": "🧪 正在以軌跡中的原值重播草稿腳本…"})
-        ok, msg = agent.approve_skill_draft(replay=(lower == "t"))
+    if lower == "y":
+        ok, msg = agent.approve_skill_draft()
         events.append({"channel": "system", "text": msg})
         return "registered" if ok else "failed"
     if choice == "" or lower in ("n", "no"):

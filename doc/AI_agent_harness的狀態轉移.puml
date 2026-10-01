@@ -139,8 +139,11 @@ rectangle StatePlan #F8CECC [
 
 rectangle StateSkill #ECECEC [
   **/make_skill（回合之外）**
-  * 把上一個起點後做對的步驟交給草擬 session 填 JSON
-  * harness 驗證、產生規格＋組合腳本，使用者核准才註冊
+  * 上一個起點後的整段對話＋工具回傳＋操作軌跡交給草擬 session
+    （對話紀錄在 messages 之外，壓縮、/clear 都不影響）
+  * 寫成流程技能的規格：使用者的要求 → 步驟（執行／確認／檢查／告知）
+  * harness 驗證引用的技能與腳本都存在，不產生腳本；使用者核准才註冊
+  * 之後載入它時提醒「沒有自己的腳本，照步驟一步一步做」
 ]
 
 ' --- 邏輯流向 ---

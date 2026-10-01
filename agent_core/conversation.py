@@ -50,6 +50,7 @@ class ConversationMixin:
 
     def ask_ai(self):
         try:
+            self._sync_transcript()   # 對話紀錄（/make_skill 用）：壓縮可能就在下面發生，先抄
             with self.messages_lock:
                 if self.messages and self.messages[0]['role'] == 'system':
                     self.messages[0]['content'] = self.get_system_prompt()

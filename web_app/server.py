@@ -145,7 +145,7 @@ class ConsoleHandler(BaseHTTPRequestHandler):
             self._send_json(build_stats())
             return
         if self.path == "/api/commands":
-            # 「/」選單的內容：功能開關／指令 + SKILLS.md 技能清單（含分類、是否有經驗記憶）
+            # 「/」選單的內容：功能開關／指令 + SKILLS.md 技能清單（含分類）
             self._send_json({"commands": SLASH_COMMANDS, "skills": agent.list_skills()})
             return
         if self.path.startswith("/api/results/"):

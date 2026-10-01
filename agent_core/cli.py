@@ -51,24 +51,25 @@ def _context_content_for_cli(agent, result, tool_tokens, use_summary):
     return content
 
 def _run_make_skill_flow(agent, arg_text):
-    """CLI 的 /make_skill：草擬 → 預覽 → y 核准／t 重播驗證後核准／n 取消／其他文字＝修改意見重擬。
+    """CLI 的 /make_skill：讀這段對話草擬流程技能 → 預覽 → y 核准／n 取消／其他文字＝修改意見重擬。
     與 Web 的 handle_skill_draft_response 用同一套 SkillAgent 狀態機。"""
     parts = arg_text.split()
     if not parts:
-        print("用法：/make_skill <技能名稱> [步驟範圍，例如 3-7、3,5,8 或 all]；先用 /trajectory 查看已記錄的步驟")
+        print("用法：/make_skill <技能名稱> [範圍：省略＝上一個起點之後的對話；或軌跡編號 3-7、3,5,8；或 all]；"
+              "/trajectory 可查編號")
         return
     name, spec = parts[0], (parts[1] if len(parts) > 1 else None)
-    print(f"🧩 正在依操作軌跡草擬技能 {name}（模型 {agent.skill_model}）…")
+    print(f"🧩 正在讀這段對話與工具回傳，草擬流程技能 {name}（模型 {agent.skill_model}）…")
     draft, err = agent.start_skill_draft(name, spec)
     if err:
         print(f"⚠️ {err}")
         return
     print(agent.skill_draft_preview(draft))
     while True:
-        choice = input("\n核准並註冊(y) / 先重播驗證再註冊(t) / 取消(n) / 直接輸入修改意見: ").strip()
+        choice = input("\n核准並註冊(y) / 取消(n) / 直接輸入修改意見: ").strip()
         lower = choice.lower()
-        if lower in ('y', 't'):
-            ok, msg = agent.approve_skill_draft(replay=(lower == 't'))
+        if lower == 'y':
+            ok, msg = agent.approve_skill_draft()
             print(msg)
             if ok:
                 return
@@ -269,7 +270,7 @@ def main():
                 for sk in agent.list_skills():
                     if sk["category"] != cat:
                         cat = sk["category"]; print(f"\n【{cat}】")
-                    print(f"  {sk['name']:<20} {sk['description']}" + ("（含經驗記憶）" if sk["has_memory"] else ""))
+                    print(f"  {sk['name']:<20} {sk['description']}")
                 print("\n輸入 /skill <名稱> 可手動載入規格，隨下一則訊息一起送出")
                 continue
             if user_msg.lower().startswith('/skill ') or user_msg.lower() == '/skill':

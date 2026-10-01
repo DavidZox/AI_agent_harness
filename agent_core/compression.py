@@ -386,6 +386,7 @@ class CompressionMixin:
         self.messages 原地移除（不重綁 list、不靠索引），所以背景壓縮期間主執行緒新 append 的訊息不會遺失；
         然後更新滾動摘要、歸檔、刷新 system prompt。"""
         data = meta.get('data') if isinstance(meta.get('data'), dict) else {}
+        self._sync_transcript()   # 被壓掉的訊息先抄進對話紀錄（/make_skill 用），回合最後一則 AI 回覆可能還沒抄過
         segment_id = self._archive_conversation_segment(compressed, self._segment_hint(compressed, data))
         with self.messages_lock:
             self._keep_user_words(compressed)

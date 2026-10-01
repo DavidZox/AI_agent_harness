@@ -115,7 +115,6 @@
   .slash-item .name { font-family: "Cascadia Code", Consolas, monospace; white-space: nowrap; }
   .slash-item .desc { color: #b8bcc2; font-size: 12px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .slash-item:hover .desc, .slash-item.active .desc { color: #e8eefc; }
-  .slash-item .badge { font-size: 10px; background: #4a4c50; border-radius: 4px; padding: 1px 5px; color: #d8c9a3; white-space: nowrap; }
   .slash-empty { padding: 8px 10px; color: #9aa0a6; }
   #skill-strip { display: none; gap: 6px; flex-wrap: wrap; margin-bottom: 8px; align-items: center; }
   #skill-strip.show { display: flex; }
@@ -173,9 +172,8 @@
     <button class="danger" onclick="sendPlanDecision('n')">🚫 取消任務</button>
   </div>
   <div id="skill-draft-bar">
-    <span>🧩 有技能草稿待你決定（也可以直接在下方輸入修改意見送出，系統會重擬）：</span>
+    <span>🧩 有流程技能的草稿待你決定（也可以直接在下方輸入修改意見送出，系統會重擬）：</span>
     <button onclick="sendSkillDraftDecision('y')">✅ 核准並註冊</button>
-    <button class="secondary" onclick="sendSkillDraftDecision('t')">🧪 重播驗證後註冊</button>
     <button class="danger" onclick="sendSkillDraftDecision('n')">🚫 取消草稿</button>
   </div>
   <div id="attach-strip"><span id="attach-hint">📎 已附加影像（送出時一起分析）：</span></div>
@@ -282,7 +280,7 @@ function renderEvents(events) {
     } else if (ev.channel === 'plan') {
       renderEntry(chatLog, 'plan', '📝 計畫', ev.text);
     } else if (ev.channel === 'skilldraft') {
-      renderEntry(chatLog, 'skilldraft', `🧩 技能草稿 ${ev.name}（待你決定：核准／重播驗證／取消，或送出修改意見）`, ev.text);
+      renderEntry(chatLog, 'skilldraft', `🧩 技能草稿 ${ev.name}（待你決定：核准／取消，或送出修改意見）`, ev.text);
     } else if (ev.channel === 'system') {
       renderEntry(toolLog, 'system', '系統', ev.text);
     }
@@ -577,10 +575,9 @@ function updateSlashMenu() {
   slashItems = []; slashMenu.innerHTML = '';
   const addSection = (title) => { const h = document.createElement('div'); h.className = 'slash-section'; h.textContent = title; slashMenu.appendChild(h); };
   const addGroup = (title) => { const g = document.createElement('div'); g.className = 'slash-group'; g.textContent = title; slashMenu.appendChild(g); };
-  const addItem = (item, nameText, descText, badge) => {
+  const addItem = (item, nameText, descText) => {
     const el = document.createElement('div'); el.className = 'slash-item'; el.dataset.index = slashItems.length;
     const n = document.createElement('span'); n.className = 'name'; n.textContent = nameText; el.appendChild(n);
-    if (badge) { const b = document.createElement('span'); b.className = 'badge'; b.textContent = badge; el.appendChild(b); }
     const d = document.createElement('span'); d.className = 'desc'; d.textContent = descText || ''; el.appendChild(d);
     el.onmousedown = (e) => { e.preventDefault(); selectSlashItem(item); };  // mousedown：避免 textarea 先失焦
     el.onmouseenter = () => setSlashActive(Number(el.dataset.index));
@@ -596,7 +593,7 @@ function updateSlashMenu() {
     let last = null;
     skills.forEach(s => {
       if (s.category !== last) { addGroup(s.category); last = s.category; }
-      addItem({ type: 'skill', ...s }, '/skill ' + s.name, s.description, s.has_memory ? '含經驗記憶' : null);
+      addItem({ type: 'skill', ...s }, '/skill ' + s.name, s.description);
     });
   }
   if (!slashItems.length) { const e = document.createElement('div'); e.className = 'slash-empty'; e.textContent = '沒有符合的指令或技能'; slashMenu.appendChild(e); }

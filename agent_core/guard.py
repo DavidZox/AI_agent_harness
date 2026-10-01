@@ -3,8 +3,8 @@
 跟 Plan 模式的核准關卡同一個原則：確認由程式路徑保證，不靠模型記得要先問。判斷在這裡（guard_check），
 執行在 DispatchMixin.run_tool：沒有 approved=True 就不執行被擋的技能（CLI／Web 以外的呼叫端也一樣擋得住）。
 哪些技能要擋見 config.GUARDED_SKILLS；docker_runcmd 的指令若是唯讀（is_readonly_shell）就放行，
-workpackage_send 加 --dry-run 只顯示不送，也放行。組合技能（make_skill）只要有一步是被擋的技能，整支都要確認。"""
-import json
+workpackage_send 加 --dry-run 只顯示不送，也放行。流程技能（make_skill）沒有自己的腳本，它的每一步都是一般的
+run_tool，被擋的技能照樣在那一步確認。"""
 import os
 import re
 import shlex
@@ -135,25 +135,8 @@ class GuardMixin:
             return "--dry-run" in args
         if skill == "docker_runcmd":
             command = _docker_runcmd_command(args)
-            return "{" not in command and is_readonly_shell(command)   # 組合技能的 {參數} 佔位符看不出實際指令，不放行
+            return "{" not in command and is_readonly_shell(command)   # 含 {…}（例如流程技能沒代入的佔位符）看不出實際指令，不放行
         return False
-
-    @staticmethod
-    def _composite_steps(script_path):
-        """make_skill 產生的組合腳本（資料檔：NAME／PARAMS／STEPS）→ STEPS；不是組合腳本回傳 None。"""
-        try:
-            with open(script_path, encoding="utf-8") as f:
-                text = f.read()
-        except OSError:
-            return None
-        if "from _composite import run_composite" not in text:
-            return None
-        m = re.search(r"^STEPS = (\[.*?\])\n\n", text, re.S | re.M)
-        try:
-            steps = json.loads(m.group(1)) if m else []
-        except ValueError:
-            steps = []
-        return [s for s in steps if isinstance(s, dict)]
 
     def guard_check(self, parsed):
         """這一輪的 action 執行前需不需要使用者確認。回傳 None（不需要），或
@@ -188,20 +171,9 @@ class GuardMixin:
         skill_map = self._script_skill_map()
         skill = skill_map.get(script_name)
         args = self._parse_script_args(script_name, remainder)
-        steps = self._composite_steps(script_path)
-        if steps is not None:
-            guarded = []
-            for st in steps:
-                sk = st.get("skill") or skill_map.get(st.get("script") or "")
-                if sk in GUARDED_SKILLS and not self._guard_exempt(sk, [str(a) for a in st.get("args") or []]):
-                    guarded.append(sk)
-            if not guarded:
-                return None
-            reason = f"組合技能，包含會改變狀態的步驟：{'、'.join(dict.fromkeys(guarded))}"
-        else:
-            if skill not in GUARDED_SKILLS or self._guard_exempt(skill, args):
-                return None
-            reason = _GUARD_REASONS.get(skill, "這個技能會改變系統狀態")
+        if skill not in GUARDED_SKILLS or self._guard_exempt(skill, args):
+            return None
+        reason = _GUARD_REASONS.get(skill, "這個技能會改變系統狀態")
         return {"skill": skill or script_name, "script": script_name,
                 "command": f"scripts/{script_name} {remainder}".strip(), "reason": reason}
 

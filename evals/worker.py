@@ -81,17 +81,6 @@ def evaluate(expect, turn):
         checks["archive_ids"] = all(str(i) in used for i in expect["archive_ids"])
     if "guard" in expect:
         checks["guard"] = bool(turn["guards"]) == expect["guard"]
-    if "memory_skill" in expect:
-        mem = [c for c in turn["tool_calls"] if c["script"] == "modify_memory_cmd.py"]
-        checks["memory_skill"] = any(("--skill" in c["args"] or "--move-last-to-skill" in c["args"])
-                                     and expect["memory_skill"] in c["args"] for c in mem)
-    if "skill_memory_has" in expect:   # 看臨時副本裡的檔案：[技能, 要出現的字]
-        skill, text = expect["skill_memory_has"]
-        path = os.path.join(ROOT, "skills_system", "memory", f"{skill}.md")
-        checks["skill_memory_has"] = os.path.exists(path) and text in open(path, encoding="utf-8").read()
-    if "global_memory_lacks" in expect:
-        mem_text = open(os.path.join(ROOT, "Memory.md"), encoding="utf-8").read() if os.path.exists(os.path.join(ROOT, "Memory.md")) else ""
-        checks["global_memory_lacks"] = not any(t in mem_text for t in expect["global_memory_lacks"])
     return checks
 
 

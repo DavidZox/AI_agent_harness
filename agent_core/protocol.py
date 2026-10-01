@@ -1,7 +1,20 @@
 """回覆協議與訊息包裝：解析主模型的 JSON 回覆、把工具結果包成主對話訊息、判斷回傳是不是規格文件或已提煉的結果。"""
 import json
 import os
-from .config import SKILL_DOC_PREFIX, TOOL_RESULT_FRAME, TOOL_SUMMARY_TAG
+import re
+from .config import PROCEDURE_DOC_TYPE, SKILL_DOC_PREFIX, TOOL_RESULT_FRAME, TOOL_SUMMARY_TAG
+
+_DOC_TYPE_RE = re.compile(r"^type:\s*(\S+)\s*$", re.M)
+
+
+def is_procedure_doc(doc):
+    """規格文件是不是流程技能（frontmatter 的 type: Procedure，/make_skill 產生）：只看開頭的 frontmatter。"""
+    text = str(doc or "")
+    if not text.startswith("---"):
+        return False
+    end = text.find("\n---", 3)
+    m = _DOC_TYPE_RE.search(text[:end if end > 0 else 400])
+    return bool(m) and m.group(1) == PROCEDURE_DOC_TYPE
 
 
 def attach_skill_docs(message, blocks):

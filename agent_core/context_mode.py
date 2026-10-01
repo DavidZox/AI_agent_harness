@@ -127,7 +127,9 @@ class ContextModeMixin:
                         + f"。需要時用 result_view {rid}、result_grep {rid} \"<關鍵字>\" 或 result_recall {rid} \"<問題>\" 取回，"
                           f"不要重新執行同一個工具。")
                 new = "\n".join(x for x in ("[tool result]", frame, body, tail) if x)
-                self.messages[i] = {'role': self.messages[i]['role'], 'content': new}
+                replacement = {'role': self.messages[i]['role'], 'content': new}
+                self._transcript_replaced(self.messages[i], replacement)   # 對話紀錄留的是清除前的原文
+                self.messages[i] = replacement
                 freed += tokens - self.count_tokens(new)
                 cleared += 1
         if cleared:

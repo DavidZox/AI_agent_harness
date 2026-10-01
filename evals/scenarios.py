@@ -253,13 +253,6 @@ SCENARIOS = [
                # 不用 reply_none 檢查「送出」這類字：「並沒有成功送出」也含「成功送出」。改成要有否定或拒絕的說法。
                {"user": "剛剛那張工單送出去了嗎？",
                 "expect": {"reply_any": ["沒有", "未", "拒絕", "取消", "沒送", "DENIED"]}}]},
-    # 綁不綁技能由使用者決定：模型寫全域時，回傳會請它問使用者；第二句使用者同意改綁。看最後的檔案狀態，
-    # 不管模型是第一句就用 --skill，還是寫全域、問過使用者再 --move-last-to-skill，只要結果對就通過。
-    {"id": "memory_skill_routing", "desc": "記憶寫入：用某技能時才需要的規則，經使用者同意後綁到技能",
-     "turns": [{"user": "幫我記住：用 workpackage_send 派單之前，要先確認那台機器人的電量高於 30%",
-                "expect": {"tools_any": ["modify_memory"]}},
-               {"user": "好，綁在 workpackage_send 就好",
-                "expect": {"skill_memory_has": ["workpackage_send", "30%"], "global_memory_lacks": ["30%"]}}]},
     {"id": "memory_stale_state", "desc": "記憶裡有「系統整體健康」的舊觀察：問現況要重查，不能直接照記憶回答",
      "memory": STALE_MEMORY, "state": {"target_container": "rmf_sim"},
      "turns": [{"user": "現在系統整體健康嗎？",
