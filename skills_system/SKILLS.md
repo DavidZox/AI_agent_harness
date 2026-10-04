@@ -12,6 +12,7 @@
 - [find_file](tools/find_file.md) — 依「檔案名稱關鍵字」遞迴搜尋整棵目錄樹，標頭算好找到幾個；要找某目錄裡最新修改的檔案請用 list_dir --newest
 - [change_dir](tools/change_dir.md) — 切換當前工作目錄（注意：後端需維護 CWD 狀態）
 - [view_file](tools/view_file.md) — 查看診斷報告或腳本內容（技能規格文件會由 EXECUTE 自動載入，不用這個）
+- [host_runcmd](tools/host_runcmd.md) — 若要在本機環境直接執行 shell 指令時使用
 
 ## 容器化環境
 - [docker_containers](tools/docker_containers.md) — 列出目前所有容器（名稱、狀態、映像檔），可只看運行中或以關鍵字過濾；要進入容器前先用這個確認完整名稱
@@ -45,4 +46,3 @@
 
 ## 記憶修改
 - [modify_memory](tools/modify_memory.md) — 寫入經驗記憶：使用者明確要求記住時，寫進每輪常駐的 Memory.md
-
