@@ -1,13 +1,13 @@
 ---
 type: Tool
 title: ROS2 Domain ID 查詢與修改
-description: 查詢或修改指定容器（或目標容器）內的 ROS_DOMAIN_ID 環境變數。
-version: 1.0.0
+description: 查詢或修改指定容器（或目標容器）內的 ROS_DOMAIN_ID 環境變數（執行前會自動 source install/setup.bash）。
+version: 1.1.0
 dependencies: ["docker"]
 ---
 
 # 用途
-在指定的 Docker 容器內查看目前的 `ROS_DOMAIN_ID` 環境變數值，或將其設定/修改為新的 Domain ID（介於 0 到 232 之間的整數）。若省略容器名稱，預設使用目前的目標容器。逾時 15 秒。
+在指定的 Docker 容器內查看目前的 `ROS_DOMAIN_ID` 環境變數值，或將其設定/修改為新的 Domain ID（介於 0 到 232 之間的整數）。在執行查詢或修改前，腳本會先自動執行 `source install/setup.bash` 以獲取最新的 ROS 2 工作區環境變數。若省略容器名稱，預設使用目前的目標容器。逾時 15 秒。
 
 # 語法
 `EXECUTE: scripts/ROS2_domain_id_cmd.py [container_name] [new_domain_id]`

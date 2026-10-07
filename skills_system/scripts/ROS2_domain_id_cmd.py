@@ -17,6 +17,9 @@ USAGE = (
     "  - container_name 可省略＝目前的目標容器。"
 )
 
+# 載入 ROS 2 工作區環境變數的前置指令
+SOURCE_ENV_CMD = "[ -f install/setup.bash ] && source install/setup.bash"
+
 
 def parse_cli(argv):
     """
@@ -55,8 +58,8 @@ def parse_cli(argv):
 
 
 def get_domain_id(container):
-    """查詢容器內的 ROS_DOMAIN_ID"""
-    cmd = "echo $ROS_DOMAIN_ID"
+    """先 source install/setup.bash 再查詢容器內的 ROS_DOMAIN_ID"""
+    cmd = f'bash -c "{SOURCE_ENV_CMD} && echo $ROS_DOMAIN_ID"'
     ok, out, err = docker_exec(container, cmd, TIMEOUT_SECONDS, what="查詢 ROS_DOMAIN_ID")
     if not ok:
         return err
@@ -80,8 +83,8 @@ def set_domain_id(container, new_id):
     if not ok:
         return err
 
-    # 2. 驗證變更
-    check_cmd = f"bash -c \"export ROS_DOMAIN_ID={new_id} && echo $ROS_DOMAIN_ID\""
+    # 2. 載入 setup.bash 並驗證變更
+    check_cmd = f"bash -c \"{SOURCE_ENV_CMD} && export ROS_DOMAIN_ID={new_id} && echo $ROS_DOMAIN_ID\""
     ok_chk, out_chk, err_chk = docker_exec(container, check_cmd, TIMEOUT_SECONDS, what="驗證 ROS_DOMAIN_ID")
     if not ok_chk:
         return err_chk

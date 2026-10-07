@@ -10,6 +10,7 @@
 - [list_dir](tools/list_dir.md) — 查看本機某一層目錄的清單（不含子目錄）；標頭算好數量與最新修改，`--filter 關鍵字` 計數、`--newest N` 找最新修改的檔案
 - [search_text](tools/search_text.md) — 在檔案「內部文字」中過濾特定關鍵字，標頭算好命中筆數與檔案數
 - [find_file](tools/find_file.md) — 依「檔案名稱關鍵字」遞迴搜尋整棵目錄樹，標頭算好找到幾個；要找某目錄裡最新修改的檔案請用 list_dir --newest
+- [code_ast_reader](tools/code_ast_reader.md) — 透過 AST 解析 Python 檔結構（類別、函式簽名、 Docstring），無須讀取全文即可掌握架構
 - [change_dir](tools/change_dir.md) — 切換當前工作目錄（注意：後端需維護 CWD 狀態）
 - [view_file](tools/view_file.md) — 查看診斷報告或腳本內容（技能規格文件會由 EXECUTE 自動載入，不用這個）
 - [host_runcmd](tools/host_runcmd.md) — 若要在本機環境直接執行 shell 指令時使用
