@@ -26,6 +26,7 @@
 - [image_inspect](tools/image_inspect.md) — 對指定路徑的影像檔（截圖、相機快照）依提示詞做視覺模型分析，回傳文字描述
 
 ## ROS2套件
+- [ROS2_domain_id](tools/ROS2_domain_id.md) — 在容器內查詢或修改 ROS_DOMAIN_ID 環境變數（可傳入 0-232 設定新 ID，省略傳參則為查詢）
 - [ROS2_topic_list](tools/ROS2_topic_list.md) — 在容器內查詢 topic 列表，標頭算好總數；`--filter 關鍵字` 只列符合的並計數
 - [ROS2_topic_echo](tools/ROS2_topic_echo.md) — 讀取指定 topic 的一筆訊息，或 --duration 擷取一段時間整理欄位變化與頻率；`--where 欄位<值` 由腳本做門檻判斷
 - [ROS2_node_list](tools/ROS2_node_list.md) — 在容器內查詢 node 列表，標頭算好總數；`--filter 關鍵字` 只列符合的並計數
